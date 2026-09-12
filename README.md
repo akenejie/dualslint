@@ -1,240 +1,241 @@
+# dualslint — UIスレッドとRenderスレッドを分離したslintのフォーク
 
-![Slint](./logo/slint-logo-full-light.svg#gh-light-mode-only) ![Slint](./logo/slint-logo-full-dark.svg#gh-dark-mode-only)
+このリポジトリは [slint-ui/slint](https://github.com/slint-ui/slint) のフォークです。フォークの変更は `i-slint-backend-winit`
+（`internal/backends/winit`）のみです。
 
-[![Build Status](https://github.com/slint-ui/slint/actions/workflows/ci.yaml/badge.svg?branch=master)](https://github.com/slint-ui/slint/actions/workflows/ci.yaml)
-[![REUSE status](https://api.reuse.software/badge/github.com/slint-ui/slint)](https://api.reuse.software/info/github.com/slint-ui/slint)
-[![Discussions](https://img.shields.io/github/discussions/slint-ui/slint)](https://github.com/slint-ui/slint/discussions)
+提供する API は上流の Slint に準拠しています。フォークは上流の公開 API を削除・変更せず、描画スレッドに関するAPIを追加しています。
 
-**Slint** is an open-source declarative GUI toolkit for building native user interfaces for embedded systems, desktops, and mobile platforms.
+## このフォークの目的
+GUI は人間とコンピュータの間の情報伝達のための手段です。その中でも、アニメーションを適切に使えば、人間から見える情報は増えます。
+そのようなとき、コンピュータがアニメーションを描き続ける処理（出力）とマウス・キーボード操作の処理（入力）を並列に処理したいことがあるはずです。
+ゲームやWebではUIと描画のスレッド分離は一般的かもしれませんが、ボタンやテキストボックスを使ったツール開発ではスレッド分離は珍しいでしょう。
+したがって、**軽量かつ2スレッドなGUIを構築する**、というのが、このフォークの目的となります。
 
-Write your UI once in `.slint`, a simple markup language. Connect it to business logic written in Rust, C++, JavaScript, or Python.
+## 上流slintからの変更点
+Rust製で軽量なGUIライブラリであるslintですが、標準の slint は、描画（シーングラフ・GL コンテキスト・プレゼンタ）を必ず UI スレッド（ウィンドウを
+作ったスレッド）に縛ります。本フォークは、UI スレッドのイベントループが入力処理を担当したまま、別の描画スレッドが画面全体の描画を担当します。変更ファイルは以下の通りです。
 
-## Why Slint?
+| # | ファイル | 変更 |
+|---|---------|------|
+| 1 | `internal/backends/winit/render_thread.rs` | **新規追加（本体）** … フル・オフ UI スレッド描画スタック |
+| 2 | `internal/backends/winit/winitwindowadapter.rs` | `request_redraw()` をフレームスロットル経由にせず winit へ直接転送 |
+| 3 | `internal/backends/winit/lib.rs` | `render_thread` モジュールを公開、イベントフィルタ登録をフォークの内部アダプタにも対応 |
+| 4 | `internal/backends/winit/Cargo.toml` | `glow` 依存追加、`windows` クレート機能に `Win32_Graphics_OpenGL` / `Win32_Foundation` 追加 |
+| 5 | `internal/backends/winit/frame_throttle.rs`（`apple_display_link.rs` 含む） | **削除** … UI スレッド側のリフレッシュレートスロットル（ui=render 前提）。描画ペーシングはレンダースレッドが担当するため不要 |
 
-The name *Slint* is derived from our design goals:
+### 1. フル・オフ UI スレッド描画（`render_thread.rs`）
 
-- **Scalable**: Slint should support responsive UI design, allow cross-platform
-    usage across operating systems and processor architectures and support
-    multiple programming languages.
-- **Lightweight**: Slint should require minimal resources, in terms of memory
-    and processing power, and yet deliver a smooth, smartphone-like user
-    experience on any device.
-- **Intuitive**: Designers and developers should feel productive while enjoying
-    the GUI design and development process. The design creation tools should be
-    intuitive to use for the designers. Similarly for the developers, the APIs
-    should be consistent and easy to use, no matter which programming language
-    they choose.
-- **Native**: GUI built with Slint should match the end users' expectations of a
-    native application irrespective of the platform - desktop, mobile, web or
-    embedded system. The UI design should be compiled to machine code and provide
-    flexibility that only a native application can offer: Access full operating
-    system APIs, utilize all CPU and GPU cores, connect to any peripheral.
+UI スレッドが winit のイベントループとネイティブウィンドウ（HWND）を所有し、レンダースレッドが
+Slint のシーングラフ全体・WGL コンテキスト・プレゼンタを所有します。
 
-Beyond the design goals, here’s what makes Slint stand out:
+- UI スレッド → レンダースレッドへは **mpsc チャネル** で「winit イベント」「ユーザーコールバック」
+  「再描画要求」「ピクセル描画クロージャー」を送る
+- レンダースレッドは受け取った **HWND 上に直接 WGL コンテキストを張り**、`FemtoVGRenderer` を構築
+- アイドル中はチャネル上でブロック（CPU ほぼ 0）。アニメーション中のみ 16ms 周期で起床
+- アプリは `RenderHost::paint(w, h, |target| …)` のクロージャー内で CPU バッファへ RGBA を描き、
+  `mark_dirty`/`present` を呼ぶ。**描画中は `&mut PixelTarget` が排他で貸し出される**ため、
+  同時ペインターによる競合が型レベルで不可能
 
-- **Independent UI Design**: Use a declarative language to separate your UI from business logic. Designers can work in parallel with developers.
-- **Tooling**: Iterate quickly with our Live Preview & editor integrations. Integrate from Figma with the [Figma to Slint plugin](https://www.figma.com/community/plugin/1474418299182276871/figma-to-slint).
-- **Stable APIs**: Slint follows a stable 1.x API. We evolve carefully without breaking your code.
+### 2. `request_redraw()` の直接転送
 
-See what others have built: [#MadeWithSlint](https://madewithslint.com)
+標準の `WinitWindowAdapter::request_redraw()` は `pending_redraw` の合流とリフレッシュレートの
+スロットル（`frame_throttle` モジュール）を行い、スロットリング中は要求を黙って捨てます。これは
+**UI スレッドが描画も担当する前提**の設計で、本フォークでは描画のペーシングをレンダースレッドが
+行うため、このスロットル機構（`frame_throttle.rs` と `apple_display_link.rs`）は丸ごと削除しました
+（変更表 #5）。フォークでは毎回 `window.request_redraw()` を直接呼ぶため、**すべての
+`request_redraw()` が同じイベントサイクル内で `RedrawRequested → draw` になります**（合成を
+ネイティブ面に委譲）。
 
-## Examples
+### 3. `with_window_event_handler()` の拡張
 
-### Embedded
+`with_window_event_handler()` が、標準の `WinitWindowAdapter` に加えてフォークの内部アダプタ
+（`pub(crate)` の `HwndWindowAdapter`）でもイベントフィルタを登録できるようにしました。
+シグネチャは不変で、既存の `WinitWindowAdapter` 向けの動作もそのままです。
 
-| RaspberryPi                          | STM32                         | RP2040                         |
-| ------------------------------------ | ----------------------------- | ------------------------------ |
-| [Video of Slint on Raspberry Pi][#1] | [Video of Slint on STM32][#2] | [Video of Slint on RP2040][#3] |
+---
 
-### Desktop
+## 追加された API
 
-| Windows                                     | macOS                                     | Linux                                     |
-| ------------------------------------------- | ----------------------------------------- | ----------------------------------------- |
-| ![Screenshot of the Gallery on Windows][#4] | ![Screenshot of the Gallery on macOS][#5] | ![Screenshot of the Gallery on Linux][#6] |
+`i-slint-backend-winit` に `render_thread` モジュール（`pub mod render_thread;`）が新規公開されます。
+このモジュールの公開 API は以下の **5 項目**です。
 
-### Web using WebAssembly
+### ① `channel()` — チャネル生成
 
-| Printer Demo                                | Slide Puzzle                                 | Energy Monitor                                       | Widget Gallery                                | Weather demo                                  |
-| ------------------------------------------- | -------------------------------------------- | ---------------------------------------------------- | --------------------------------------------- | --------------------------------------------- |
-| [![Screenshot of the Printer Demo][#7]][#8] | [![Screenshot of the Slide Puzzle][#9]][#10] | [![Screenshot of the Energy Monitor Demo][#11]][#12] | [![Screenshot of the Gallery Demo][#13]][#14] | [![Screenshot of the weather Demo][#29]][#30] |
+```rust
+pub fn channel() -> (RenderHost, mpsc::Receiver<RenderMessage>)
+```
 
-More examples and demos in the [examples folder](examples#examples)
+UI スレッドが `RenderHost`（送信側）、レンダースレッドが `RenderMessage` の受信側を持ちます。
 
-## Get Started
+### ② `RenderHost` — 送信側ハンドル（`#[derive(Clone)]`）
 
-### Hello World
-
-The UI is defined in a Domain Specific Language that is declarative, easy to use,
-intuitive, and provides a powerful way to describe graphical elements, their
-placement, their hierarchy, property bindings, and the flow of data through the
-different states.
-
-Here's the obligatory "Hello World":
-
-```slint
-export component HelloWorld inherits Window {
-    width: 400px;
-    height: 400px;
-
-    Text {
-       y: parent.width / 2;
-       x: parent.x + 200px;
-       text: "Hello, world";
-       color: blue;
-    }
+```rust
+pub struct RenderHost {
+    sender: mpsc::Sender<RenderMessage>,   // フィールドは非公開
 }
 ```
 
-### Documentation
+`Clone`・`Send + Sync`。UI スレッドや任意のワーカースレッドが持って、レンダースレッドへ要求を送ります。
 
-For more details, check out the [Slint Documentation](https://docs.slint.dev).
+| メソッド | シグネチャ | 説明 |
+|---|---|---|
+| `send_winit` | `pub fn send_winit(&self, event: winit::event::WindowEvent)` | winit ウィンドウイベントをシーングラフへ転送 |
+| `send_user` | `pub fn send_user(&self, f: impl FnOnce() + Send + 'static)` | 任意クロージャーをレンダースレッドで実行 |
+| `send_quit` | `pub fn send_quit(&self)` | イベントループを終了 |
+| `send_redraw` | `pub fn send_redraw(&self)` | 再描画要求 |
+| `paint` | `pub fn paint<F>(&self, width: u32, height: u32, f: F)`<br/>`where F: FnOnce(&mut PixelTarget) + Send + 'static` | ピクセル描画を予約。先にダブルバッファを `width`×`height` で（再）生成し、レンダースレッド上で**排他 `&mut PixelTarget`** を貸して `f` を実行 |
 
-The [examples](examples) folder contains examples and demos, showing how to
-use the Slint markup language and how to interact with a Slint user interface
-from supported programming languages.
+### ③ `RenderMessage` — チャネルのメッセージ型
 
-The `docs` folder contains a lot more information, including
-[build instructions](docs/building.md), and
-[internal developer docs](docs/development.md).
+```rust
+pub enum RenderMessage {
+    Winit(winit::event::WindowEvent),
+    User(Box<dyn FnOnce() + Send>),
+    Redraw,
+    Paint { width: u32, height: u32, f: Box<dyn FnOnce(&mut PixelTarget) + Send> },
+    Quit,
+}
+```
 
-Refer to the README of each language directory in the `api` folder:
+アプリが自分で構築する必要はありません。`channel()` の受信側を `RenderThreadPlatform::new`
+へそのまま渡します（`derive` なし）。
 
-- [C++](api/cpp) ([Documentation][#15] | [Getting Started Template][#17])
-- [Rust](api/rs/slint) [![Crates.io][#18]][#19] ([Documentation][#20] | [Tutorial Video][#22] | [Getting Started Template][#23])
-- [JavaScript/NodeJS (Beta)](api/node) [![npm][#24]][#25] ([Documentation][#26] | [Getting Started Template][#28])
-- [Python (Beta)](api/python/slint) [![pypi][#31]][#32] ([Documentation][#33] | [Getting Started Template][#34])
+### ④ `PixelTarget` — 描画先（レンダースレッド専用・`!Send`）
 
-## Architecture
+```rust
+pub struct PixelTarget { /* … 非公開フィールド */ }
+```
 
-An application is composed of the business logic written in Rust, C++, Python, or
-JavaScript and the `.slint` user interface design markup, which is compiled to
-native code.
+`RenderHost::paint` のクロージャーが受け取る描画先です。**変更系メソッドはすべて `&mut self`**のため、
+同時に 2 箇所から書き込むことは型レベルで不可能です。バッファは RGBA8・row-major・`width * height * 4`
+バイト（row 0 = 上）。`Send` ではないのでレンダースレッド専用です。
 
-![Architecture Overview](https://slint.dev/resources/slint_architecture_block_diagram.svg)
+| メソッド | シグネチャ | 説明 |
+|---|---|---|
+| `width` | `pub fn width(&self) -> u32` | バッファ/テクスチャの幅 |
+| `height` | `pub fn height(&self) -> u32` | バッファ/テクスチャの高さ |
+| `bytes_mut` | `pub fn bytes_mut(&mut self) -> &mut [u8]` | ピクセルバッファへ直接書き込み |
+| `mark_dirty` | `pub fn mark_dirty(&mut self, x: u32, y: u32, w: u32, h: u32)` | 更新領域を登録（`glTexSubImage2D` で差分アップロード） |
+| `mark_whole_dirty` | `pub fn mark_whole_dirty(&mut self)` | 全面を更新領域に |
+| `present` | `pub fn present(&mut self)` | フレームを確定。sink 経由で `Image` に差し替え、次フレーム描画直前にダブルバッファへアップロード |
 
-### Compiler
+### ⑤ `RenderThreadPlatform` — レンダースレッド用プラットフォーム（`#[derive(Clone)]`）
 
-The `.slint` files are compiled ahead of time. The expressions in the `.slint`
-are pure functions that the compiler can optimize. For example, the compiler
-could choose to "inline" properties and remove those that are constant or
-unchanged.
+```rust
+pub struct RenderThreadPlatform { /* … 非公開フィールド */ }
+```
 
-The compiler uses the typical compiler phases of lexing, parsing, optimization,
-and finally code generation. It provides different back-ends for code generation
-in the target language. The C++ code generator produces a C++ header file, the
-Rust generator produces Rust code, and so on. An interpreter for dynamic
-languages is also included.
+`i_slint_core::platform::Platform` を実装します。レンダースレッド上で
+`SlintContext::new(Box::new(platform))` に渡して使います。
 
-### Runtime
+| メソッド | シグネチャ | 説明 |
+|---|---|---|
+| `new` | `pub fn new(hwnd: isize, size: PhysicalSize, host: RenderHost, rx: mpsc::Receiver<RenderMessage>) -> Self` | HWND・初期サイズ・`channel()` の 2 要素から構築（`PhysicalSize` は `i_slint_core::api::PhysicalSize`） |
+| `set_image_sink` | `pub fn set_image_sink<F>(&self, sink: F)`<br/>`where F: Fn(Image) + Send + 'static` | 確定されたフレームをシーングラフに届けるクロージャーを登録（例: `ui.set_xxx_image(image)` を弱参照で呼ぶ） |
+| `host` | `pub fn host(&self) -> RenderHost` | 任意スレッドから `paint` するための `RenderHost` を取り出す |
 
-The runtime library consists of an engine that supports properties declared in
-the `.slint` language. Components with their elements, items, and properties are
-laid out in a single memory region, to reduce memory allocations.
+`Platform` 実装として `create_window_adapter()` と `run_event_loop()`（実体はチャネルポンプ）を提供し、
+`new_event_loop_proxy()` は `send_user` へ接続されます。
 
-Rendering backends and styles are configurable at compile time:
+---
 
-- The `femtovg` renderer uses OpenGL ES 2.0 for rendering.
-- The `skia` renderer uses [Skia](https://skia.org) for rendering.
-- The `software` renderer uses the CPU with no additional dependencies.
+## 上流 API との関係
 
-NOTE: When Qt is installed on the system, the `qt` style becomes available,
-using Qt's QStyle to achieve native looking widgets.
+本フォークの差分は上記に尽きます。確認の基準:
 
-### Tooling
+- 上流 master（commit `8dce1c42`）との差分は `internal/backends/winit` 内の **6 ファイル** のみ
+  （新規 `render_thread.rs`、変更 `lib.rs` / `winitwindowadapter.rs` / `Cargo.toml`、削除
+  `frame_throttle.rs` / `apple_display_link.rs`）。`Cargo.lock` の追記（`glow`）と本 README 以外に
+  上流から変更したものはありません。
+- **削除された public API はありません。** `render_thread` モジュールと上記 5 項目が追加されただけで、
+  既存の `WinitWindowAdapter`・`Platform`・`with_window_event_handler()` 等はシグネチャを保ったまま動作します。
+- 動作差は以下の 2 点のみ（いずれもシグネチャ不変）:
+  - `WinitWindowAdapter::request_redraw()` … スロットル/合流をやめ、毎回 winit へ直接転送
+  - `WinitWindowAccessor::with_window_event_handler()` … フォークの内部アダプタでもフィルタが効くよう拡張
 
-We have a few tools to help with the development of .slint files:
+---
 
-- A [**LSP Server**](./tools/lsp) that adds features like auto-complete and live
-  preview of the .slint files to many editors.
-- It is bundled in a [**Visual Studio Code Extension**](./editors/vscode)
-  available from the market place.
-- A [**slint-viewer**](./tools/viewer) tool which displays the .slint files. The
-  `--auto-reload` argument makes it easy to preview your UI while you are
-  working on it (when using the LSP preview is not possible).
-- [**SlintPad**](https://slintpad.com/), an online editor to try out .slint syntax
-  without installing anything ([sources](./tools/slintpad)).
-- A [**Figma to Slint**](https://www.figma.com/community/plugin/1474418299182276871/figma-to-slint) plugin.
+## 追加された依存関係（`internal/backends/winit/Cargo.toml`）
 
-Please check our [Editors README](./editors/README.md) for tips on how to
-configure your favorite editor to work well with Slint.
+- `glow = { workspace = true }`（version 0.18）
+- `windows` クレートの機能に `Win32_Graphics_OpenGL` と `Win32_Foundation` を追加
 
-## License
+---
 
-See [LICENSE.md](LICENSE.md) for the licensing terms of the whole repository, including documentation and examples.
+## アプリとの統合方法
 
-You can use Slint under ***any*** of the following licenses, at your choice:
+`dualslint` は公開時に **1 つのクレート** として crates.io に公開される想定です。アプリは `slint` を
+依存に追加するのと同じ要領で、`slint` の代わりに `dualslint` を追加するだけです。
 
-1. Build proprietary desktop, mobile, or web applications for free with the [Royalty-free License](LICENSES/LicenseRef-Slint-Royalty-free-2.0.md),
-2. Build open source embedded, desktop, mobile, or web applications for free with the [GNU GPLv3](LICENSES/GPL-3.0-only.txt),
-3. Build proprietary embedded, desktop, mobile, or web applications with the [Commercial license](LICENSES/LicenseRef-Slint-Software-3.0.md).
+```toml
+[dependencies]
+dualslint = { version = "1.18.0", features = ["renderer-femtovg"] }
+```
 
-See the [Slint licensing options on the website](https://slint.dev/pricing) and the [Licensing FAQ](FAQ.md#licensing).
+`dualslint` は slint の公開 API（`.slint` のコンパイル、`slint` 相当の各モジュール、`Image` 等の型）を
+そのまま提供し、内部の winit バックエンドだけを本フォーク版（`render_thread` モジュール入り）に
+差し替えています。ここまでに解説した `render_thread` の各 API は `dualslint::render_thread` から
+使えます。
 
-## Contributions
+利用コード（抜粋）:
 
-We welcome your contributions: in the form of code, bug reports or feedback.
-For contribution guidelines see [CONTRIBUTING.md](CONTRIBUTING.md).
+```rust
+use dualslint::render_thread::{channel, RenderHost, RenderThreadPlatform};
 
-## Frequently Asked Questions
+let (host, rx) = channel();                                  // チャネル生成
+let platform = RenderThreadPlatform::new(hwnd, size, host.clone(), rx);
+platform.set_image_sink(move |image: dualslint::Image| {      // フレームを Image プロパティへ
+    ui.set_xxx_image(image);
+});
+let ctx = i_slint_core::SlintContext::new(Box::new(platform));
+let ui = MainWindow::new_with_context(ctx.clone())?;          // build.rs で
+                                                              // SLINT_ENABLE_EXPERIMENTAL_FEATURES=1
+// … 任意のスレッドから …
+host.paint(w, h, |target| {
+    target.bytes_mut().copy_from_slice(&rgba);
+    target.mark_whole_dirty();
+    target.present();
+});
+ctx.run_event_loop()
+```
 
-Please see our separate [FAQ](FAQ.md).
+> **公開前（現在）の利用方法** — 未公開の間は、フォークの `i-slint-backend-winit` を
+> `[patch.crates-io]` で差し替えて使います。ただしフォークの `i-slint-backend-winit` は
+> `i-slint-core` / `i-slint-renderer-femtovg` を workspace path 依存で参照するため、同じ git ツリー
+> から **3 クレートをまとめて** 差し替えてください（crates.io 版と git 版の `i_slint_core` が別
+> インスタンスになると型不一致のコンパイルエラーになります）。詳細はブランチの状況で変わりますので、
+> 利用時のコミット・ブランチに合わせてください。
 
-## About us (SixtyFPS GmbH)
+---
 
-We are passionate about software - API design, cross-platform software
-development and user interface components. Our aim is to make developing user
-interfaces fun for everyone: from Python, JavaScript, C++, or Rust developers all the
-way to UI/UX designers. We believe that software grows organically and keeping
-it open source is the best way to sustain that growth. Our team members are
-located remotely in Germany, Finland, and US.
+## ベース情報
 
-### Stay up to date
+| 項目 | 値 |
+|---|---|
+| 上流リポジトリ | https://github.com/slint-ui/slint |
+| ベース | `master`（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`、2026-09-12、version `1.18.0`） |
+| 公開先 | https://github.com/akenejie/dualslint |
+| フォークブランチ | `main` |
+| 変更対象 | `internal/backends/winit`（`i-slint-backend-winit`） |
 
-- Follow [@slint_ui](https://twitter.com/slint_ui) on X/Twitter.
-- Follow [@slint@fosstodon.org](https://fosstodon.org/@slint) on Mastodon.
-- Follow [@slint-ui](https://www.linkedin.com/company/slint-ui/) on LinkedIn.
-- Follow [@slint.dev](https://bsky.app/profile/slint.dev) on Bluesky
-- Subscribe to our [YouTube channel](https://www.youtube.com/@Slint-UI)
+モノレポ内パスと crates.io パッケージ名の対応:
 
-### Contact us
+| モノレポ内パス | crates.io パッケージ |
+|---|---|
+| `internal/backends/winit` | `i-slint-backend-winit` |
+| `internal/renderers/femtovg` | `i-slint-renderer-femtovg` |
+| `internal/core` | `i-slint-core` |
 
-Feel free to join [Github discussions](https://github.com/slint-ui/slint/discussions)
-for general chat or questions. Use [Github issues](https://github.com/slint-ui/slint/issues)
-to report public suggestions or bugs.
+---
 
-We chat in [our Mattermost instance](https://chat.slint.dev) where you are
-welcome to listen in or ask your questions.
+## ライセンス
 
-You can of course also contact us privately via email to [info@slint.dev](mailto:info@slint.dev).
+本リポジトリは上流 [slint-ui/slint](https://github.com/slint-ui/slint) をもとにしています。
 
-[#1]: https://www.youtube.com/watch?v=_BDbNHrjK7g
-[#2]: https://www.youtube.com/watch?v=NNNOJJsOAis
-[#3]: https://www.youtube.com/watch?v=dkBwNocItGs
-[#4]: https://slint.dev/resources/gallery_win_screenshot.png "Gallery"
-[#5]: https://slint.dev/resources/gallery_mac_screenshot.png "Gallery"
-[#6]: https://slint.dev/resources/gallery_linux_screenshot.png "Gallery"
-[#7]: https://slint.dev/resources/printerdemo_screenshot.png "Printer Demo"
-[#8]: https://slint.dev/demos/printerdemo/
-[#9]: https://slint.dev/resources/puzzle_screenshot.png "Slide Puzzle"
-[#10]: https://slint.dev/demos/slide_puzzle/
-[#11]: https://slint.dev/resources/energy-monitor-screenshot.png "Energy Monitor Demo"
-[#12]: https://slint.dev/demos/energy-monitor/
-[#13]: https://slint.dev/resources/gallery_screenshot.png "Gallery Demo"
-[#14]: https://slint.dev/demos/gallery/
-[#15]: https://docs.slint.dev/latest/docs/cpp/
-[#17]: https://github.com/slint-ui/slint-cpp-template
-[#18]: https://img.shields.io/crates/v/slint
-[#19]: https://crates.io/crates/slint
-[#20]: https://docs.slint.dev/latest/docs/rust/slint/
-[#22]: https://youtu.be/WBcv4V-whHk
-[#23]: https://github.com/slint-ui/slint-rust-template
-[#24]: https://img.shields.io/npm/v/slint-ui
-[#25]: https://www.npmjs.com/package/slint-ui
-[#26]: https://docs.slint.dev/latest/docs/node/
-[#28]: https://github.com/slint-ui/slint-nodejs-template
-[#29]: ./demos/weather-demo/docs/img/desktop-preview.png "Weather Demo"
-[#30]: https://slint.dev/demos/weather-demo/
-[#31]: https://img.shields.io/pypi/v/slint
-[#32]: https://pypi.org/project/slint/
-[#33]: https://docs.slint.dev/latest/docs/python/slint/
-[#34]: https://github.com/slint-ui/slint-python-template
+- **上流のコード**（`render_thread.rs` 以外）は上流 slint のライセンス
+  （`GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0`）に従います。
+  各ファイルの SPDX ヘッダーと各クレート内の `LICENSES/` ディレクトリを参照してください。
+- **本フォークで変更・追加した部分**（新規 `render_thread.rs`、`lib.rs` /
+  `winitwindowadapter.rs` / `Cargo.toml` の変更箇所、削除した `frame_throttle*` の扱い）は
+  **GNU Affero General Public License v3.0 (AGPL-3.0)** です。
+

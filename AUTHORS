@@ -1,0 +1,13 @@
+dualslint is a fork of slint-ui/slint.
+
+Upstream:
+  slint-ui/slint — copyright their respective authors. See each file's SPDX
+  header and the LICENSES/ directories.
+
+Fork modifications and additions:
+  akenejie — AGPL-3.0-only
+  (new file render_thread.rs; changes to lib.rs, winitwindowadapter.rs,
+   Cargo.toml; removal of frame_throttle.rs / frame_throttle/apple_display_link.rs)
+
+Publication:
+  https://github.com/akenejie/dualslint

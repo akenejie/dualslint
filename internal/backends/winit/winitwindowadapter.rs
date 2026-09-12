@@ -226,7 +226,6 @@ fn window_is_resizable(
 enum WinitWindowOrNone {
     HasWindow {
         window: Arc<winit::window::Window>,
-        frame_throttle: Box<dyn crate::frame_throttle::FrameThrottle>,
         #[cfg(enable_accesskit)]
         accesskit_adapter: RefCell<crate::accesskit::AccessKitAdapter>,
         #[cfg(muda)]
@@ -662,15 +661,8 @@ impl WinitWindowAdapter {
             ));
         }
 
-        let frame_throttle = crate::frame_throttle::create_frame_throttle(
-            self.self_weak.clone(),
-            &winit_window,
-            self.shared_backend_data.is_wayland,
-        );
-
         *self.winit_window_or_none.borrow_mut() = WinitWindowOrNone::HasWindow {
             window: winit_window.clone(),
-            frame_throttle,
             #[cfg(enable_accesskit)]
             accesskit_adapter: crate::accesskit::AccessKitAdapter::new(
                 self.self_weak.clone(),
@@ -1705,10 +1697,6 @@ impl WinitWindowAdapter {
         self.shown.get()
     }
 
-    pub(crate) fn pending_redraw(&self) -> bool {
-        self.pending_redraw.get()
-    }
-
     pub async fn async_winit_window(
         self_weak: Weak<Self>,
     ) -> Result<Arc<winit::window::Window>, PlatformError> {
@@ -1799,11 +1787,23 @@ impl WindowAdapter for WinitWindowAdapter {
     }
 
     fn request_redraw(&self) {
-        if !self.pending_redraw.replace(true)
-            && let WinitWindowOrNone::HasWindow { window, frame_throttle, .. } =
-                &*self.winit_window_or_none.borrow()
+        // DESIGN REWRITE: never silently drop a redraw request.
+        //
+        // Stock slint coalesces redraws on the UI thread via `pending_redraw` and
+        // a refresh-rate throttle, assuming the UI thread also owns rendering. In
+        // this fork the render thread paces presentation itself, so look-aside
+        // throttling on the UI thread would stall the presentation of freshly
+        // uploaded data: the content changes on every upload, but no
+        // RedrawRequested is delivered in time, so the frame keeps showing stale
+        // pixels.
+        //
+        // We instead forward every request straight to winit and let the native
+        // surface present/coalesce. This guarantees each `request_redraw()` ends
+        // up as a `RedrawRequested` -> `window.draw()` in the same event cycle.
+        if let WinitWindowOrNone::HasWindow { window, .. } =
+            &*self.winit_window_or_none.borrow()
         {
-            frame_throttle.request_throttled_redraw(window);
+            window.request_redraw();
         }
     }
 

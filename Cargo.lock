@@ -3470,6 +3470,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "futures",
+ "glow 0.18.0",
  "glutin",
  "glutin-winit",
  "i-slint-common",

@@ -34,9 +34,9 @@ mod winit_compat;
 mod winitwindowadapter;
 use winitwindowadapter::*;
 pub(crate) mod event_loop;
-mod frame_throttle;
 #[cfg(target_os = "ios")]
 mod ios;
+pub mod render_thread;
 
 /// Re-export of the winit crate.
 pub use winit;
@@ -1177,10 +1177,19 @@ impl WinitWindowAccessor for i_slint_core::api::Window {
         mut callback: impl FnMut(&i_slint_core::api::Window, &winit::event::WindowEvent) -> EventResult
         + 'static,
     ) {
-        if let Some(adapter) = i_slint_core::window::WindowInner::from_pub(self)
-            .window_adapter()
+        let adapter = i_slint_core::window::WindowInner::from_pub(self).window_adapter();
+        if let Some(adapter) = adapter
             .internal(i_slint_core::InternalToken)
             .and_then(|wa| (wa as &dyn core::any::Any).downcast_ref::<WinitWindowAdapter>())
+        {
+            adapter
+                .window_event_filter
+                .set(Some(Box::new(move |window, event| callback(window, event))));
+        } else if let Some(adapter) = adapter
+            .internal(i_slint_core::InternalToken)
+            .and_then(|wa| {
+                (wa as &dyn core::any::Any).downcast_ref::<render_thread::HwndWindowAdapter>()
+            })
         {
             adapter
                 .window_event_filter
