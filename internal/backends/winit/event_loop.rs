@@ -33,6 +33,8 @@ pub enum CustomEvent {
     UserEventWithEventLoop(Box<dyn FnOnce(&ActiveEventLoop) + Send>),
     /// Emitted from quit_event_loop with the current event loop generation
     Exit(usize),
+    /// The render thread has produced a new frame; process it on the UI thread.
+    RenderFrame,
     #[cfg(enable_accesskit)]
     Accesskit(accesskit_winit::Event),
     #[cfg(muda)]
@@ -47,6 +49,7 @@ impl std::fmt::Debug for CustomEvent {
             Self::UserEvent(_) => write!(f, "UserEvent"),
             Self::UserEventWithEventLoop(_) => write!(f, "UserEventWithEventLoop"),
             Self::Exit(_) => write!(f, "Exit"),
+            Self::RenderFrame => write!(f, "RenderFrame"),
             #[cfg(enable_accesskit)]
             Self::Accesskit(a) => write!(f, "AccessKit({a:?})"),
             #[cfg(muda)]
@@ -165,6 +168,27 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
                     event_loop.exit()
                 }
                 // else ignore the event, since it's from a previous run of the event loop
+            }
+            CustomEvent::RenderFrame => {
+                use crate::render_thread;
+                use i_slint_core::graphics::{Image, Rgba8Pixel, SharedPixelBuffer};
+                if let Some(frame_queue) = render_thread::GLOBAL_FRAME_QUEUE.get() {
+                    while let Some(frame) = frame_queue.lock().unwrap().pop_front() {
+                        let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+                            &frame.pixels,
+                            frame.width,
+                            frame.height,
+                        );
+                        let image = Image::from_rgba8(buffer);
+                        if let Some(sink) = render_thread::GLOBAL_IMAGE_SINK.get() {
+                            if let Ok(guard) = sink.lock() {
+                                if let Some(ref cb) = *guard {
+                                    cb(image);
+                                }
+                            }
+                        }
+                    }
+                }
             }
             #[cfg(enable_accesskit)]
             CustomEvent::Accesskit(accesskit_winit::Event { window_id, window_event }) => {

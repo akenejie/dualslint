@@ -890,6 +890,21 @@ impl i_slint_core::platform::Platform for Backend {
     }
 
     fn run_event_loop(&self) -> Result<(), PlatformError> {
+        // Spawn the render thread on the first call to run_event_loop().
+        // The thread runs RenderHostCore::run() which blocks on the mpsc channel.
+        use crate::render_thread;
+        if render_thread::GLOBAL_FRAME_QUEUE.get().is_none() {
+            let (host, mut core, frame_queue) = render_thread::channel(
+                self.shared_data.event_loop_proxy.clone(),
+            );
+            let _ = render_thread::GLOBAL_FRAME_QUEUE.set(frame_queue);
+            let _ = render_thread::GLOBAL_RENDER_HOST.set(host);
+            std::thread::Builder::new()
+                .name("slint-render".into())
+                .spawn(move || core.run())
+                .ok();
+        }
+
         let loop_state = self.event_loop_state.borrow_mut().take().unwrap_or_else(|| {
             EventLoopState::new(self.shared_data.clone(), self.custom_application_handler.take())
         });
