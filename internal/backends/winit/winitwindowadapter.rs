@@ -745,6 +745,17 @@ impl WinitWindowAdapter {
             waker.wake();
         }
 
+        // Store the HWND for public access via render_thread::hwnd().
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::HasWindowHandle as _;
+            if let Ok(wh) = winit_window.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(h) = wh.as_raw() {
+                    crate::render_thread::set_hwnd(h.hwnd.get());
+                }
+            }
+        }
+
         Ok(winit_window)
     }
 

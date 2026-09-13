@@ -180,11 +180,9 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
                             frame.height,
                         );
                         let image = Image::from_rgba8(buffer);
-                        if let Some(sink) = render_thread::GLOBAL_IMAGE_SINK.get() {
-                            if let Ok(guard) = sink.lock() {
-                                if let Some(ref cb) = *guard {
-                                    cb(image);
-                                }
+                        if let Ok(guard) = render_thread::GLOBAL_IMAGE_SINK.lock() {
+                            if let Some(ref cb) = *guard {
+                                cb(image);
                             }
                         }
                     }

@@ -30,11 +30,16 @@ pub(crate) static GLOBAL_FRAME_QUEUE: OnceLock<FrameQueue> = OnceLock::new();
 /// Initialized when the backend starts; accessible via [`host()`].
 pub(crate) static GLOBAL_RENDER_HOST: OnceLock<RenderHost> = OnceLock::new();
 
+/// Global HWND (Windows window handle) stored when the winit window is created.
+/// Accessible via [`hwnd()`].
+#[cfg(target_os = "windows")]
+pub(crate) static GLOBAL_HWND: OnceLock<isize> = OnceLock::new();
+
 /// Global image sink callback.  Set by the app; invoked by the UI thread
 /// when a new frame is ready from the render thread.
-pub(crate) static GLOBAL_IMAGE_SINK: OnceLock<std::sync::Mutex<
+pub(crate) static GLOBAL_IMAGE_SINK: std::sync::Mutex<
     Option<Box<dyn Fn(i_slint_core::graphics::Image) + Send + Sync>>,
->> = OnceLock::new();
+> = std::sync::Mutex::new(None);
 
 /// Obtain the [`RenderHost`] for sending paint closures to the render thread.
 /// Returns `None` if the dualslint backend has not been started yet.
@@ -44,11 +49,35 @@ pub fn host() -> Option<RenderHost> {
 
 /// Register a callback that receives images from the render thread.
 /// Called by the app to wire render thread output to a Slint `Image` property.
+/// Can be called multiple times; the latest callback wins.
 pub fn set_image_sink<F>(sink: F)
 where
     F: Fn(i_slint_core::graphics::Image) + Send + Sync + 'static,
 {
-    let _ = GLOBAL_IMAGE_SINK.get_or_init(|| std::sync::Mutex::new(Some(Box::new(sink))));
+    if let Ok(mut guard) = GLOBAL_IMAGE_SINK.lock() {
+        *guard = Some(Box::new(sink));
+    }
+}
+
+/// Returns the raw HWND (window handle) of the slint window, if available.
+/// On non-Windows platforms this always returns `None`.
+#[cfg(target_os = "windows")]
+pub fn hwnd() -> Option<isize> {
+    GLOBAL_HWND.get().copied()
+}
+
+/// Store the HWND when the winit window is created.  Called internally by
+/// the window adapter; not part of the public API.
+#[cfg(target_os = "windows")]
+pub(crate) fn set_hwnd(hwnd: isize) {
+    let _ = GLOBAL_HWND.set(hwnd);
+}
+
+/// Returns the raw HWND (window handle) of the slint window, if available.
+/// On non-Windows platforms this always returns `None`.
+#[cfg(not(target_os = "windows"))]
+pub fn hwnd() -> Option<isize> {
+    None
 }
 
 /// A completed frame ready for display on the UI thread.
