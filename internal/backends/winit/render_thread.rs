@@ -268,11 +268,8 @@ impl Drop for PixelTarget {
 pub struct RenderHostCore {
     rx: mpsc::Receiver<RenderMessage>,
     host: RenderHost,
-    /// Callback invoked on the render thread when a redraw is needed on the
-    /// UI side (e.g. after presenting a new frame).
     redraw_request: Option<Box<dyn Fn() + Send + 'static>>,
     image_sink: Option<Box<dyn Fn(Image) + Send + 'static>>,
-    pixel_target: Option<PixelTarget>,
 }
 
 impl RenderHostCore {
@@ -282,12 +279,9 @@ impl RenderHostCore {
             host,
             redraw_request: None,
             image_sink: None,
-            pixel_target: None,
         }
     }
 
-    /// Set the callback that signals the UI thread to redraw.  Called from the
-    /// render thread after presenting a new frame.
     pub fn set_redraw_request<F>(&mut self, f: F)
     where
         F: Fn() + Send + 'static,
@@ -295,7 +289,6 @@ impl RenderHostCore {
         self.redraw_request = Some(Box::new(f));
     }
 
-    /// Register how freshly advertised frames reach the scene graph.
     pub fn set_image_sink<F>(&mut self, sink: F)
     where
         F: Fn(Image) + Send + 'static,
@@ -303,50 +296,13 @@ impl RenderHostCore {
         self.image_sink = Some(Box::new(sink));
     }
 
-    /// Provide the glow context (shared with the UI thread) and initial size
-    /// for the pixel target.
-    pub fn init_pixel_target(
-        &mut self,
-        gl: std::rc::Rc<glow::Context>,
-        width: u32,
-        height: u32,
-    ) {
-        match PixelTarget::new(gl, width, height) {
-            Ok(target) => self.pixel_target = Some(target),
-            Err(e) => eprintln!("render thread: pixel target init: {e}"),
-        }
-    }
-
-    /// Resize the pixel target if the dimensions changed.
-    pub fn ensure_pixel_target(
-        &mut self,
-        gl: std::rc::Rc<glow::Context>,
-        width: u32,
-        height: u32,
-    ) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        let has_size = self
-            .pixel_target
-            .as_ref()
-            .is_some_and(|t| t.width == width && t.height == height);
-        if has_size {
-            return;
-        }
-        match PixelTarget::new(gl, width, height) {
-            Ok(target) => self.pixel_target = Some(target),
-            Err(e) => eprintln!("render thread: pixel target create: {e}"),
-        }
-    }
-
-    /// Run the render thread message loop.  Blocks until [`RenderMessage::Quit`].
     pub fn run(&mut self) {
+        let mut pixel_target: Option<PixelTarget> = None;
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 RenderMessage::User(f) => f(),
                 RenderMessage::Paint { width, height, f } => {
-                    if let Some(target) = self.pixel_target.as_mut() {
+                    if let Some(target) = pixel_target.as_mut() {
                         if target.width != width || target.height != height {
                             eprintln!(
                                 "render thread: paint size mismatch: target={}x{}, requested={}x{}",
@@ -357,8 +313,7 @@ impl RenderHostCore {
                     }
                 }
                 RenderMessage::Redraw => {
-                    let advertised = self
-                        .pixel_target
+                    let advertised = pixel_target
                         .as_mut()
                         .map(|t| t.present_pending(&self.image_sink))
                         .unwrap_or(false);
