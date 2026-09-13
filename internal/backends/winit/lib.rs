@@ -1185,15 +1185,6 @@ impl WinitWindowAccessor for i_slint_core::api::Window {
             adapter
                 .window_event_filter
                 .set(Some(Box::new(move |window, event| callback(window, event))));
-        } else if let Some(adapter) = adapter
-            .internal(i_slint_core::InternalToken)
-            .and_then(|wa| {
-                (wa as &dyn core::any::Any).downcast_ref::<render_thread::HwndWindowAdapter>()
-            })
-        {
-            adapter
-                .window_event_filter
-                .set(Some(Box::new(move |window, event| callback(window, event))));
         }
     }
 }
