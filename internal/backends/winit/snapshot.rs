@@ -32,7 +32,7 @@ use i_slint_core::Color as CoreColor;
 
 use crate::render_thread::{
     ControlRegion, DrawCommand, GradientStop, LineCapDesc, LineJoinDesc, PaintDesc, PathEvent,
-    PhysicalLength, PhysicalPoint, PhysicalRect, PositionedGlyph, SceneFrame,
+    PhysicalLength, PhysicalPoint, PhysicalRect, PositionedGlyph, SceneFont, SceneFrame,
 };
 
 // ---------------------------------------------------------------------------
@@ -163,6 +163,8 @@ pub(crate) struct SnapshotEncoder {
     /// Separate text layout cache for the snapshot encoder (independent of
     /// the renderer's own cache so it works without a GL context).
     text_layout_cache: sharedparley::TextLayoutCache,
+    /// Deduplicated font payloads referenced by this frame's glyph runs.
+    fonts: Vec<SceneFont>,
     /// The window adapter for dependency tracking / window queries.
     window_adapter: i_slint_core::window::WindowAdapterRc,
 }
@@ -188,6 +190,7 @@ impl SnapshotEncoder {
             scale_factor,
             next_key: 1,
             text_layout_cache: sharedparley::TextLayoutCache::default(),
+            fonts: Vec::new(),
             window_adapter,
             background: None,
         }
@@ -205,6 +208,7 @@ impl SnapshotEncoder {
             height: self.height,
             scale_factor: self.scale_factor.get(),
             background: self.background,
+            fonts: self.fonts,
             commands: self.commands,
             controls: self.controls,
         }
@@ -274,34 +278,21 @@ impl ItemRenderer for SnapshotEncoder {
                 rect: layout.background_rect,
                 paint,
                 radius: layout.background_radius,
-                anti_alias: false,
+                anti_alias: true,
             });
         }
 
-        // Border stroke
+        // Border stroke (rounded path, mirroring upstream femtovg renderer)
         if layout.border_width.get() > 0.0 {
             let border_paint =
                 brush_to_paint_desc(&layout.border_color, layout.brush_size, self.scale_factor);
             if let Some(paint) = border_paint {
-                let r = layout.border_rect;
-                // Approximate border as a straight-edge path; the render
-                // thread strokes this path for now.  Rounded border strokes
-                // require arc segments and will be added later.
-                let path_events = vec![
-                    PathEvent::MoveTo(r.origin.x, r.origin.y),
-                    PathEvent::LineTo(r.origin.x + r.size.width, r.origin.y),
-                    PathEvent::LineTo(r.origin.x + r.size.width, r.origin.y + r.size.height),
-                    PathEvent::LineTo(r.origin.x, r.origin.y + r.size.height),
-                    PathEvent::Close,
-                ];
-                self.push(DrawCommand::StrokePath {
-                    path: path_events,
+                self.push(DrawCommand::StrokeRoundedRect {
+                    rect: layout.border_rect,
                     paint,
+                    radius: layout.border_radius,
                     line_width: layout.border_width.get(),
-                    line_cap: LineCapDesc::Butt,
-                    line_join: LineJoinDesc::Miter,
-                    miter_limit: 10.0,
-                    anti_alias: false,
+                    anti_alias: true,
                 });
             }
         }
@@ -374,7 +365,7 @@ impl ItemRenderer for SnapshotEncoder {
                 phys_size.width,
                 phys_size.height,
                 0.0,
-                0.0,
+                1.0,
                 buf_w as f32,
                 buf_h as f32,
                 0.0,
@@ -715,7 +706,7 @@ impl ItemRenderer for SnapshotEncoder {
         self.push(DrawCommand::UploadPixmap { key, pixels, width: w, height: h });
         self.push(DrawCommand::BlitPixmap {
             key,
-            params: [0.0, 0.0, w as f32, h as f32, 0.0, 0.0, w as f32, h as f32, 0.0],
+            params: [0.0, 0.0, w as f32, h as f32, 0.0, 1.0, w as f32, h as f32, 0.0],
         });
         let _ = item_cache;
     }
@@ -771,7 +762,7 @@ impl ItemRenderer for SnapshotEncoder {
         let phys = target_size * self.scale_factor;
         self.push(DrawCommand::BlitPixmap {
             key,
-            params: [0.0, 0.0, phys.width, phys.height, 0.0, 0.0, buf_w as f32, buf_h as f32, 0.0],
+            params: [0.0, 0.0, phys.width, phys.height, 0.0, 1.0, buf_w as f32, buf_h as f32, 0.0],
         });
     }
 
@@ -839,8 +830,15 @@ impl GlyphRenderer for SnapshotEncoder {
         y_offset: PhysicalLength,
         glyphs_it: &mut dyn Iterator<Item = parley::layout::Glyph>,
     ) {
-        let font_data = font.data.data().to_vec();
+        let blob_id = font.data.id();
         let font_index = font.index;
+        if !self.fonts.iter().any(|f| f.blob_id == blob_id && f.font_index == font_index) {
+            self.fonts.push(SceneFont {
+                blob_id,
+                font_index,
+                data: font.data.data().to_vec(),
+            });
+        }
 
         let paint_desc = match &brush {
             GlyphBrush::Fill(p) => p.clone(),
@@ -851,13 +849,13 @@ impl GlyphRenderer for SnapshotEncoder {
         let positioned: Vec<PositionedGlyph> = glyphs_it
             .map(|g| PositionedGlyph {
                 x: g.x,
-                y: g.y + y_offset.get(),
+                y: g.y,
                 id: g.id as u16,
             })
             .collect();
 
         self.push(DrawCommand::DrawGlyphRun {
-            font_data,
+            font_blob_id: blob_id,
             font_index,
             font_size: font_size.get(),
             normalized_coords: normalized_coords.to_vec(),

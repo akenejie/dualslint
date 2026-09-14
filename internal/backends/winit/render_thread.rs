@@ -185,8 +185,23 @@ pub struct SceneFrame {
     /// `None` means the UI thread did not see a solid brush and the commands
     /// carry the full background instead.
     pub background: Option<[u8; 4]>,
+    /// Deduplicated font payloads referenced by the glyph runs below. The
+    /// `blob_id` is `Blob::id()` of the parley font data, stable across
+    /// frames, so the render thread can cache the femtovg font id without
+    /// re-hashing the font bytes.
+    pub fonts: Vec<SceneFont>,
     pub commands: Vec<DrawCommand>,
     pub controls: Vec<ControlRegion>,
+}
+
+/// One unique font payload serialised for a frame.
+#[derive(Clone, Debug)]
+pub struct SceneFont {
+    /// Stable `Blob::id()` of the parley font data.
+    pub blob_id: u64,
+    /// Index of the font in a collection, or 0 for a single font.
+    pub font_index: u32,
+    pub data: Vec<u8>,
 }
 
 /// A single draw command in the serialised scene.
@@ -217,6 +232,14 @@ pub enum DrawCommand {
         radius: PhysicalBorderRadius,
         anti_alias: bool,
     },
+    /// Stroke a rounded rectangle (border stroke for buttons / text boxes).
+    StrokeRoundedRect {
+        rect: PhysicalRect,
+        paint: PaintDesc,
+        radius: PhysicalBorderRadius,
+        line_width: f32,
+        anti_alias: bool,
+    },
     /// Stroke a path (border rectangle).
     StrokePath {
         path: Vec<PathEvent>,
@@ -236,9 +259,11 @@ pub enum DrawCommand {
     },
 
     // -- Text (glyph-based) --
-    /// Draw a glyph run produced by sharedparley on the UI thread.
+    /// Draw a glyph run produced by sharedparley on the UI thread. The font
+    /// payload is carried once per frame in `SceneFrame::fonts`, referenced
+    /// here by its stable `Blob::id()`.
     DrawGlyphRun {
-        font_data: Vec<u8>,
+        font_blob_id: u64,
         font_index: u32,
         font_size: f32,
         normalized_coords: Vec<i16>,
@@ -513,7 +538,7 @@ struct GlRenderState {
     width: u32,
     height: u32,
     scale_factor: f32,
-    /// Font cache mapping (font-blob hash, index) → femtovg FontId.
+    /// Font cache mapping (font blob id, index) → femtovg FontId.
     font_cache: RefCell<std::collections::HashMap<(u64, u32), femtovg::FontId>>,
     /// Texture cache for uploaded pixmaps.
     texture_cache: RefCell<std::collections::HashMap<u64, femtovg::ImageId>>,
@@ -611,8 +636,8 @@ impl GlRenderState {
         let backend = unsafe { femtovg::renderer::OpenGl::new_from_function_cstr(proc_addr) }
             .map_err(|e| format!("femtovg OpenGL init failed: {e}"))?;
         let text_context = femtovg::TextContext::default();
-        let mut canvas = femtovg::Canvas::new(backend)
-            .map_err(|e| format!("femtovg Canvas::new failed: {e}"))?;
+        let mut canvas = femtovg::Canvas::new_with_text_context(backend, text_context.clone())
+            .map_err(|e| format!("femtovg Canvas::new_with_text_context failed: {e}"))?;
         canvas.set_size(width, height, scale_factor.ceil() as _);
 
         Ok(Self {
@@ -651,6 +676,10 @@ impl GlRenderState {
         _host: &RenderHost,
     ) {
         use glutin::prelude::*;
+
+        // Register fonts before replaying so glyph runs can resolve their
+        // font id from the stable blob-id cache.
+        self.register_fonts(&frame.fonts);
 
         let canvas = &self.femtovg_canvas;
 
@@ -730,6 +759,15 @@ impl GlRenderState {
                     canvas.borrow_mut().fill_path(&path, &p);
                 }
             }
+            DrawCommand::StrokeRoundedRect { rect, paint, radius, line_width, anti_alias } => {
+                let paint_f = self.desc_to_paint_stroke(paint);
+                if let Some(mut p) = paint_f {
+                    p.set_line_width(*line_width);
+                    p.set_anti_alias(*anti_alias);
+                    let path = rounded_rect_to_femtovg_path(*rect, *radius);
+                    canvas.borrow_mut().stroke_path(&path, &p);
+                }
+            }
             DrawCommand::StrokePath { path, paint, line_width, line_cap, line_join, miter_limit, anti_alias } => {
                 let paint_f = self.desc_to_paint_stroke(paint);
                 if let Some(mut p) = paint_f {
@@ -763,10 +801,10 @@ impl GlRenderState {
                 }
             }
             DrawCommand::DrawGlyphRun {
-                font_data, font_index, font_size, normalized_coords,
+                font_blob_id, font_index, font_size, normalized_coords,
                 paint, y_offset, glyphs, is_stroke,
             } => {
-                self.replay_glyph_run(canvas, font_data, *font_index, *font_size,
+                self.replay_glyph_run(canvas, *font_blob_id, *font_index, *font_size,
                     normalized_coords, paint, *y_offset, glyphs, *is_stroke);
             }
             DrawCommand::FillTextRect { rect, paint, radius, border } => {
@@ -842,18 +880,29 @@ impl GlRenderState {
         self.desc_to_paint(desc)
     }
 
-    fn get_or_create_font(&self, font_data: &[u8], font_index: u32) -> Option<femtovg::FontId> {
-        let hash = blob_hash(font_data);
-        let key = (hash, font_index);
+    /// Ensure every font in the frame is registered in the femtovg font
+    /// context. Keyed by the stable parley blob id, so the same font is only
+    /// added once for the lifetime of the render thread.
+    fn register_fonts(&mut self, fonts: &[SceneFont]) {
         let mut cache = self.font_cache.borrow_mut();
-        if let Some(&font_id) = cache.get(&key) {
-            return Some(font_id);
+        for font in fonts {
+            let key = (font.blob_id, font.font_index);
+            if cache.contains_key(&key) {
+                continue;
+            }
+            if let Some(font_id) = self
+                .femtovg_text_context
+                .add_shared_font_with_index(font.data.clone(), font.font_index)
+                .ok()
+            {
+                cache.insert(key, font_id);
+            }
         }
-        let font_id = self.femtovg_text_context
-            .add_shared_font_with_index(font_data.to_vec(), font_index)
-            .ok()?;
-        cache.insert(key, font_id);
-        Some(font_id)
+    }
+
+    /// Resolve a font id for a glyph run by its stable blob id and index.
+    fn get_or_create_font(&self, blob_id: u64, font_index: u32) -> Option<femtovg::FontId> {
+        self.font_cache.borrow().get(&(blob_id, font_index)).copied()
     }
 
     fn upload_pixmap(
@@ -1094,20 +1143,21 @@ impl GlRenderState {
     fn replay_glyph_run(
         &self,
         canvas: &RefCell<femtovg::Canvas<femtovg::renderer::OpenGl>>,
-        font_data: &[u8],
+        font_blob_id: u64,
         font_index: u32,
-        _font_size: f32,
+        font_size: f32,
         normalized_coords: &[i16],
         paint_desc: &PaintDesc,
         y_offset: f32,
         glyphs: &[PositionedGlyph],
         is_stroke: bool,
     ) {
-        let femtovg_paint = match self.desc_to_paint(paint_desc) {
+        let mut femtovg_paint = match self.desc_to_paint(paint_desc) {
             Some(p) => p,
             None => return,
         };
-        let Some(font_id) = self.get_or_create_font(font_data, font_index) else { return; };
+        femtovg_paint.set_font_size(font_size);
+        let Some(font_id) = self.get_or_create_font(font_blob_id, font_index) else { return; };
 
         let mapped: Vec<femtovg::PositionedGlyph> = glyphs.iter().map(|g| {
             femtovg::PositionedGlyph {
@@ -1117,15 +1167,44 @@ impl GlRenderState {
             }
         }).collect();
 
-        let mut cv = canvas.borrow_mut();
-        if is_stroke {
-            let _ = cv.stroke_glyph_run(
-                font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+        // Pixel-align the canvas during text rendering, mirroring upstream
+        // slint's align_canvas_during(): flush a translate-only transform to
+        // integer pixels so glyphs rasterize on a crisp pixel grid.
+        let original = canvas.borrow().transform();
+        let [a, b, c, d, x, y] = original.0;
+        let translate_only = (a - 1.0).abs() < 1e-3
+            && b.abs() < 1e-3
+            && c.abs() < 1e-3
+            && (d - 1.0).abs() < 1e-3;
+        if translate_only {
+            let floored = femtovg::Transform2D::new(
+                a.round(), b.round(), c.round(), d.round(), x.round(), y.round(),
             );
+            let mut cv = canvas.borrow_mut();
+            cv.reset_transform();
+            cv.set_transform(&floored);
+            if is_stroke {
+                let _ = cv.stroke_glyph_run(
+                    font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                );
+            } else {
+                let _ = cv.fill_glyph_run(
+                    font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                );
+            }
+            cv.reset_transform();
+            cv.set_transform(&original);
         } else {
-            let _ = cv.fill_glyph_run(
-                font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
-            );
+            let mut cv = canvas.borrow_mut();
+            if is_stroke {
+                let _ = cv.stroke_glyph_run(
+                    font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                );
+            } else {
+                let _ = cv.fill_glyph_run(
+                    font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                );
+            }
         }
     }
 }
@@ -1182,13 +1261,6 @@ fn lyon_path_to_femtovg(events: &[PathEvent]) -> femtovg::Path {
 
 fn to_femtovg_color(c: &Color) -> femtovg::Color {
     femtovg::Color::rgba(c.red(), c.green(), c.blue(), c.alpha())
-}
-
-fn blob_hash(data: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish()
 }
 
 // ---------------------------------------------------------------------------
