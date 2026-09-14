@@ -2343,9 +2343,14 @@ dependencies = [
  "imgref",
  "itertools 0.15.0",
  "log",
+ "lru",
  "rgb",
+ "rustybuzz",
  "slotmap",
  "swash",
+ "ttf-parser",
+ "unicode-bidi",
+ "unicode-segmentation",
  "wasm-bindgen",
  "web-sys",
  "wgpu 30.0.1",
@@ -3469,6 +3474,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "cfg_aliases",
+ "femtovg",
  "futures",
  "glow 0.18.0",
  "glutin",
@@ -4671,6 +4677,12 @@ checksum = "0fae87c125b03c1d2c0150c90365d7d6bcc53fb73a9acaef207d2d065860f062"
 dependencies = [
  "imgref",
 ]
+
+[[package]]
+name = "lru"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
 
 [[package]]
 name = "lru-slab"

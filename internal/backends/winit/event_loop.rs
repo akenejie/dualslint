@@ -35,6 +35,9 @@ pub enum CustomEvent {
     Exit(usize),
     /// The render thread has produced a new frame; process it on the UI thread.
     RenderFrame,
+    /// The render thread wants the next snapshot (frame pacing). Re-arms a
+    /// redraw on every active window.
+    RequestRedraw,
     #[cfg(enable_accesskit)]
     Accesskit(accesskit_winit::Event),
     #[cfg(muda)]
@@ -50,6 +53,7 @@ impl std::fmt::Debug for CustomEvent {
             Self::UserEventWithEventLoop(_) => write!(f, "UserEventWithEventLoop"),
             Self::Exit(_) => write!(f, "Exit"),
             Self::RenderFrame => write!(f, "RenderFrame"),
+            Self::RequestRedraw => write!(f, "RequestRedraw"),
             #[cfg(enable_accesskit)]
             Self::Accesskit(a) => write!(f, "AccessKit({a:?})"),
             #[cfg(muda)]
@@ -186,6 +190,18 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
                             }
                         }
                     }
+                }
+            }
+            CustomEvent::RequestRedraw => {
+                let windows = self
+                    .shared_backend_data
+                    .active_windows
+                    .borrow()
+                    .values()
+                    .filter_map(|w| w.upgrade())
+                    .collect::<Vec<_>>();
+                for window in windows {
+                    window.request_redraw();
                 }
             }
             #[cfg(enable_accesskit)]

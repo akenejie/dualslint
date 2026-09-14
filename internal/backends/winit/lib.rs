@@ -37,6 +37,7 @@ pub(crate) mod event_loop;
 #[cfg(target_os = "ios")]
 mod ios;
 pub mod render_thread;
+pub(crate) mod snapshot;
 
 /// Re-export of the winit crate.
 pub use winit;
@@ -93,6 +94,8 @@ mod renderer {
 
     #[cfg(enable_femtovg_renderer)]
     pub(crate) mod femtovg;
+    #[cfg(all(feature = "renderer-femtovg", supports_opengl, not(feature = "renderer-femtovg-wgpu")))]
+    pub(crate) mod dual;
     #[cfg(enable_skia_renderer)]
     pub(crate) mod skia;
 
@@ -135,7 +138,7 @@ fn default_renderer_factory(
         } else if #[cfg(feature = "renderer-femtovg-wgpu")] {
             renderer::femtovg::WGPUFemtoVGRenderer::new_suspended(shared_backend_data)
         } else if #[cfg(all(feature = "renderer-femtovg", supports_opengl))] {
-            renderer::femtovg::GlutinFemtoVGRenderer::new_suspended(shared_backend_data)
+            renderer::dual::DualThreadRenderer::new_suspended(shared_backend_data)
         } else if #[cfg(feature = "renderer-software")] {
             renderer::sw::WinitSoftwareRenderer::new_suspended(shared_backend_data)
         } else if #[cfg(feature = "renderer-vello")] {
@@ -168,7 +171,7 @@ fn try_create_window_with_fallback_renderer(
             supports_opengl,
             not(feature = "renderer-femtovg-wgpu")
         ))]
-        renderer::femtovg::GlutinFemtoVGRenderer::new_suspended,
+        renderer::dual::DualThreadRenderer::new_suspended,
         #[cfg(feature = "renderer-software")]
         renderer::sw::WinitSoftwareRenderer::new_suspended,
         #[cfg(feature = "renderer-vello")]
@@ -817,6 +820,22 @@ impl Drop for Backend {
     }
 }
 
+/// Spawn the render thread on the first call (from `run_event_loop` or when
+/// a window adapter is created). Idempotent: later calls are no-ops. The
+/// thread runs `RenderCore::run()` which blocks on the mpsc channel.
+pub(crate) fn ensure_render_thread(proxy: &winit::event_loop::EventLoopProxy<SlintEvent>) {
+    use crate::render_thread;
+    if render_thread::GLOBAL_RENDER_HOST.get().is_none() {
+        let (host, mut core, frame_queue) = render_thread::channel(proxy.clone());
+        let _ = render_thread::GLOBAL_FRAME_QUEUE.set(frame_queue);
+        let _ = render_thread::GLOBAL_RENDER_HOST.set(host);
+        std::thread::Builder::new()
+            .name("slint-render".into())
+            .spawn(move || core.run())
+            .ok();
+    }
+}
+
 impl i_slint_core::platform::Platform for Backend {
     fn bind_context(&self, _ctx: i_slint_core::SlintContextWeak, _: i_slint_core::InternalToken) {
         let _ = self.shared_data.context.set(_ctx.clone());
@@ -890,20 +909,7 @@ impl i_slint_core::platform::Platform for Backend {
     }
 
     fn run_event_loop(&self) -> Result<(), PlatformError> {
-        // Spawn the render thread on the first call to run_event_loop().
-        // The thread runs RenderHostCore::run() which blocks on the mpsc channel.
-        use crate::render_thread;
-        if render_thread::GLOBAL_FRAME_QUEUE.get().is_none() {
-            let (host, mut core, frame_queue) = render_thread::channel(
-                self.shared_data.event_loop_proxy.clone(),
-            );
-            let _ = render_thread::GLOBAL_FRAME_QUEUE.set(frame_queue);
-            let _ = render_thread::GLOBAL_RENDER_HOST.set(host);
-            std::thread::Builder::new()
-                .name("slint-render".into())
-                .spawn(move || core.run())
-                .ok();
-        }
+        ensure_render_thread(&self.shared_data.event_loop_proxy.clone());
 
         let loop_state = self.event_loop_state.borrow_mut().take().unwrap_or_else(|| {
             EventLoopState::new(self.shared_data.clone(), self.custom_application_handler.take())
@@ -1215,7 +1221,7 @@ fn create_renderer(
             if let Some(api) = maybe_graphics_api {
                 i_slint_core::graphics::RequestedOpenGLVersion::try_from(api)?;
             }
-            renderer::femtovg::GlutinFemtoVGRenderer::new_suspended(shared_data)
+            renderer::dual::DualThreadRenderer::new_suspended(shared_data)
         }
         #[cfg(feature = "renderer-femtovg-wgpu")]
         (Some("femtovg-wgpu"), maybe_graphics_api) => {
@@ -1323,7 +1329,7 @@ fn create_renderer(
                 } else if #[cfg(all(feature = "renderer-femtovg", supports_opengl))] {
                     // If a graphics API was requested, double check that it's GL. FemtoVG doesn't support Metal, etc.
                     i_slint_core::graphics::RequestedOpenGLVersion::try_from(_requested_graphics_api)?;
-                    renderer::femtovg::GlutinFemtoVGRenderer::new_suspended(shared_data)
+                    renderer::dual::DualThreadRenderer::new_suspended(shared_data)
                 } else {
                     return Err(format!("Graphics API use requested by the compile-time enabled renderers don't support that").into())
                 }
