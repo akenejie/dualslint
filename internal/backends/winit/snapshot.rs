@@ -15,20 +15,18 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 
-use i_slint_core::graphics::{euclid, Brush, Image, ImageInner};
+use i_slint_core::Color as CoreColor;
+use i_slint_core::graphics::{Brush, Image, ImageInner, IntRect, euclid};
 use i_slint_core::item_rendering::{
-    BorderRectLayout, CachedRenderingData, ItemRenderer,
-    RenderBorderRectangle, RenderImage, RenderRectangle, RenderText,
+    BorderRectLayout, CachedRenderingData, ItemRenderer, RenderBorderRectangle, RenderImage,
+    RenderRectangle, RenderText,
 };
-use i_slint_core::items::{
-    self, Clip, FillRule, ItemRc, Layer, Opacity, Path, RenderingResult,
-};
+use i_slint_core::items::{self, Clip, FillRule, ItemRc, Layer, Opacity, Path, RenderingResult};
 use i_slint_core::lengths::{
-    LogicalBorderRadius, LogicalPoint, LogicalRect, LogicalSize, LogicalVector,
-    PhysicalPx, ScaleFactor,
+    LogicalBorderRadius, LogicalPoint, LogicalRect, LogicalSize, LogicalVector, PhysicalPx,
+    ScaleFactor,
 };
 use i_slint_core::textlayout::sharedparley::{self, GlyphRenderer, fontique, parley};
-use i_slint_core::Color as CoreColor;
 
 use crate::render_thread::{
     ControlRegion, DrawCommand, GradientStop, LineCapDesc, LineJoinDesc, PaintDesc, PathEvent,
@@ -46,10 +44,7 @@ fn color_to_u8_array(c: CoreColor) -> [u8; 4] {
 fn stops_to_gradient_stops(stops: &[i_slint_core::graphics::GradientStop]) -> Vec<GradientStop> {
     stops
         .iter()
-        .map(|s| GradientStop {
-            offset: s.position,
-            color: color_to_u8_array(s.color),
-        })
+        .map(|s| GradientStop { offset: s.position, color: color_to_u8_array(s.color) })
         .collect()
 }
 
@@ -64,12 +59,9 @@ fn brush_to_paint_desc(
 
     let resolved = resolve_brush(brush, size, scale_factor)?;
     Some(match resolved {
-        i_slint_core::graphics::ResolvedBrush::SolidColor(color) => PaintDesc::Solid {
-            r: color.red(),
-            g: color.green(),
-            b: color.blue(),
-            a: color.alpha(),
-        },
+        i_slint_core::graphics::ResolvedBrush::SolidColor(color) => {
+            PaintDesc::Solid { r: color.red(), g: color.green(), b: color.blue(), a: color.alpha() }
+        }
         i_slint_core::graphics::ResolvedBrush::LinearGradient(gradient) => {
             PaintDesc::LinearGradient {
                 start_x: gradient.start.x,
@@ -251,11 +243,7 @@ impl ItemRenderer for SnapshotEncoder {
             Some(p) => p,
             None => return,
         };
-        self.push(DrawCommand::FillRect {
-            rect: geometry,
-            paint,
-            anti_alias: false,
-        });
+        self.push(DrawCommand::FillRect { rect: geometry, paint, anti_alias: false });
     }
 
     fn draw_border_rectangle(
@@ -323,12 +311,23 @@ impl ItemRenderer for SnapshotEncoder {
         let source = image.source();
         let image_inner: &ImageInner = (&source).into();
 
-        let target_size_for_scalable = if image_inner.is_svg() {
-            let phys = size * self.scale_factor;
-            Some(phys.cast())
-        } else {
-            None
-        };
+        // Mirror the upstream femtovg renderer: compute the destination rect
+        // that fits the source into the item, respecting the image-fit mode,
+        // aspect ratio and alignment. The canvas transform is already translated
+        // to the item origin, so the blit lands in the item's local space.
+        let orig_size = source.size().cast::<f32>();
+        let source_clip_rect = image.source_clip().unwrap_or(IntRect::from_size(orig_size.cast()));
+        let fitted = i_slint_core::graphics::fit(
+            image.image_fit(),
+            size * self.scale_factor,
+            source_clip_rect,
+            self.scale_factor,
+            image.alignment(),
+            image.tiling(),
+        );
+
+        let target_size_for_scalable =
+            if image_inner.is_svg() { Some(fitted.size.cast()) } else { None };
 
         let Some(pixel_buffer) = image_inner.render_to_buffer(target_size_for_scalable) else {
             return;
@@ -356,14 +355,13 @@ impl ItemRenderer for SnapshotEncoder {
         let key = self.alloc_key();
         self.push(DrawCommand::UploadPixmap { key, pixels: rgba, width: buf_w, height: buf_h });
 
-        let phys_size = size * self.scale_factor;
         self.push(DrawCommand::BlitPixmap {
             key,
             params: [
-                0.0,
-                0.0,
-                phys_size.width,
-                phys_size.height,
+                fitted.offset.x,
+                fitted.offset.y,
+                fitted.size.width,
+                fitted.size.height,
                 0.0,
                 1.0,
                 buf_w as f32,
@@ -430,18 +428,16 @@ impl ItemRenderer for SnapshotEncoder {
                     events.push(PathEvent::LineTo(to.x * sf, to.y * sf));
                 }
                 lyon_path::Event::Quadratic { from: _, ctrl, to } => {
-                    events.push(PathEvent::QuadTo(
-                        ctrl.x * sf,
-                        ctrl.y * sf,
-                        to.x * sf,
-                        to.y * sf,
-                    ));
+                    events.push(PathEvent::QuadTo(ctrl.x * sf, ctrl.y * sf, to.x * sf, to.y * sf));
                 }
                 lyon_path::Event::Cubic { from: _, ctrl1, ctrl2, to } => {
                     events.push(PathEvent::CubicTo(
-                        ctrl1.x * sf, ctrl1.y * sf,
-                        ctrl2.x * sf, ctrl2.y * sf,
-                        to.x * sf, to.y * sf,
+                        ctrl1.x * sf,
+                        ctrl1.y * sf,
+                        ctrl2.x * sf,
+                        ctrl2.y * sf,
+                        to.x * sf,
+                        to.y * sf,
                     ));
                 }
                 lyon_path::Event::End { last: _, first: _, close } => {
@@ -480,8 +476,7 @@ impl ItemRenderer for SnapshotEncoder {
 
         // Stroke
         let stroke_brush = path.stroke();
-        let stroke_paint =
-            brush_to_paint_desc(&stroke_brush, fill_phys_size, self.scale_factor);
+        let stroke_paint = brush_to_paint_desc(&stroke_brush, fill_phys_size, self.scale_factor);
         if let Some(paint) = stroke_paint {
             self.push(DrawCommand::StrokePath {
                 path: events,
@@ -507,9 +502,7 @@ impl ItemRenderer for SnapshotEncoder {
     ) {
         use i_slint_core::graphics::boxshadowcache::BoxShadowOptions;
 
-        let Some(options) =
-            BoxShadowOptions::new(_self_rc, box_shadow, self.scale_factor)
-        else {
+        let Some(options) = BoxShadowOptions::new(_self_rc, box_shadow, self.scale_factor) else {
             return;
         };
         if options.inset {
@@ -602,9 +595,10 @@ impl ItemRenderer for SnapshotEncoder {
             Some(r) => {
                 *scissor = r;
                 let phys_clip = r * self.scale_factor;
-                self.push(DrawCommand::CombineClip(euclid::Rect::from_size(
-                    euclid::size2(phys_clip.width(), phys_clip.height()),
-                ).translate(euclid::vec2(phys_clip.origin.x, phys_clip.origin.y))));
+                self.push(DrawCommand::CombineClip(
+                    euclid::Rect::from_size(euclid::size2(phys_clip.width(), phys_clip.height()))
+                        .translate(euclid::vec2(phys_clip.origin.x, phys_clip.origin.y)),
+                ));
                 true
             }
             None => {
@@ -833,11 +827,7 @@ impl GlyphRenderer for SnapshotEncoder {
         let blob_id = font.data.id();
         let font_index = font.index;
         if !self.fonts.iter().any(|f| f.blob_id == blob_id && f.font_index == font_index) {
-            self.fonts.push(SceneFont {
-                blob_id,
-                font_index,
-                data: font.data.data().to_vec(),
-            });
+            self.fonts.push(SceneFont { blob_id, font_index, data: font.data.data().to_vec() });
         }
 
         let paint_desc = match &brush {
@@ -846,13 +836,8 @@ impl GlyphRenderer for SnapshotEncoder {
         };
         let is_stroke = matches!(brush, GlyphBrush::Stroke(_));
 
-        let positioned: Vec<PositionedGlyph> = glyphs_it
-            .map(|g| PositionedGlyph {
-                x: g.x,
-                y: g.y,
-                id: g.id as u16,
-            })
-            .collect();
+        let positioned: Vec<PositionedGlyph> =
+            glyphs_it.map(|g| PositionedGlyph { x: g.x, y: g.y, id: g.id as u16 }).collect();
 
         self.push(DrawCommand::DrawGlyphRun {
             font_blob_id: blob_id,
