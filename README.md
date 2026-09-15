@@ -75,6 +75,7 @@ pub enum RenderMessage {
 	Configure { window: Arc<winit::window::Window>, width: u32, height: u32, scale_factor: f64 },
 	Resize { width: u32, height: u32 },
 	RenderScene { frame: SceneFrame },
+	SetOverlay { overlay: OverlayFrame },
 	User(Box<dyn FnOnce() + Send>),
 	Suspend,
 	Quit,
@@ -84,9 +85,28 @@ pub enum RenderMessage {
 - `Configure` … UI スレッドで作ったネイティブウィンドウのハンドル。描画スレッドが glutin GL コンテキストと
   **FemtoVG canvas を自スレッド上で生成** します。
 - `RenderScene` … `SceneFrame`（下記）をリプレイして `swap_buffers()` でプレゼント。
+- `SetOverlay` … UI シーンの上に合成するオーバーレイ層を差し替え。**任意のスレッドから送信可能**。
 - `Suspend` … GL コンテキストとウィンドウの `Arc` を解放（UI スレッド側からネイティブウィンドウ破棄可能にする）。
 - `User` … 任意クロージャーを描画スレッドで実行（診断・補助用）。
 - `Quit` … スレッド終了。
+
+### UI スレッド非依存の描画（オーバーレイ）
+
+描画スレッドは最後に受け取った `SceneFrame` を **保持** します。`SetOverlay`（`RenderHost::submit_overlay()`）
+が届くと、UI スレッドに依頼せず、保持した UI シーン＋オーバーレイを再合成して `swap_buffers()` でプレゼントします。
+ウィンドウの `Resize` 時も同様に再合成するため、**UI スレッドがビジーでも描画を続行**できます。
+
+```rust
+// 任意のワーカースレッドから（RenderHost は Clone + Send + Sync）
+if let Some(host) = render_thread::host() {
+	host.submit_overlay(OverlayFrame { fonts: vec![], commands: vec![
+		DrawCommand::FillRoundedRect { /* 物理ピクセル座標で記述 */ .. },
+	] });
+}
+```
+
+`OverlayFrame` の座標空間・列挙型は `SceneFrame` と同じです（物理ピクセル、同一 `DrawCommand`）。
+空の `commands` を送るとオーバーレイ解除になります。
 
 ### `SceneFrame` — シーン全体のスナップショット
 
@@ -118,8 +138,12 @@ pub struct SceneFrame {
 1. アプリが状態を更新 → `Window::request_redraw()`。
 2. winit が `RedrawRequested` を発火 → `WinitWindowAdapter::draw()` が `DualThreadRenderer::render()` を呼ぶ。
 3. `SnapshotEncoder` が item tree を巡回し、`SceneFrame` に直列化 → `RenderHost::submit_scene()`。
-4. 描画スレッドが `SceneFrame` をリプレイ（クリア → `DrawCommand` 列 → `flush_to_output` → `swap_buffers`）。
+4. 描画スレッドが `SceneFrame` をリプレイ（クリア → `DrawCommand` 列 → `overlay` → `flush_to_output` → `swap_buffers`）。
 5. 描画スレッドが `CustomEvent::RequestRedraw` を UI スレッドへ送り返し、次のフレームをスケジュール。
+
+上記は UI スレッド発のペーシングです。これとは別に、**任意スレッドからの `submit_overlay()`** でも
+描画スレッドは保持済み UI シーン＋オーバーレイをその場で合成・プレゼントします（ステップ 1〜3 を
+経由しない、UI スレッド非依存の描画パス）。
 
 ## 追加された API
 
@@ -133,6 +157,8 @@ pub struct SceneFrame {
 | `host()` | `pub fn host() -> Option<RenderHost>` | グローバルな送信側ハンドルを取得 |
 | `RenderHost` | `#[derive(Clone)]` `Send + Sync` | 送信側。`submit_scene()` / `submit_configure()` / `submit_resize()` / `submit_suspend()` / `send_user()` / `send_quit()` / `send_redraw()` を持ち、任意スレッドから描画スレッドへ要求を送れる |
 | `set_image_sink()` | `pub fn set_image_sink<F>(sink: F)` | レトゥインドモードのフレームを `Image` として外部へ渡すコールバックを登録（CPU ラスタフォールバック用に残置） |
+| `submit_overlay()` | `pub fn submit_overlay(&self, overlay: OverlayFrame)` | UI 非依存の描画パス。任意スレッドから UI シーン上に合成されるオーバーレイ層を差し替え、保持済み UI シーン＋オーバーレイを即座に再合成・プレゼント（`Resize` 時も自動再合成） |
+| `OverlayFrame` | `pub struct { fonts: Vec<SceneFont>, commands: Vec<DrawCommand> }` | オーバーレイ層。座標空間・`DrawCommand` は `SceneFrame` と同一（物理ピクセル） |
 | `hwnd()` | `pub fn hwnd() -> Option<isize>` | 起動中のネイティブウィンドウの HWND（Windows）を取得 |
 | 型別名 | `PhysicalLength` / `PhysicalPoint` / `PhysicalRect` | `DrawCommand` の座標空間（物理ピクセル）を表す `euclid` エイリアス |
 
