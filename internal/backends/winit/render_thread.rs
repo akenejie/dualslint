@@ -445,11 +445,6 @@ impl RenderCore {
                         state.resize(width, height);
                     }
                 }
-                RenderMessage::Resize { width, height } => {
-                    if let Some(state) = &mut gl_state {
-                        state.resize(width, height);
-                    }
-                }
                 RenderMessage::RenderScene { frame } => {
                     if let Some(state) = &mut gl_state {
                         state.render_scene(&frame, &self.frame_queue, &self.host);
@@ -567,9 +562,9 @@ impl GlRenderState {
         // The `DisplayApiPreference` variants are cfg-gated by glutin per
         // backend, so each platform must select its own.
         #[cfg(target_os = "windows")]
-        let display_preference = glutin::display::DisplayApiPreference::EglThenWgl(
-            raw_window_handle::RawWindowHandle::from(raw_window.as_raw())
-        );
+        let display_preference = glutin::display::DisplayApiPreference::EglThenWgl(Some(
+            raw_window_handle::RawWindowHandle::from(raw_window.as_raw()),
+        ));
         #[cfg(target_os = "macos")]
         let display_preference = glutin::display::DisplayApiPreference::Cgl;
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
