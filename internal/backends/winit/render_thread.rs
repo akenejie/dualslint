@@ -7,7 +7,8 @@
 // The UI thread encodes the scene graph into `SceneFrame`s (`snapshot.rs`);
 // the render thread replays them against a FemtoVG/GL stack it owns entirely.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::c_void;
 use std::num::NonZeroU32;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -16,6 +17,10 @@ use i_slint_core::graphics::{Color, euclid};
 use i_slint_core::lengths::{LogicalRect, PhysicalBorderRadius, PhysicalPx};
 
 use crate::winit_compat::WindowSurfaceSizeExt;
+
+// Re-exported by the sharedparley module (default i-slint-core feature);
+// used only inside this file's render-thread text shaping.
+use i_slint_core::textlayout::sharedparley::parley;
 
 /// Physical-pixel geometry aliases (documents that all command payloads are
 /// in physical pixels, matching femtovg's coordinate space).
@@ -36,6 +41,12 @@ pub(crate) static GLOBAL_FRAME_QUEUE: OnceLock<FrameQueue> = OnceLock::new();
 /// Render host — the send-half.  The UI thread and any worker thread holds
 /// this to push paint closures or scene snapshots to the render thread.
 pub(crate) static GLOBAL_RENDER_HOST: OnceLock<RenderHost> = OnceLock::new();
+
+/// Shared coordinate table between the render thread (writer: publishes the
+/// composited controls' geometry + state) and the UI thread / workers
+/// (reader: hit-testing during event processing).  Initialised together with
+/// the render host in `ensure_render_thread`.
+pub(crate) static GLOBAL_COORDINATE_MAP: OnceLock<Arc<Mutex<CoordinateMap>>> = OnceLock::new();
 
 /// Global HWND (Windows only) stored when the winit window is created.
 #[cfg(target_os = "windows")]
@@ -182,6 +193,35 @@ pub struct ControlRegion {
     pub geometry: LogicalRect,
 }
 
+/// Logical-coordinate entry in the shared coordinate table.  Published by the
+/// render thread as it composites the retained scene; read by the UI thread
+/// for hit-testing during event processing (the pointer position is only
+/// available on the UI thread, so the map never blocks the render thread).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ControlCoord {
+    /// Control's top-left corner in logical pixels.
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    /// Current pointer-interaction state, updated by the render thread when
+    /// it owns the widget state (see the event-protocol design).
+    pub hovered: bool,
+    pub pressed: bool,
+}
+
+impl ControlCoord {
+    /// True when the logical point is inside this control's rectangle.
+    pub fn contains(&self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+}
+
+/// Shared, thread-safe table of control coordinates.  The render thread writes
+/// (publish on composite); the UI thread and workers read (hit-test).  Access
+/// via [`coordinate_map()`].
+pub type CoordinateMap = std::collections::HashMap<u64, ControlCoord>;
+
 /// Complete serialisable scene for one frame.
 #[derive(Clone, Debug)]
 pub struct SceneFrame {
@@ -301,6 +341,20 @@ pub enum DrawCommand {
         paint: PaintDesc,
         radius: f32,
         border: Option<(PaintDesc, f32)>,
+    },
+    /// Draw a text string that the render thread shapes itself with its own
+    /// parley context (system fonts, no UI-thread involvement).  `x`/`y` is
+    /// the baseline origin in physical pixels; `font_size` is in physical
+    /// pixels; `max_width` wraps the line at the given physical-pixel width
+    /// (`None` = single line).  Meant for overlay drawing driven by any app
+    /// thread: only the string and geometry travel over the wire.
+    DrawText {
+        x: f32,
+        y: f32,
+        text: String,
+        font_size: f32,
+        paint: PaintDesc,
+        max_width: Option<f32>,
     },
 
     // -- Images / pixmaps --
@@ -539,6 +593,36 @@ pub fn host() -> Option<RenderHost> {
     GLOBAL_RENDER_HOST.get().cloned()
 }
 
+/// Access the shared coordinate table.  Returns `None` until the winit
+/// backend has been configured (`ensure_render_thread`).  UI thread and
+/// workers call this during event processing to hit-test the pointer against
+/// the latest geometry that the render thread actually composited.
+pub fn coordinate_map() -> Option<Arc<Mutex<CoordinateMap>>> {
+    GLOBAL_COORDINATE_MAP.get().cloned()
+}
+
+/// Replace the shared coordinate table with the given control regions.
+/// Called on the render thread when a scene is composited, so the published
+/// geometry always reflects what was actually drawn.
+pub(crate) fn publish_control_coords(controls: &[ControlRegion]) {
+    let Some(map) = coordinate_map() else { return };
+    let mut map = map.lock().unwrap();
+    map.clear();
+    for c in controls {
+        map.insert(
+            c.id,
+            ControlCoord {
+                x: c.geometry.origin.x,
+                y: c.geometry.origin.y,
+                width: c.geometry.size.width,
+                height: c.geometry.size.height,
+                hovered: false,
+                pressed: false,
+            },
+        );
+    }
+}
+
 /// Register a callback that receives images from the render thread (legacy).
 pub fn set_image_sink<F>(sink: F)
 where
@@ -570,7 +654,21 @@ pub(crate) fn set_hwnd(hwnd: isize) {
 // GL Render State — owned entirely by the render thread
 // ===========================================================================
 
-use std::cell::RefCell;
+/// Render-thread-local text shaper for `DrawCommand::DrawText`.  Mirrors the
+/// i-slint-core UI-side shaping recipe (build → `break_all_lines` → `align`)
+/// against parley's system-font database, so the UI thread and any app thread
+/// only pass the string and geometry.  Not `Send`/`Sync`: a single instance is
+/// owned by the render thread inside `GlRenderState`.
+struct TextShaper {
+    fctx: parley::FontContext,
+    lctx: parley::LayoutContext,
+}
+
+impl TextShaper {
+    fn new() -> Self {
+        Self { fctx: parley::FontContext::new(), lctx: parley::LayoutContext::new() }
+    }
+}
 
 struct GlRenderState {
     window: Arc<winit::window::Window>,
@@ -590,6 +688,9 @@ struct GlRenderState {
     texture_cache: RefCell<std::collections::HashMap<u64, femtovg::ImageId>>,
     /// Layer texture cache keyed by (item ptr, index) → (origin, texture).
     layer_cache: RefCell<std::collections::HashMap<u64, (PhysicalPoint, femtovg::ImageId)>>,
+    /// Render-thread-local parley context for `DrawText`.  Lazily
+    /// initialised on first overlay text; only ever used on this thread.
+    text_shaper: RefCell<Option<TextShaper>>,
 }
 
 impl GlRenderState {
@@ -699,6 +800,7 @@ impl GlRenderState {
             font_cache: RefCell::new(std::collections::HashMap::new()),
             texture_cache: RefCell::new(std::collections::HashMap::new()),
             layer_cache: RefCell::new(std::collections::HashMap::new()),
+            text_shaper: RefCell::new(None),
         })
     }
 
@@ -725,6 +827,11 @@ impl GlRenderState {
         _frame_queue: &FrameQueue,
         _host: &RenderHost,
     ) {
+        // Publish the controls that are actually part of this composited
+        // frame into the shared coordinate table, so the UI thread can
+        // hit-test during event processing from the render thread's (the
+        // authority's) view without blocking it.
+        publish_control_coords(&frame.controls);
         self.last_frame = Some(frame);
         let Some(frame) = &self.last_frame else { return };
         self.composite_and_present(frame, overlay);
@@ -874,6 +981,9 @@ impl GlRenderState {
             } => {
                 self.replay_glyph_run(canvas, *font_blob_id, *font_index, *font_size,
                     normalized_coords, paint, *y_offset, glyphs, *is_stroke);
+            }
+            DrawCommand::DrawText { x, y, text, font_size, paint, max_width } => {
+                self.replay_text(canvas, *x, *y, text, *font_size, paint, *max_width);
             }
             DrawCommand::FillTextRect { rect, paint, radius, border } => {
                 let paint_f = self.desc_to_paint(paint);
@@ -1276,6 +1386,85 @@ impl GlRenderState {
             } else {
                 let _ = cv.fill_glyph_run(
                     font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                );
+            }
+        }
+    }
+
+    /// Shape and draw a `DrawCommand::DrawText` payload on the render thread.
+    /// The string is shaped with the render thread's own parley database
+    /// (`TextShaper`), so no UI-thread font table or worker-side shaping is
+    /// involved; each frame's `SceneFrame::fonts` stays untouched.  Font data
+    /// discovered by parley is registered into the femtoVg font cache on
+    /// demand, keyed by `(blob id, font index)` like UI-side glyph runs.
+    fn replay_text(
+        &self,
+        canvas: &RefCell<femtovg::Canvas<femtovg::renderer::OpenGl>>,
+        x: f32,
+        y: f32,
+        text: &str,
+        font_size: f32,
+        paint_desc: &PaintDesc,
+        max_width: Option<f32>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if self.text_shaper.borrow().is_none() {
+            *self.text_shaper.borrow_mut() = Some(TextShaper::new());
+        }
+        let mut shaper_guard = self.text_shaper.borrow_mut();
+        let shaper = shaper_guard.as_mut().unwrap();
+
+        let mut layout = {
+            let mut builder =
+                shaper.lctx.ranged_builder(&mut shaper.fctx, text, self.scale_factor, true);
+            builder.push_default(parley::StyleProperty::FontSize(font_size));
+            builder.build(text)
+        };
+        layout.break_all_lines(max_width);
+        layout.align(parley::Alignment::Start, parley::AlignmentOptions::default());
+
+        let mut seen_fonts = HashSet::new();
+        for line in layout.lines() {
+            for item in line.items() {
+                let parley::PositionedLayoutItem::GlyphRun(run) = item else { continue; };
+                let font = run.run().font();
+                let blob_id = font.data.id();
+                let font_index = font.index;
+                if seen_fonts.insert((blob_id, font_index))
+                    && !self.font_cache.borrow().contains_key(&(blob_id, font_index))
+                {
+                    if let Some(font_id) = self
+                        .femtovg_text_context
+                        .add_shared_font_with_index(font.data.data().to_vec(), font_index)
+                        .ok()
+                    {
+                        self.font_cache.borrow_mut().insert((blob_id, font_index), font_id);
+                    }
+                }
+                let glyphs: Vec<PositionedGlyph> = run.positioned_glyphs().map(|g| {
+                    PositionedGlyph { x: x + g.x, y: g.y, id: g.id as u16 }
+                }).collect();
+                if glyphs.is_empty() {
+                    continue;
+                }
+                // parley positions every glyph of a line at the line's
+                // baseline offset (all share the same `g.y`, Y-down from the
+                // layout origin).  `y` in DrawCommand::DrawText is the text
+                // baseline, so drop the offset back to zero before
+                // `replay_glyph_run` applies it as its `y_offset`.
+                let baseline_offset = glyphs[0].y;
+                self.replay_glyph_run(
+                    canvas,
+                    blob_id,
+                    font_index,
+                    run.run().font_size(),
+                    &[],
+                    paint_desc,
+                    y - baseline_offset,
+                    &glyphs,
+                    false,
                 );
             }
         }

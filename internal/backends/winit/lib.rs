@@ -829,6 +829,8 @@ pub(crate) fn ensure_render_thread(proxy: &winit::event_loop::EventLoopProxy<Sli
         let (host, mut core, frame_queue) = render_thread::channel(proxy.clone());
         let _ = render_thread::GLOBAL_FRAME_QUEUE.set(frame_queue);
         let _ = render_thread::GLOBAL_RENDER_HOST.set(host);
+        let _ = render_thread::GLOBAL_COORDINATE_MAP
+            .set(Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
         std::thread::Builder::new()
             .name("slint-render".into())
             .spawn(move || core.run())

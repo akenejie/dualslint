@@ -108,6 +108,88 @@ if let Some(host) = render_thread::host() {
 `OverlayFrame` の座標空間・列挙型は `SceneFrame` と同じです（物理ピクセル、同一 `DrawCommand`）。
 空の `commands` を送るとオーバーレイ解除になります。
 
+### コントロール（テキスト入りウィジェット）の任意スレッド描画
+
+オーバーレイは矩形・画像だけでなく、**テキスト入りのコントロール全体**を UI スレッド非依存で描画できます。
+コントロールの「描く」処理は render スレッドが完全に担当し、アプリ（ワーカー）スレッドは**状態と要求のみ**
+（テキスト文字列・矩形・スタイル）を送ります。ワーカー側はフォントやグリフ配置に一切触れません。
+
+`DrawCommand::DrawText` は、文字列を render スレッド自身の parley コンテキスト（`TextShaper`、システム
+フォント DB、スレッドローカル 1 本）で整形し、既存のグリフ描画経路で描画します。`x`／`y` はベースライン原点、
+`font_size` は物理ピクセル、`max_width` は折り返し幅（`None` = 1 行）です。フォントは整形の結果初出のもの
+だけを、既存の femtoVg フォントキャッシュ（blob id ＋フォント index キー）へ自動登録します。
+
+```rust
+// 任意のワーカースレッドから、UI スレッドに一切触れず「OK」ボタンを描く
+use i_slint_backend_winit::render_thread::{self, DrawCommand, OverlayFrame, PhysicalPoint,
+                                           PhysicalRect, PaintDesc};
+use euclid::Size2D;
+use i_slint_core::lengths::PhysicalBorderRadius;
+
+let (x, y) = (10.0f32, 40.0f32);            // ボタン矩形（物理 px）
+let frame = OverlayFrame {
+    fonts: Vec::new(),                      // render 側で整形するため何も持たせない
+    commands: vec![
+        DrawCommand::FillRoundedRect {
+            rect: PhysicalRect::new(PhysicalPoint::new(x, y), Size2D::new(160.0, 40.0)),
+            paint: PaintDesc::Solid { r: 60, g: 90, b: 200, a: 255 },
+            radius: PhysicalBorderRadius::new(6.0, 6.0, 6.0, 6.0),
+            anti_alias: true,
+        },
+        DrawCommand::StrokeRoundedRect {
+            rect: PhysicalRect::new(PhysicalPoint::new(x, y), Size2D::new(160.0, 40.0)),
+            paint: PaintDesc::Solid { r: 255, g: 255, b: 255, a: 255 },
+            radius: PhysicalBorderRadius::new(6.0, 6.0, 6.0, 6.0),
+            line_width: 1.0,
+            anti_alias: true,
+        },
+        DrawCommand::DrawText {
+            x: 24.0, y: 40.0,               // ベースライン原点（物理 px）
+            text: "Hello World 12345".to_string(),
+            font_size: 20.0,
+            paint: PaintDesc::Solid { r: 255, g: 255, b: 255, a: 255 },
+            max_width: None,
+        },
+    ],
+};
+render_thread::host().map(|h| h.submit_overlay(frame));
+```
+
+これで「UI スレッド完全アイドルのまま、アプリスレッドが要求を送り続け、render スレッドがコントロール
+（テキスト整形・描画含む）を再描画し続ける」ことができます（`ovl-sample` で実証済み: 100ms 毎に文字列と
+矩形を送りつつボタン全体を移動させ、直接キャプチャで確認）。
+
+### 共有座標マップ（`coordinate_map`）
+
+UI スレッドはイベント処理時にマウスポインタ位置から「どのコントロール上か」を判定する必要があります。
+座標は render スレッドが合成した実値だけが正であり、その値を共有メモリ
+（`Arc<Mutex<CoordinateMap>>`、`render_thread::coordinate_map()` で取得）に公開します。
+
+- **書き手（render スレッド）**: `SceneFrame.controls` の `ControlRegion` を合成時に
+  `publish_control_coords` でマップへ反映。マップ内容＝「render が実際に描画した」座標の権威。
+- **読み手（UI スレッド・ワーカー）**: イベント処理時にマップを `lock()` して hit-test。
+  ロックはごく短いため render スレッドをブロックしません。
+
+```rust
+// UI スレッドのイベント処理: マウス位置 (mx, my) がどのコントロール上かを判定
+use i_slint_backend_winit::render_thread::{self, CoordinateMap, ControlCoord};
+
+if let Some(map) = render_thread::coordinate_map() {
+    let map = map.lock().unwrap();
+    let under_pointer: Vec<u64> = map
+        .iter()
+        .filter(|(_, c)| c.contains(mx, my))
+        .map(|(id, _)| *id)
+        .collect();
+    // under_pointer が空でなければ、そのコントロールへ hover 等のイベントを転送
+}
+```
+
+`CoordinateMap` は `HashMap<u64 /*widget id*/, ControlCoord>` で、`ControlCoord` は
+論理ピクセルの矩形（`x`/`y`/`width`/`height`）と現在のポインタ状態
+（`hovered`/`pressed`、render が状態を所有する段階で更新）を持ちます。
+`CoordinateMap`・`ControlCoord`・`ControlRegion` は公開 API です。
+
 ### `SceneFrame` — シーン全体のスナップショット
 
 ```rust
@@ -115,7 +197,7 @@ pub struct SceneFrame {
 	pub width: u32, pub height: u32, pub scale_factor: f32,
 	pub background: Option<[u8; 4]>,        // ウィンドウ背景（単色）→ クリアカラー
 	pub commands: Vec<DrawCommand>,
-	pub controls: Vec<ControlRegion>,       // ヒットテスト / スクリーンリーダー用（予約）
+	pub controls: Vec<ControlRegion>,       // render が共有座標マップへ公開するコントロール矩形
 }
 ```
 
