@@ -151,17 +151,17 @@ pub struct SceneFrame {
 
 ## アプリとの統合方法
 
-`dualslint` は公開時に **1 つのクレート** として crates.io に公開される想定です。アプリは `slint` を
-依存に追加するのと同じ要領で、`slint` の代わりに `dualslint` を追加するだけです。
+`dualslint` は crates.io に公開しておらず、git リポジトリから直接依存して使います。`slint` を
+依存に追加するときと同じ要領で、`slint` の依存指定をバージョンの代わりに git 参照へ差し替えるだけです。
 
 ```toml
 [dependencies]
-dualslint = { version = "1.18.0", features = ["renderer-femtovg"] }
+slint = { git = "https://github.com/akenejie/dualslint", branch = "master", features = ["renderer-femtovg"] }
 ```
 
 `dualslint` は slint の公開 API（`.slint` のコンパイル、`slint` 相当の各モジュール、`Image` 等の型）を
 そのまま提供し、内部の winit バックエンドだけを本フォーク版（`render_thread` モジュール入り）に
-差し替えています。**`slint` を使う既存コードは、Cargo.toml のクレート名を差し替えるだけでそのまま動きます。**
+差し替えています。**`slint` を使う既存コードは、Cargo.toml の依存指定を git 参照へ差し替えるだけでそのまま動きます。**
 アプリ側のコード変更は不要です。
 
 ```rust
@@ -173,12 +173,12 @@ fn main() -> Result<(), slint::PlatformError> {
 }
 ```
 
-> **公開前（現在）の利用方法** — 未公開の間は、フォークの `i-slint-backend-winit` を
-> `[patch.crates-io]` で差し替えて使います。ただし `i-slint-backend-winit` は `i-slint-core` /
-> `i-slint-renderer-femtovg` を workspace path 依存で参照するため、同じ git ツリーから
-> **必要なクレートをまとめて** 差し替えてください（crates.io 版と git 版の `i_slint_core` が別
-> インスタンスになると型不一致のコンパイルエラーになります）。詳細はブランチの状況で変わりますので、
-> 利用時のコミット・ブランチに合わせてください。
+> **注意** — git 依存にすると、フォークの workspace 全体（`i-slint-backend-winit` / `i-slint-core` /
+> `i-slint-renderer-femtovg` など）が同じ git ツリーから一括で解決されます。crates.io 版と git 版の
+> `i_slint_core` が別インスタンスになると型不一致のコンパイルエラーになるため、既存プロジェクトでは
+> `slint` を含む全 slint 系依存を git 参照へ差し替えてください。フォークは上流 `master` を固定コミット
+> （下表）で追従しています。挙動を固定したい場合は `branch = "master"` の代わりに `rev` にコミット
+> ハッシュを指定してください。
 
 ---
 
@@ -189,12 +189,12 @@ fn main() -> Result<(), slint::PlatformError> {
 | 上流リポジトリ | https://github.com/slint-ui/slint |
 | ベース | `master`（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`、2026-09-12、version `1.18.0`） |
 | 公開先 | https://github.com/akenejie/dualslint |
-| フォークブランチ | `main` |
+| フォークブランチ | `master` |
 | 変更対象 | `internal/backends/winit`（`i-slint-backend-winit`） |
 
-モノレポ内パスと crates.io パッケージ名の対応:
+モノレポ内パスとクレート名の対応:
 
-| モノレポ内パス | crates.io パッケージ |
+| モノレポ内パス | クレート名 |
 |---|---|
 | `internal/backends/winit` | `i-slint-backend-winit` |
 | `internal/renderers/femtovg` | `i-slint-renderer-femtovg` |
