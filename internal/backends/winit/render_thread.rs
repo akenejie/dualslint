@@ -1425,6 +1425,7 @@ impl GlRenderState {
         layout.break_all_lines(max_width);
         layout.align(parley::Alignment::Start, parley::AlignmentOptions::default());
 
+        let mut baseline_offset = None;
         let mut seen_fonts = HashSet::new();
         for line in layout.lines() {
             for item in line.items() {
@@ -1449,12 +1450,17 @@ impl GlRenderState {
                 if glyphs.is_empty() {
                     continue;
                 }
-                // parley positions every glyph of a line at the line's
-                // baseline offset (all share the same `g.y`, Y-down from the
-                // layout origin).  `y` in DrawCommand::DrawText is the text
-                // baseline, so drop the offset back to zero before
-                // `replay_glyph_run` applies it as its `y_offset`.
-                let baseline_offset = glyphs[0].y;
+                // parley positions every glyph of a line at that line's
+                // baseline offset (`g.y`, Y-down from the layout origin; all
+                // glyphs of one line share it, later lines carry an
+                // additional line-height delta).  `y` in DrawCommand::DrawText
+                // is the *first* line's baseline, so the first line's `g.y`
+                // is folded out of every run; later lines then stack below
+                // `y` at their own line delta instead of collapsing onto the
+                // first line ("Hello World 12345" wraps at max_width).
+                if baseline_offset.is_none() {
+                    baseline_offset = Some(glyphs[0].y);
+                }
                 self.replay_glyph_run(
                     canvas,
                     blob_id,
@@ -1462,7 +1468,7 @@ impl GlRenderState {
                     run.run().font_size(),
                     &[],
                     paint_desc,
-                    y - baseline_offset,
+                    y - baseline_offset.unwrap(),
                     &glyphs,
                     false,
                 );
