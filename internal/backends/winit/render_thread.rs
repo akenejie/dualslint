@@ -83,6 +83,13 @@ pub enum RenderMessage {
     RenderScene {
         frame: SceneFrame,
     },
+    /// Replace the overlay layer composited on top of the UI scene.  May be
+    /// sent from any thread; the render thread re-presents the retained UI
+    /// scene together with the new overlay without waiting for the UI thread.
+    SetOverlay {
+        /// The overlay layer to composite on top of the UI scene.
+        overlay: OverlayFrame,
+    },
     /// Execute an arbitrary closure on the render thread.
     User(Box<dyn FnOnce() + Send>),
     /// Drop the render-thread GL state (window hidden / context suspended).
@@ -202,6 +209,22 @@ pub struct SceneFont {
     /// Index of the font in a collection, or 0 for a single font.
     pub font_index: u32,
     pub data: Vec<u8>,
+}
+
+/// A compositing layer drawn on top of the UI scene, submitted from any
+/// thread without going through the UI thread.
+///
+/// Commands use the same physical-pixel coordinate space as
+/// [`SceneFrame::commands`].  Submitting a new frame replaces the previous
+/// overlay; an empty command list removes it.  Whenever such an overlay is
+/// submitted (or the window is resized) while the UI thread is busy, the
+/// render thread re-composites the last retained UI scene with the overlay
+/// and presents it, so drawing does not stall behind the UI thread.
+#[derive(Clone, Debug, Default)]
+pub struct OverlayFrame {
+    /// Font payloads referenced by the glyph runs in `commands`.
+    pub fonts: Vec<SceneFont>,
+    pub commands: Vec<DrawCommand>,
 }
 
 /// A single draw command in the serialised scene.
@@ -366,6 +389,16 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::RenderScene { frame });
     }
 
+    /// Submit an overlay layer to composite on top of the UI scene.
+    ///
+    /// This is the UI-independent draw path: callable from any thread (the
+    /// host is `Clone + Send + Sync`).  The render thread retains the last UI
+    /// scene, so submitting an overlay immediately re-composites and presents
+    /// the UI scene plus the new overlay without consulting the UI thread.
+    pub fn submit_overlay(&self, overlay: OverlayFrame) {
+        let _ = self.sender.send(RenderMessage::SetOverlay { overlay });
+    }
+
     /// Configure the render thread with the winit window + initial size.
     pub(crate) fn submit_configure(
         &self,
@@ -415,11 +448,13 @@ pub(crate) struct RenderCore {
     rx: mpsc::Receiver<RenderMessage>,
     host: RenderHost,
     frame_queue: FrameQueue,
+    /// Master overlay layer; re-applied to a fresh GL state after suspend.
+    overlay: OverlayFrame,
 }
 
 impl RenderCore {
     fn new(rx: mpsc::Receiver<RenderMessage>, host: RenderHost, frame_queue: FrameQueue) -> Self {
-        Self { rx, host, frame_queue }
+        Self { rx, host, frame_queue, overlay: OverlayFrame::default() }
     }
 
     /// Run the render-thread event loop.  Blocks until `Quit`.
@@ -443,11 +478,24 @@ impl RenderCore {
                 RenderMessage::Resize { width, height } => {
                     if let Some(state) = &mut gl_state {
                         state.resize(width, height);
+                        // Re-composite the retained UI scene plus the overlay
+                        // so the window is not stale while the UI thread is
+                        // busy or suspended.
+                        let overlay = &self.overlay;
+                        state.repaint_retained(overlay);
                     }
                 }
                 RenderMessage::RenderScene { frame } => {
                     if let Some(state) = &mut gl_state {
-                        state.render_scene(&frame, &self.frame_queue, &self.host);
+                        let overlay = &self.overlay;
+                        state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                    }
+                }
+                RenderMessage::SetOverlay { overlay } => {
+                    self.overlay = overlay;
+                    let overlay = &self.overlay;
+                    if let Some(state) = &mut gl_state {
+                        state.repaint_retained(overlay);
                     }
                 }
                 RenderMessage::User(f) => {
@@ -533,6 +581,9 @@ struct GlRenderState {
     width: u32,
     height: u32,
     scale_factor: f32,
+    /// The last UI scene snapshot, retained so an overlay update or a resize
+    /// can be re-composited and presented without the UI thread.
+    last_frame: Option<SceneFrame>,
     /// Font cache mapping (font blob id, index) → femtovg FontId.
     font_cache: RefCell<std::collections::HashMap<(u64, u32), femtovg::FontId>>,
     /// Texture cache for uploaded pixmaps.
@@ -644,6 +695,7 @@ impl GlRenderState {
             width,
             height,
             scale_factor: scale_factor as f32,
+            last_frame: None,
             font_cache: RefCell::new(std::collections::HashMap::new()),
             texture_cache: RefCell::new(std::collections::HashMap::new()),
             layer_cache: RefCell::new(std::collections::HashMap::new()),
@@ -664,24 +716,42 @@ impl GlRenderState {
         );
     }
 
+    /// Render the UI scene snapshot, retain it for later overlay/resize
+    /// re-composites, and present it with the current overlay.
     fn render_scene(
         &mut self,
-        frame: &SceneFrame,
+        frame: SceneFrame,
+        overlay: &OverlayFrame,
         _frame_queue: &FrameQueue,
         _host: &RenderHost,
     ) {
+        self.last_frame = Some(frame);
+        let Some(frame) = &self.last_frame else { return };
+        self.composite_and_present(frame, overlay);
+    }
+
+    /// Re-composite the retained UI scene with the given overlay and present
+    /// it.  Used for overlay updates and resizes that must not depend on the
+    /// UI thread.  A no-op when no UI scene has been drawn yet.
+    fn repaint_retained(&self, overlay: &OverlayFrame) {
+        let Some(frame) = &self.last_frame else { return };
+        self.composite_and_present(frame, overlay);
+    }
+
+    /// Clear the canvas, replay the UI scene commands followed by the overlay
+    /// commands, and present the result.
+    fn composite_and_present(&self, frame: &SceneFrame, overlay: &OverlayFrame) {
         use glutin::prelude::*;
 
-        // Register fonts before replaying so glyph runs can resolve their
-        // font id from the stable blob-id cache.
         self.register_fonts(&frame.fonts);
+        self.register_fonts(&overlay.fonts);
 
         let canvas = &self.femtovg_canvas;
 
         // Set size and reset
         {
             let mut cv = canvas.borrow_mut();
-            cv.set_size(frame.width, frame.height, frame.scale_factor.ceil() as _);
+            cv.set_size(self.width, self.height, self.scale_factor.ceil() as _);
             cv.reset();
         }
 
@@ -693,11 +763,14 @@ impl GlRenderState {
                 Some([r, g, b, a]) => femtovg::Color::rgba(r, g, b, a),
                 None => femtovg::Color::rgba(255, 255, 255, 255),
             };
-            cv.clear_rect(0, 0, frame.width, frame.height, clear);
+            cv.clear_rect(0, 0, self.width, self.height, clear);
         }
 
-        // Replay commands
+        // Replay the UI scene first, then the overlay on top.
         for cmd in &frame.commands {
+            self.replay_command(canvas, cmd);
+        }
+        for cmd in &overlay.commands {
             self.replay_command(canvas, cmd);
         }
 
@@ -823,7 +896,12 @@ impl GlRenderState {
                 }
             }
             DrawCommand::UploadPixmap { key, pixels, width, height } => {
-                self.upload_pixmap(canvas, *key, pixels, *width, *height);
+                // Skip re-uploading a texture that is already cached; when a
+                // retained frame is re-composited (overlay update / resize)
+                // the same commands are replayed without re-wasting GPU uploads.
+                if !self.texture_cache.borrow().contains_key(key) {
+                    self.upload_pixmap(canvas, *key, pixels, *width, *height);
+                }
             }
             DrawCommand::BlitPixmap { key, params } => {
                 self.blit_pixmap(canvas, *key, params);
@@ -878,7 +956,7 @@ impl GlRenderState {
     /// Ensure every font in the frame is registered in the femtovg font
     /// context. Keyed by the stable parley blob id, so the same font is only
     /// added once for the lifetime of the render thread.
-    fn register_fonts(&mut self, fonts: &[SceneFont]) {
+    fn register_fonts(&self, fonts: &[SceneFont]) {
         let mut cache = self.font_cache.borrow_mut();
         for font in fonts {
             let key = (font.blob_id, font.font_index);
