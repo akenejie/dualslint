@@ -16,16 +16,14 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use i_slint_core::api::Window as SlintApiWindow;
-use i_slint_core::item_rendering::ItemRenderer;
-use i_slint_core::lengths::ScaleFactor;
 use i_slint_core::platform::PlatformError;
 use i_slint_core::renderer::{DrawOutcome, Renderer, RendererSealed};
-use i_slint_core::window::{WindowAdapter, WindowInner};
+use i_slint_core::window::WindowAdapter;
 use winit::event_loop::ActiveEventLoop;
 
 use crate::SharedBackendData;
-use crate::renderer::WinitCompatibleRenderer;
 use crate::render_thread::GLOBAL_RENDER_HOST;
+use crate::renderer::WinitCompatibleRenderer;
 
 /// The core `Renderer` served to the Slint runtime.
 ///
@@ -37,7 +35,7 @@ pub struct DualCoreRenderer {
 }
 
 impl DualCoreRenderer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { window_adapter: Default::default() }
     }
 }
@@ -77,65 +75,24 @@ impl DualThreadRenderer {
     }
 
     fn encode_scene(&self, window: &SlintApiWindow) -> Result<DrawOutcome, PlatformError> {
+        // When a render-owned component is attached (see
+        // `RenderHost::attach_component`), the screen is drawn entirely by the
+        // render thread from its own component.  The UI thread's tree keeps
+        // running for app logic and input, but must not submit a competing
+        // scene any more — the rendered window would otherwise flip-flop
+        // between the two trees' snapshots.
+        if let Some(host) = GLOBAL_RENDER_HOST.get() {
+            if host.has_attached_component() {
+                return Ok(DrawOutcome::Success);
+            }
+        }
         let Some(host) = GLOBAL_RENDER_HOST.get() else {
             // The render thread is not running yet; nothing to draw.
             return Ok(DrawOutcome::Success);
         };
 
-        let window_inner = WindowInner::from_pub(window);
-        let scale_factor = ScaleFactor::new(window_inner.scale_factor());
-        let window_adapter = window_inner.window_adapter();
-        let size = window_adapter.size();
-        if size.width == 0 || size.height == 0 {
-            return Ok(DrawOutcome::Success);
-        }
-
-        let mut encoder = crate::snapshot::SnapshotEncoder::new(
-            size.width,
-            size.height,
-            scale_factor,
-            window_adapter.clone(),
-        );
-
-        // Window background: a solid color is shipped as the clear color that
-        // the render thread fills the back buffer with; any other brush
-        // (gradient) is serialised as a full-viewport rectangle.
-        if let Some(window_item_rc) = window_inner.window_item_rc() {
-            let window_item =
-                window_item_rc.downcast::<i_slint_core::items::WindowItem>().unwrap();
-            match window_item.as_pin_ref().background() {
-                i_slint_core::graphics::Brush::SolidColor(color) => {
-                    encoder.set_background(color);
-                }
-                _ => {
-                    encoder.draw_rectangle(
-                        window_item.as_pin_ref(),
-                        &window_item_rc,
-                        i_slint_core::lengths::logical_size_from_api(
-                            window.size().to_logical(window_inner.scale_factor()),
-                        ),
-                        &window_item.as_pin_ref().cached_rendering_data,
-                    );
-                }
-            }
-        }
-
-        window_inner.draw_contents(|components, post_render| {
-            for (component, origin) in components {
-                if let Some(component) = i_slint_core::item_tree::ItemTreeWeak::upgrade(component)
-                {
-                    i_slint_core::item_rendering::render_component_items(
-                        &component,
-                        &mut encoder,
-                        *origin,
-                        &window_adapter,
-                    );
-                }
-            }
-            post_render(&mut encoder);
-        });
-
-        host.submit_scene(encoder.finish());
+        let frame = crate::snapshot::encode_window_scene(window)?;
+        host.submit_scene(frame);
         Ok(DrawOutcome::Success)
     }
 }

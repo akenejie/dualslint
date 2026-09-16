@@ -1011,6 +1011,9 @@ impl WinitWindowAdapter {
 
     pub fn set_accent_color(&self, color: Color) {
         WindowInner::from_pub(self.window()).context().set_accent_color(color);
+        // Mirror the accent into the dualslint render thread so its headless
+        // mirror context renders the same widget palette as this host window.
+        crate::render_thread::forward_system_accent(color);
     }
 
     fn query_system_accent_color() -> Color {

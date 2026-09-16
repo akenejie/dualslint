@@ -833,6 +833,17 @@ impl PropertyHandle {
         // Safety: dependencies is a valid pointer to a DependencyListHead (Cell<*mut ()> internally)
         unsafe { *(dependencies as *mut *mut ()) == const_sentinel() }
     }
+
+    fn release_constant(&self) {
+        unsafe {
+            let dependencies = self.dependencies();
+            if *(dependencies as *mut *mut ()) == const_sentinel() {
+                // The const_sentinel is a stub pointer, not a dependency list:
+                // overwrite the head with an empty list instead of dropping it.
+                *(dependencies as *mut *mut ()) = core::ptr::null_mut();
+            }
+        }
+    }
 }
 
 impl Drop for PropertyHandle {
@@ -1125,6 +1136,14 @@ impl<T: Clone> Property<T> {
     /// Mark that this property will never be modified again and that no tracking should be done
     pub fn set_constant(&self) {
         self.handle.set_constant();
+    }
+
+    /// Clear the constant flag previously set with [`Self::set_constant`],
+    /// making the property writable again.  A no-op when the property is not
+    /// constant.  Used by the property-loan API to assign into controls whose
+    /// declarations compile to a constant binding.
+    pub fn release_constant(&self) {
+        self.handle.release_constant();
     }
 
     /// Returns true if set_constant was called on this property

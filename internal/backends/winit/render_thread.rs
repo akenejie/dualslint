@@ -4,17 +4,34 @@
 // dualslint — 2-thread render separation for the Slint GUI toolkit.
 //
 // This module is the cross-thread protocol and the render-thread GL driver.
-// The UI thread encodes the scene graph into `SceneFrame`s (`snapshot.rs`);
-// the render thread replays them against a FemtoVG/GL stack it owns entirely.
+// In the 2-thread split the UI thread encodes the scene graph into
+// `SceneFrame`s (`snapshot.rs`); the render thread replays them against a
+// FemtoVG/GL stack it owns entirely.
+//
+// With a render-owned component attached (`RenderHost::attach_component`) the
+// screen is drawn *entirely* on the render thread: the app's component is
+// instantiated here against a headless window adapter so the upstream Slint
+// draw path (including text shaping) runs on this thread.  The render thread
+// is then the visual authority — both the UI thread and worker threads are
+// equal peers that borrow the published coordinate/state table and request
+// changes through `RenderHost::apply_control_state`.
 
-use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::num::NonZeroU32;
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
+use i_slint_core::api::{PhysicalSize, Window as SlintApiWindow};
 use i_slint_core::graphics::{Color, euclid};
-use i_slint_core::lengths::{LogicalRect, PhysicalBorderRadius, PhysicalPx};
+use i_slint_core::input::{BackendMouseEvent, PointerEventButton};
+use i_slint_core::item_tree::ItemRc;
+use i_slint_core::lengths::{
+    LogicalLength, LogicalPoint, LogicalRect, PhysicalBorderRadius, PhysicalPx,
+};
+use i_slint_core::platform::{Platform, PlatformError, WindowEvent};
+use i_slint_core::window::{WindowAdapter, WindowInner};
 
 use crate::winit_compat::WindowSurfaceSizeExt;
 
@@ -59,6 +76,69 @@ pub(crate) static GLOBAL_IMAGE_SINK: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 // ---------------------------------------------------------------------------
+// Headless window adapter — used when a render-owned component is attached
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Stores the adapter created by the headless platform during
+    /// `Platform::create_window_adapter` so the caller can retrieve it
+    /// after `App::new()` wires everything up.
+    static HEADLESS_ADAPTER_SLOT: OnceCell<Rc<dyn WindowAdapter>> = OnceCell::new();
+}
+
+/// Minimal window adapter for the render-thread component.  The Slint runtime
+/// queries it for the window geometry; actual GL compositing is handled by the
+/// render loop (`render_scene`).
+struct RenderWindowAdapter {
+    window: SlintApiWindow,
+    size: Cell<PhysicalSize>,
+    renderer: crate::renderer::dual::DualCoreRenderer,
+}
+
+impl WindowAdapter for RenderWindowAdapter {
+    fn window(&self) -> &SlintApiWindow {
+        &self.window
+    }
+
+    fn size(&self) -> PhysicalSize {
+        self.size.get()
+    }
+
+    fn set_size(&self, size: i_slint_core::api::WindowSize) {
+        self.size.set(size.to_physical(self.window.scale_factor()));
+    }
+
+    fn renderer(&self) -> &dyn i_slint_core::renderer::Renderer {
+        &self.renderer
+    }
+
+    fn request_redraw(&self) {
+        // The render thread redraws on demand when a scene is submitted or
+        // a control state is changed; nothing to do here.
+    }
+}
+
+/// Headless platform for the render thread.  Only `create_window_adapter` is
+/// implemented; the rest is handled by default trait methods.
+struct RenderMirrorPlatform;
+
+impl Platform for RenderMirrorPlatform {
+    fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+        let adapter: Rc<RenderWindowAdapter> =
+            Rc::new_cyclic(|weak: &Weak<RenderWindowAdapter>| {
+                let window = SlintApiWindow::new(weak.clone() as Weak<dyn WindowAdapter>);
+                RenderWindowAdapter {
+                    window,
+                    size: Cell::new(PhysicalSize::new(800, 600)),
+                    renderer: crate::renderer::dual::DualCoreRenderer::new(),
+                }
+            });
+        let _ = HEADLESS_ADAPTER_SLOT.with(|slot| slot.set(adapter.clone()));
+        Ok(adapter)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Protocol types (UI thread → render thread)
 // ---------------------------------------------------------------------------
 
@@ -70,6 +150,21 @@ pub struct Frame {
 }
 
 pub(crate) type FrameQueue = Arc<Mutex<VecDeque<Frame>>>;
+
+/// A value to assign to a borrowed (lent-out) control property.  The render
+/// thread converts it to the concrete Slint property type (upstream
+/// semantics, including detaching a previous binding) on the mirror tree.
+#[derive(Clone, Debug)]
+pub enum ControlPropertyValue {
+    /// For `Text.text`, `TextInput.text`, ...
+    Text(String),
+    /// RGBA, for `Rectangle.background`, `Text.color`, ...
+    Color { r: u8, g: u8, b: u8, a: u8 },
+    /// For `TouchArea.enabled` / `pressed` / `has-hover`, ...
+    Bool(bool),
+    /// For numeric properties (`opacity`, `width`, ...).
+    Number(f32),
+}
 
 /// Messages the UI thread sends to the render thread.
 pub enum RenderMessage {
@@ -86,14 +181,9 @@ pub enum RenderMessage {
         scale_factor: f64,
     },
     /// The GL surface has been resized.
-    Resize {
-        width: u32,
-        height: u32,
-    },
+    Resize { width: u32, height: u32 },
     /// A complete scene snapshot from the UI thread's snapshot encoder.
-    RenderScene {
-        frame: SceneFrame,
-    },
+    RenderScene { frame: SceneFrame },
     /// Replace the overlay layer composited on top of the UI scene.  May be
     /// sent from any thread; the render thread re-presents the retained UI
     /// scene together with the new overlay without waiting for the UI thread.
@@ -103,6 +193,71 @@ pub enum RenderMessage {
     },
     /// Execute an arbitrary closure on the render thread.
     User(Box<dyn FnOnce() + Send>),
+    /// Instantiate the app's component on the render thread.  `factory` runs on
+    /// the render thread (it must call the component's `new()` *there*, since
+    /// ItemTree/Property are single-threaded) and returns the component's
+    /// strong handle, type-erased.  The render thread then draws the whole
+    /// window from its own component, running the upstream Slint render path
+    /// (text shaping included) on this thread.
+    AttachComponent {
+        /// Runs on the render thread.  Must return a `Box<dyn Any>` holding
+        /// the strong component handle created on this thread.
+        factory: Box<dyn FnOnce() -> Box<dyn std::any::Any> + Send>,
+    },
+    /// Request a control's interaction state from the render thread, the
+    /// visual authority.  Translated into upstream pointer input so the
+    /// `has-hover` / `pressed` bindings recompute exactly as if the pointer
+    /// were there, then the scene is re-encoded, republished and re-presented.
+    ///
+    /// Ui thread and workers are equal peers here: both read the shared
+    /// coordinate table (`coordinate_map()`) to borrow the current state and
+    /// both send this message to request a change.
+    ApplyControlState {
+        /// The control id (as published in the shared coordinate table).
+        id: u64,
+        /// Desired pointer-hover state.
+        hovered: bool,
+        /// Desired pressed (button down) state.
+        pressed: bool,
+    },
+    /// Apply a named property assignment to a control in the render thread's
+    /// mirror tree (the control whose id was published in the shared
+    /// coordinate table), then re-encode and re-present.  The sender receives
+    /// `Ok` on the response channel when the property was found and set.
+    ///
+    /// Ui thread and external workers are equal peers here.  This is the
+    /// property-unit loan API: the caller "borrows" the control and sets one
+    /// of its properties directly, exactly as if it held the instance.
+    SetControlProperty {
+        /// The control id (as published in the shared coordinate table).
+        id: u64,
+        /// The property name (`"text"`, `"color"`, `"background"`, ...).
+        property: String,
+        /// The value to assign.
+        value: ControlPropertyValue,
+        /// Reply channel: `true` when the assignment was applied.
+        response: std::sync::mpsc::SyncSender<bool>,
+    },
+    /// Re-encode the render thread's mirror component and re-present it.  An
+    /// explicit redraw command; also used implicitly after every property
+    /// assignment and control-state change.
+    RequestRedraw,
+    /// Forward the host's system accent colour (from the OS/xdg settings) to
+    /// the mirror context.  The mirror has no OS connection of its own, so
+    /// without this its widget palette would fall back to the default accent.
+    SetAccent { color: Color },
+    /// Borrow a control from the render thread for hit-testing: the UI thread
+    /// detects a click or key event but the control geometry lives with the
+    /// render thread, so it asks here which control owns the logical point.
+    /// The reply is the most specific (smallest) control containing the point.
+    HitTest {
+        /// Logical x coordinate of the pointer.
+        x: f32,
+        /// Logical y coordinate of the pointer.
+        y: f32,
+        /// Reply channel carrying the control id, or `None`.
+        response: std::sync::mpsc::SyncSender<Option<u64>>,
+    },
     /// Drop the render-thread GL state (window hidden / context suspended).
     /// The render thread releases its `Arc<winit::window::Window>`, allowing
     /// the UI thread's `suspend` to actually destroy the native window.
@@ -119,20 +274,11 @@ pub enum RenderMessage {
 #[derive(Clone, Debug)]
 pub enum PaintDesc {
     /// Solid color fill.
-    Solid {
-        r: u8, g: u8, b: u8, a: u8,
-    },
+    Solid { r: u8, g: u8, b: u8, a: u8 },
     /// Linear gradient.
-    LinearGradient {
-        start_x: f32, start_y: f32,
-        end_x: f32, end_y: f32,
-        stops: Vec<GradientStop>,
-    },
+    LinearGradient { start_x: f32, start_y: f32, end_x: f32, end_y: f32, stops: Vec<GradientStop> },
     /// Radial gradient.
-    RadialGradient {
-        cx: f32, cy: f32, radius: f32,
-        stops: Vec<GradientStop>,
-    },
+    RadialGradient { cx: f32, cy: f32, radius: f32, stops: Vec<GradientStop> },
     /// Texture-mapped paint (image blit).
     ImagePaint {
         texture_key: u64,
@@ -409,13 +555,96 @@ pub enum DrawCommand {
 // ---------------------------------------------------------------------------
 
 /// The send half of the render-thread channel.  Clonable and Send-safe.
-#[derive(Clone)]
 pub struct RenderHost {
     sender: mpsc::Sender<RenderMessage>,
     event_loop_proxy: Option<winit::event_loop::EventLoopProxy<crate::SlintEvent>>,
+    /// Set to `true` once `AttachComponent` has been sent.  Used to suppress
+    /// the UI-thread encode path once the render thread owns the screen.
+    /// Shared across all clones of the host so every thread sees the state.
+    attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Clone for RenderHost {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            event_loop_proxy: self.event_loop_proxy.clone(),
+            attached: self.attached.clone(),
+        }
+    }
 }
 
 impl RenderHost {
+    /// Whether a render-owned component has been attached and is now the
+    /// visual authority on the render thread.
+    pub fn has_attached_component(&self) -> bool {
+        self.attached.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Send the app's component factory to the render thread.  `factory`
+    /// executes on the render thread and must call the generated `App::new()`
+    /// *there* (after seeding a headless platform via
+    /// `RenderMirrorPlatform`).  The strong component handle is leaked so the
+    /// render tree stays alive for the lifetime of the render thread.
+    ///
+    /// Once attached the UI-thread encode path (`dual.rs`) is suppressed;
+    /// the render thread redraws from its own component on every
+    /// `submit_scene` or `apply_control_state` call.
+    pub fn attach_component<F>(&self, factory: F)
+    where
+        F: FnOnce() -> Box<dyn std::any::Any> + Send + 'static,
+    {
+        self.attached.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.sender.send(RenderMessage::AttachComponent { factory: Box::new(factory) });
+    }
+
+    /// Request the render thread to apply a pointer state to the given control
+    /// in its own component and redraw.  Ui thread and workers are equal
+    /// peers here: both call this to indicate that a control should be
+    /// hovered / pressed.
+    pub fn apply_control_state(&self, id: u64, hovered: bool, pressed: bool) {
+        let _ = self.sender.send(RenderMessage::ApplyControlState { id, hovered, pressed });
+    }
+
+    /// Borrow the render-owned control identified by `id` and assign one of
+    /// its properties, blocking until the render thread confirms the
+    /// assignment (detaching any previous binding, upstream-style).  Returns
+    /// `true` when the property name resolved and the value was applied.
+    ///
+    /// Ui thread and library-external workers are equal peers here.
+    pub fn set_control_property(
+        &self,
+        id: u64,
+        property: &str,
+        value: ControlPropertyValue,
+    ) -> bool {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        let _ = self.sender.send(RenderMessage::SetControlProperty {
+            id,
+            property: property.to_string(),
+            value,
+            response: tx,
+        });
+        rx.recv().unwrap_or(false)
+    }
+
+    /// Ask the render thread to re-encode its mirror component and re-present
+    /// the frame (an explicit redraw command).
+    pub fn request_redraw(&self) {
+        let _ = self.sender.send(RenderMessage::RequestRedraw);
+    }
+
+    /// Borrow the render-owned controls for hit-testing: asks the render
+    /// thread which control owns the logical point `(x, y)` and returns the
+    /// most specific control id.  The UI thread calls this when it detects a
+    /// click or key event, since the control geometry lives with the render
+    /// thread.
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<u64> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<u64>>(1);
+        let _ = self.sender.send(RenderMessage::HitTest { x, y, response: tx });
+        rx.recv().unwrap_or(None)
+    }
+
     /// Send an arbitrary closure to execute on the render thread.
     pub fn send_user(&self, f: impl FnOnce() + Send + 'static) {
         let _ = self.sender.send(RenderMessage::User(Box::new(f)));
@@ -471,6 +700,13 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::Resize { width, height });
     }
 
+    /// Forward the host's system accent colour to the mirror context so the
+    /// mirror widget palette matches what the host would render (checked
+    /// boxes, highlights, ...).  No-op outside the dualslint 2-thread path.
+    pub(crate) fn submit_accent(&self, color: Color) {
+        let _ = self.sender.send(RenderMessage::SetAccent { color });
+    }
+
     /// Ask the render thread to tear down its GL context and release the window.
     pub(crate) fn submit_suspend(&self) {
         let _ = self.sender.send(RenderMessage::Suspend);
@@ -516,6 +752,23 @@ impl RenderCore {
         // Render-thread state: GL context + femtovg canvas, created on first
         // `Configure` message.
         let mut gl_state: Option<GlRenderState> = None;
+        // Mirror state lives only here, on this thread — it would make
+        // `RenderCore` non-Send otherwise.
+        let mut render_window_adapter: Option<Rc<dyn WindowAdapter>> = None;
+        let mut render_controls: HashMap<u64, ControlRegion> = HashMap::new();
+        // Render-side item behind each control id, so property loans can
+        // assign to the mirror tree item directly.  Stays on this thread.
+        let mut render_item_rcs: HashMap<u64, ItemRc> = HashMap::new();
+        let mut hovered_controls: HashSet<u64> = HashSet::new();
+        let mut pressed_controls: HashSet<u64> = HashSet::new();
+        // Keeps the mirror component tree alive for the lifetime of the
+        // render thread (the strong handle owns the ItemTree).  Moved in
+        // only from `AttachComponent`; never leaves this thread.
+        let mut render_component: Option<Box<dyn std::any::Any>> = None;
+        // Last system accent forwarded by the UI thread; applied to the
+        // mirror context on attach in case the accent update arrives before
+        // the mirror component exists.
+        let mut accent: Option<Color> = None;
 
         while let Ok(msg) = self.rx.recv() {
             match msg {
@@ -523,6 +776,23 @@ impl RenderCore {
                     match GlRenderState::new(window, width, height, scale_factor) {
                         Ok(state) => {
                             gl_state = Some(state);
+                            // If a mirror component was attached before the
+                            // GL context existed, present it now.
+                            if render_component.is_some() {
+                                if let Some(frame) = re_encode_mirror(
+                                    &render_window_adapter,
+                                    &mut render_controls,
+                                    &mut render_item_rcs,
+                                ) {
+                                    let overlay = &self.overlay;
+                                    gl_state.as_mut().unwrap().render_scene(
+                                        frame,
+                                        overlay,
+                                        &self.frame_queue,
+                                        &self.host,
+                                    );
+                                }
+                            }
                         }
                         Err(e) => {
                             eprintln!("dualslint render thread: GL init failed: {e}");
@@ -552,13 +822,171 @@ impl RenderCore {
                         state.repaint_retained(overlay);
                     }
                 }
+                RenderMessage::SetAccent { color } => {
+                    accent = Some(color);
+                    if let Some(adapter) = &render_window_adapter {
+                        let context = WindowInner::from_pub(adapter.window()).context();
+                        context.set_accent_color(color);
+                    }
+                }
                 RenderMessage::User(f) => {
                     f();
+                }
+                RenderMessage::AttachComponent { factory } => {
+                    // Seed the headless platform on this thread (ignore
+                    // AlreadySet — set_platform succeeds as long as this
+                    // thread's GLOBAL_CONTEXT is still free).
+                    let _ = i_slint_core::platform::set_platform(Box::new(RenderMirrorPlatform));
+                    render_component = Some(factory());
+                    render_window_adapter = HEADLESS_ADAPTER_SLOT.with(|slot| slot.get().cloned());
+                    // Mirror the host's system accent into the mirror context
+                    // so widget palettes (checked boxes, etc.) resolve the
+                    // same colour the host would, instead of the default.
+                    if let Some(accent_color) = accent
+                        && let Some(adapter) = &render_window_adapter
+                    {
+                        WindowInner::from_pub(adapter.window())
+                            .context()
+                            .set_accent_color(accent_color);
+                    }
+                    // From here on the render thread owns every control.  Drop
+                    // the UI-thread's publish so peers never borrow stale ids.
+                    if let Some(map) = coordinate_map() {
+                        map.lock().unwrap().clear();
+                    }
+                    if let Some(frame) = re_encode_mirror(
+                        &render_window_adapter,
+                        &mut render_controls,
+                        &mut render_item_rcs,
+                    ) {
+                        if let Some(state) = &mut gl_state {
+                            let overlay = &self.overlay;
+                            state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                        }
+                    }
+                }
+                RenderMessage::ApplyControlState { id, hovered, pressed } => {
+                    let Some(mirror) = &render_window_adapter else {
+                        continue;
+                    };
+                    let Some(region) = render_controls.get(&id).cloned() else {
+                        continue;
+                    };
+                    let geometry = region.geometry;
+                    let center = LogicalPoint::from_lengths(
+                        LogicalLength::new(geometry.min_x() + geometry.width() / 2.0),
+                        LogicalLength::new(geometry.min_y() + geometry.height() / 2.0),
+                    );
+                    // Hover transition
+                    if hovered && hovered_controls.insert(id) {
+                        i_slint_core::api::Window::dispatch_event(
+                            mirror.window(),
+                            WindowEvent::internal(BackendMouseEvent::Moved {
+                                position: center,
+                                touch_finger_id: 0,
+                            }),
+                        );
+                    } else if !hovered && hovered_controls.remove(&id) {
+                        i_slint_core::api::Window::dispatch_event(
+                            mirror.window(),
+                            WindowEvent::internal(BackendMouseEvent::Moved {
+                                position: center,
+                                touch_finger_id: 0,
+                            }),
+                        );
+                    }
+                    // Press / release transitions: only send an edge so a
+                    // held button keeps `pressed` visible across re-encodes.
+                    if pressed && pressed_controls.insert(id) {
+                        i_slint_core::api::Window::dispatch_event(
+                            mirror.window(),
+                            WindowEvent::internal(BackendMouseEvent::Pressed {
+                                position: center,
+                                button: PointerEventButton::Left,
+                                click_count: 0,
+                                touch_finger_id: 0,
+                            }),
+                        );
+                    } else if !pressed && pressed_controls.remove(&id) {
+                        i_slint_core::api::Window::dispatch_event(
+                            mirror.window(),
+                            WindowEvent::internal(BackendMouseEvent::Released {
+                                position: center,
+                                button: PointerEventButton::Left,
+                                click_count: 0,
+                                touch_finger_id: 0,
+                            }),
+                        );
+                    }
+                    // Re-encode and present from the mirror tree so the
+                    // button state update is visible.
+                    if let Some(frame) = re_encode_mirror(
+                        &render_window_adapter,
+                        &mut render_controls,
+                        &mut render_item_rcs,
+                    ) {
+                        if let Some(state) = &mut gl_state {
+                            let overlay = &self.overlay;
+                            state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                        }
+                    }
+                }
+                RenderMessage::SetControlProperty { id, property, value, response } => {
+                    let ok = render_item_rcs
+                        .get(&id)
+                        .map(|item_rc| apply_control_property(item_rc, &property, &value))
+                        .unwrap_or(false);
+                    let _ = response.send(ok);
+                    // Re-encode and re-present so the borrowed property change
+                    // is visible on screen (also refreshes the id→item map).
+                    if ok {
+                        if let Some(frame) = re_encode_mirror(
+                            &render_window_adapter,
+                            &mut render_controls,
+                            &mut render_item_rcs,
+                        ) {
+                            if let Some(state) = &mut gl_state {
+                                let overlay = &self.overlay;
+                                state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                            }
+                        }
+                    }
+                }
+                RenderMessage::HitTest { x, y, response } => {
+                    // Smallest containing control wins, so nested elements hit
+                    // before their parent rectangle.
+                    let hit = render_controls
+                        .values()
+                        .filter(|r| r.geometry.contains(LogicalPoint::new(x, y)))
+                        .min_by_key(|r| {
+                            let g = r.geometry;
+                            (g.width() * g.height()) as u32
+                        })
+                        .map(|r| r.id);
+                    let _ = response.send(hit);
+                }
+                RenderMessage::RequestRedraw => {
+                    if let Some(frame) = re_encode_mirror(
+                        &render_window_adapter,
+                        &mut render_controls,
+                        &mut render_item_rcs,
+                    ) {
+                        if let Some(state) = &mut gl_state {
+                            let overlay = &self.overlay;
+                            state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                        }
+                    }
                 }
                 RenderMessage::Suspend => {
                     // Drop the GL context + canvas and release the winit window
                     // Arc so the UI thread can destroy the native window.
                     gl_state = None;
+                    render_window_adapter = None;
+                    render_component = None;
+                    render_controls.clear();
+                    render_item_rcs.clear();
+                    hovered_controls.clear();
+                    pressed_controls.clear();
                 }
                 RenderMessage::Quit => break,
             }
@@ -567,6 +995,102 @@ impl RenderCore {
 
     pub(crate) fn host(&self) -> &RenderHost {
         &self.host
+    }
+}
+
+/// Encode a scene frame from the render-owned mirror component, snapshot the
+/// resulting control regions and the render-side item behind each control id.
+/// Returns `None` if the adapter is not ready yet.
+fn re_encode_mirror(
+    render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
+    render_controls: &mut HashMap<u64, ControlRegion>,
+    render_item_rcs: &mut HashMap<u64, ItemRc>,
+) -> Option<SceneFrame> {
+    let adapter = render_window_adapter.as_ref()?;
+    let adapter: &dyn WindowAdapter = &**adapter;
+    let (frame, item_refs) = crate::snapshot::encode_window_scene_full(adapter.window()).ok()?;
+    *render_controls = frame.controls.iter().map(|r| (r.id, r.clone())).collect();
+    render_item_rcs.clear();
+    render_item_rcs.extend(item_refs);
+    Some(frame)
+}
+
+/// Apply a dynamic, property-name based control property loan onto the
+/// render-side mirror item.  Uses the upstream `Property::set` semantics (a
+/// previous binding is detached), and clears the compiler's constant flag
+/// first so bindings that compile to a literal value stay writable.  Returns
+/// `false` if the item or property is not known.
+fn apply_control_property(item_rc: &ItemRc, property: &str, value: &ControlPropertyValue) -> bool {
+    use i_slint_core::graphics::{Brush, Color};
+    fn force_set<T: Clone + PartialEq>(property: &i_slint_core::properties::Property<T>, value: T) {
+        property.release_constant();
+        property.set(value);
+    }
+    match value {
+        ControlPropertyValue::Text(text) => {
+            let text = i_slint_core::SharedString::from(text.as_str());
+            if property == "text" {
+                if let Some(item) = item_rc.downcast::<i_slint_core::items::ComplexText>() {
+                    force_set(&item.as_pin_ref().get_ref().text, text);
+                    return true;
+                }
+                if let Some(item) = item_rc.downcast::<i_slint_core::items::SimpleText>() {
+                    force_set(&item.as_pin_ref().get_ref().text, text);
+                    return true;
+                }
+                if let Some(item) = item_rc.downcast::<i_slint_core::items::TextInput>() {
+                    force_set(&item.as_pin_ref().get_ref().text, text);
+                    return true;
+                }
+            }
+            false
+        }
+        ControlPropertyValue::Color { r, g, b, a } => {
+            let brush = Brush::SolidColor(Color::from_argb_u8(*a, *r, *g, *b));
+            if property == "background" {
+                if let Some(item) = item_rc.downcast::<i_slint_core::items::Rectangle>() {
+                    force_set(&item.as_pin_ref().get_ref().background, brush.clone());
+                    return true;
+                }
+                if let Some(item) = item_rc.downcast::<i_slint_core::items::BasicBorderRectangle>()
+                {
+                    force_set(&item.as_pin_ref().get_ref().background, brush.clone());
+                    return true;
+                }
+                if let Some(item) = item_rc.downcast::<i_slint_core::items::BorderRectangle>() {
+                    force_set(&item.as_pin_ref().get_ref().background, brush);
+                    return true;
+                }
+            }
+            if property == "color" {
+                if let Some(item) = item_rc.downcast::<i_slint_core::items::ComplexText>() {
+                    force_set(&item.as_pin_ref().get_ref().color, brush.clone());
+                    return true;
+                }
+                if let Some(item) = item_rc.downcast::<i_slint_core::items::SimpleText>() {
+                    force_set(&item.as_pin_ref().get_ref().color, brush);
+                    return true;
+                }
+            }
+            false
+        }
+        ControlPropertyValue::Bool(value) => {
+            if let Some(item) = item_rc.downcast::<i_slint_core::items::TouchArea>() {
+                let item = item.as_pin_ref();
+                match property {
+                    "enabled" => force_set(&item.get_ref().enabled, *value),
+                    "pressed" => force_set(&item.get_ref().pressed, *value),
+                    "has-hover" => force_set(&item.get_ref().has_hover, *value),
+                    _ => return false,
+                }
+                return true;
+            }
+            false
+        }
+        ControlPropertyValue::Number(_) => {
+            // No numeric property is wired up yet.
+            false
+        }
     }
 }
 
@@ -579,6 +1103,7 @@ pub(crate) fn channel(
     let host = RenderHost {
         sender: tx,
         event_loop_proxy: Some(event_loop_proxy),
+        attached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let core = RenderCore::new(rx, host.clone(), frame_queue.clone());
     (host, core, frame_queue)
@@ -591,6 +1116,16 @@ pub(crate) fn channel(
 /// Obtain the [`RenderHost`] for the current process.
 pub fn host() -> Option<RenderHost> {
     GLOBAL_RENDER_HOST.get().cloned()
+}
+
+/// Forward the host's system accent colour to the render thread's mirror
+/// context.  Called whenever the winit backend resolves the accent from the
+/// OS (xdg-desktop-settings watcher or the winit window adapter); a no-op
+/// when the render thread has not been started.
+pub fn forward_system_accent(color: Color) {
+    if let Some(host) = GLOBAL_RENDER_HOST.get() {
+        host.submit_accent(color);
+    }
 }
 
 /// Access the shared coordinate table.  Returns `None` until the winit

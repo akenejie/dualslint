@@ -137,6 +137,9 @@ fn apply_accent_value(value: zbus::zvariant::OwnedValue, cx: &SettingsContext) {
         && let Some(ctx) = cx.ctx.upgrade()
     {
         ctx.set_accent_color(color);
+        // Mirror the accent into the dualslint render thread so its headless
+        // mirror context renders the same widget palette as the host context.
+        crate::render_thread::forward_system_accent(color);
     }
 }
 

@@ -26,7 +26,9 @@ use i_slint_core::lengths::{
     LogicalBorderRadius, LogicalPoint, LogicalRect, LogicalSize, LogicalVector, PhysicalPx,
     ScaleFactor,
 };
+use i_slint_core::platform::PlatformError;
 use i_slint_core::textlayout::sharedparley::{self, GlyphRenderer, fontique, parley};
+use i_slint_core::window::WindowInner;
 
 use crate::render_thread::{
     ControlRegion, DrawCommand, GradientStop, LineCapDesc, LineJoinDesc, PaintDesc, PathEvent,
@@ -110,7 +112,7 @@ fn femtovg_line_join(join: items::LineJoin) -> LineJoinDesc {
 
 /// Unique u64 id from an ItemRc (component ptr + item index), used for
 /// cache keys and control regions.
-fn item_rc_as_id(item_rc: &ItemRc) -> u64 {
+pub(crate) fn item_rc_as_id(item_rc: &ItemRc) -> u64 {
     let mut hasher = DefaultHasher::new();
     let ptr = &**item_rc.item_tree() as *const _ as usize;
     ptr.hash(&mut hasher);
@@ -140,6 +142,11 @@ pub(crate) struct SnapshotEncoder {
     pub(crate) commands: Vec<DrawCommand>,
     /// Control regions for this frame (one per visible item).
     pub(crate) controls: Vec<ControlRegion>,
+    /// The render-side item behind each control id, so the render thread —
+    /// which owns the mirror tree — can loan out its properties.  This is
+    /// only meaningful on the render thread; the UI thread drops it before
+    /// sending the `SceneFrame`.
+    pub(crate) item_refs: Vec<(u64, ItemRc)>,
     /// Current transform state stack.
     state: Vec<State>,
     /// Physical pixel dimensions of the window.
@@ -173,6 +180,7 @@ impl SnapshotEncoder {
         Self {
             commands: Vec::new(),
             controls: Vec::new(),
+            item_refs: Vec::new(),
             state: vec![State {
                 scissor: LogicalRect::new(LogicalPoint::default(), logical_size),
                 global_alpha: 1.0,
@@ -193,9 +201,10 @@ impl SnapshotEncoder {
         self.background = Some([color.red(), color.green(), color.blue(), color.alpha()]);
     }
 
-    /// Finish encoding and return the complete `SceneFrame`.
-    pub(crate) fn finish(self) -> SceneFrame {
-        SceneFrame {
+/// Finish encoding and return the complete `SceneFrame` plus the render-side
+/// item behind each control id.
+pub(crate) fn finish(self) -> (SceneFrame, Vec<(u64, ItemRc)>) {
+        let frame = SceneFrame {
             width: self.width,
             height: self.height,
             scale_factor: self.scale_factor.get(),
@@ -203,13 +212,30 @@ impl SnapshotEncoder {
             fonts: self.fonts,
             commands: self.commands,
             controls: self.controls,
-        }
+        };
+        (frame, self.item_refs)
     }
 
     fn alloc_key(&mut self) -> u64 {
         let k = self.next_key;
         self.next_key = k.wrapping_add(1);
         k
+    }
+
+    /// Publish this item as a control region (a target for hit-testing and
+    /// `RenderHost::apply_control_state`).  Geometry is in window-space logical
+    /// pixels.
+    fn push_control(&mut self, item: &ItemRc, size: LogicalSize) {
+        if size.is_empty() {
+            return;
+        }
+        let origin = item.geometry().origin;
+        let window_origin = item.map_to_window(origin);
+        self.controls.push(ControlRegion {
+            id: item_rc_as_id(item),
+            geometry: LogicalRect::new(window_origin, size),
+        });
+        self.item_refs.push((item_rc_as_id(item), item.clone()));
     }
 
     fn push(&mut self, cmd: DrawCommand) {
@@ -229,7 +255,7 @@ impl ItemRenderer for SnapshotEncoder {
     fn draw_rectangle(
         &mut self,
         rect: Pin<&dyn RenderRectangle>,
-        _self_rc: &ItemRc,
+        self_rc: &ItemRc,
         size: LogicalSize,
         _cache: &CachedRenderingData,
     ) {
@@ -244,12 +270,13 @@ impl ItemRenderer for SnapshotEncoder {
             None => return,
         };
         self.push(DrawCommand::FillRect { rect: geometry, paint, anti_alias: false });
+        self.push_control(self_rc, size);
     }
 
     fn draw_border_rectangle(
         &mut self,
         rect: Pin<&dyn RenderBorderRectangle>,
-        _self_rc: &ItemRc,
+        self_rc: &ItemRc,
         size: LogicalSize,
         _cache: &CachedRenderingData,
     ) {
@@ -284,6 +311,7 @@ impl ItemRenderer for SnapshotEncoder {
                 });
             }
         }
+        self.push_control(self_rc, size);
     }
 
     fn draw_window_background(
@@ -392,6 +420,7 @@ impl ItemRenderer for SnapshotEncoder {
         );
         sharedparley::draw_text(self, text, Some(self_rc), size, Some(&layout_cache));
         self.text_layout_cache = layout_cache;
+        self.push_control(self_rc, size);
     }
 
     fn draw_text_input(
@@ -886,4 +915,85 @@ impl GlyphRenderer for SnapshotEncoder {
             border: border_desc,
         });
     }
+}
+
+/// Serialise the given window's item tree into a `SceneFrame`, independent of
+/// which thread / window adapter the component lives on.  This is the shared
+/// encode path for both sides of the 2-thread split:
+///
+/// * the UI thread encodes its own component and submits the frame to the
+///   render thread (`DualThreadRenderer::encode_scene`), and
+/// * the render thread encodes the render-owned component (instantiated on
+///   the render thread via `RenderHost::attach_component`) and composites the
+///   frame directly — this is the authoritative draw path: text shaping runs
+///   on the render thread through the render component's own font context.
+///
+/// The window background is handled as in the UI path: a solid color becomes
+/// the clear colour, any other brush is serialised as a full-viewport rect.
+pub(crate) fn encode_window_scene(
+    window: &i_slint_core::api::Window,
+) -> Result<SceneFrame, PlatformError> {
+    encode_window_scene_full(window).map(|(frame, _)| frame)
+}
+
+/// Like [`encode_window_scene`] but also returns the render-side `ItemRc`
+/// behind every control id.  Used by the render thread's mirror to loan out
+/// control properties; the `ItemRc`s are not `Send` and must never leave the
+/// thread that encoded them.
+pub(crate) fn encode_window_scene_full(
+    window: &i_slint_core::api::Window,
+) -> Result<(SceneFrame, Vec<(u64, ItemRc)>), PlatformError> {
+    let window_inner = WindowInner::from_pub(window);
+    let scale_factor = ScaleFactor::new(window_inner.scale_factor());
+    let window_adapter = window_inner.window_adapter();
+    let size = window_adapter.size();
+    if size.width == 0 || size.height == 0 {
+        return Ok((SceneFrame {
+            width: 0,
+            height: 0,
+            scale_factor: scale_factor.get(),
+            background: None,
+            fonts: Vec::new(),
+            commands: Vec::new(),
+            controls: Vec::new(),
+        }, Vec::new()));
+    }
+
+    let mut encoder =
+        SnapshotEncoder::new(size.width, size.height, scale_factor, window_adapter.clone());
+
+    if let Some(window_item_rc) = window_inner.window_item_rc() {
+        let window_item = window_item_rc.downcast::<i_slint_core::items::WindowItem>().unwrap();
+        match window_item.as_pin_ref().background() {
+            i_slint_core::graphics::Brush::SolidColor(color) => {
+                encoder.set_background(color);
+            }
+            _ => {
+                encoder.draw_rectangle(
+                    window_item.as_pin_ref(),
+                    &window_item_rc,
+                    i_slint_core::lengths::logical_size_from_api(
+                        window.size().to_logical(window_inner.scale_factor()),
+                    ),
+                    &window_item.as_pin_ref().cached_rendering_data,
+                );
+            }
+        }
+    }
+
+    window_inner.draw_contents(|components, post_render| {
+        for (component, origin) in components {
+            if let Some(component) = i_slint_core::item_tree::ItemTreeWeak::upgrade(component) {
+                i_slint_core::item_rendering::render_component_items(
+                    &component,
+                    &mut encoder,
+                    *origin,
+                    &window_adapter,
+                );
+            }
+        }
+        post_render(&mut encoder);
+    });
+
+    Ok(encoder.finish())
 }
