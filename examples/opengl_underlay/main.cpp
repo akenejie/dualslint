@@ -53,7 +53,7 @@ public:
         case slint::RenderingState::BeforeRendering:
             if (auto app = app_weak.lock()) {
                 render((*app)->get_rotation_enabled());
-                (*app)->window().request_redraw();
+                slint::render_thread::request_redraw();
             }
             break;
         case slint::RenderingState::AfterRendering:

@@ -163,7 +163,7 @@ pub fn main() {
                             app.get_requested_texture_height() as u32,
                         );
                         app.set_texture(slint::Image::try_from(texture).unwrap());
-                        app.window().request_redraw();
+                        slint::render_thread::request_redraw();
                     }
                 }
                 slint::RenderingState::AfterRendering => {}

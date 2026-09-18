@@ -170,7 +170,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             slint::RenderingState::BeforeRendering => {
                 let Some(app) = app_weak.upgrade() else { return };
-                app.window().request_redraw();
+                slint::render_thread::request_redraw();
 
                 let channels = bevy_channels_setup.borrow();
                 let Some((new_texture_receiver, control_message_sender)) = channels.as_ref()

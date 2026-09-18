@@ -98,9 +98,6 @@ export interface Window {
     /** Hides the window, so that it is not visible anymore. */
     hide(): void;
 
-    /** Issues a request to the windowing system to re-render the contents of the window. */
-    requestRedraw(): void;
-
     /**
      * Dispatches a window event to the scene.
      *

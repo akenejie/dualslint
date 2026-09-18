@@ -15,7 +15,7 @@ path = "main.rs"
 name = "opengl_texture"
 
 [dependencies]
-slint = { path = "../../api/rs/slint" }
+slint = { path = "../../api/rs/slint", features = ["backend-winit"] }
 glow = { workspace = true }
 web-time = { version = "1.0" }
 

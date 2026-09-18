@@ -117,7 +117,7 @@ fn test_empty_window() {
     // Let's emulate this scenario here using public platform API.
 
     let msw = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-    msw.window().request_redraw();
+    msw.request_redraw();
     let mut region = None;
     let render_called = msw.draw_if_needed(|renderer| {
         let mut buffer = i_slint_core::graphics::SharedPixelBuffer::<

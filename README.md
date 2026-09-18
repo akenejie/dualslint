@@ -217,7 +217,7 @@ pub struct SceneFrame {
 
 ## ワークフロー（1フレーム）
 
-1. アプリが状態を更新 → `Window::request_redraw()`。
+1. アプリが状態を更新 → 再描画要求（描画スレッド経由 `render_thread::request_redraw()`）。
 2. winit が `RedrawRequested` を発火 → `WinitWindowAdapter::draw()` が `DualThreadRenderer::render()` を呼ぶ。
 3. `SnapshotEncoder` が item tree を巡回し、`SceneFrame` に直列化 → `RenderHost::submit_scene()`。
 4. 描画スレッドが `SceneFrame` をリプレイ（クリア → `DrawCommand` 列 → `overlay` → `flush_to_output` → `swap_buffers`）。
@@ -249,8 +249,17 @@ pub struct SceneFrame {
 
 ## 上流 API との関係
 
-- **削除・変更された公開 API はありません。** 既存の `WinitWindowAdapter`・`Platform`・`Renderer`・
-  `with_window_event_handler()` 等はシグネチャを保ったまま動作します。
+- **削除された公開 API:** `Window::request_redraw()`（Rust / C++ / Node）と FFI `slint_windowrc_request_redraw`。
+  描画の権威が描画スレッド（`RenderHost` / mirror 装着時は render 側コンポーネント）にあるため、
+  UI スレッドへの再描画要求は意味を成さず、mirror 装着時に silent no-op になるため削除しました。
+  再描画を求める場合は `slint::render_thread::request_redraw()`（C++: `slint::render_thread::request_redraw()`）を使用します。
+  この関数は winit バックエンドなら常に利用でき、winit 系 feature（`backend-winit` / `backend-winit-x11` /
+  `backend-winit-wayland` / `backend-default`）のいずれかで `slint::render_thread` が公開されます。
+- 再描画要求の経路: mirror を装着していない（= 描画スレッドが描画の権威でない）場合は、描画スレッドが
+  `RenderHost::send_redraw()` で UI スレッドへ要求を送り返し、UI 側の通常レンダラが再描画します。
+  そのため `render_thread::request_redraw()` は 2 スレッド GL パスに限らず全 winit レンダラで機能します。
+- その他の公開 API（`WinitWindowAdapter`・`Platform`・`Renderer`・`with_window_event_handler()` 等）は
+  シグネチャを保ったまま動作します。
 - 動作差は以下のとおりです（いずれもシグネチャ不変）:
   - `WinitWindowAdapter::request_redraw()` … スロットル/合流をやめ、毎回 winit へ直接転送
   - デフォルトレンダラがフォーク版 `DualThreadRenderer` になる（`renderer-femtovg` 時）

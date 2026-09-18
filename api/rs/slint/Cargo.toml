@@ -170,18 +170,18 @@ backend-qt = ["i-slint-backend-selector/backend-qt", "std", "i-slint-backend-qt"
 ## It supports Windows, macOS, web browsers, X11 and Wayland. X11 and wayland are only available when
 ## compiling for Linux or other Unix-like operating systems. With this feature, both X11 and Wayland are supported.
 ## For a smaller build, omit this feature and select one of the other specific `backend-winit-XX` features.
-backend-winit = ["i-slint-backend-selector/backend-winit", "std"]
+backend-winit = ["i-slint-backend-selector/backend-winit", "dep:i-slint-backend-winit", "std"]
 
 ## Similar to `backend-winit` this enables the winit based event loop but only
 ## with support for the X Window System on Unix.
-backend-winit-x11 = ["i-slint-backend-selector/backend-winit-x11", "std"]
+backend-winit-x11 = ["i-slint-backend-selector/backend-winit-x11", "dep:i-slint-backend-winit", "std"]
 
 ## Similar to `backend-winit` this enables the winit based event loop but only
 ## with support for the Wayland window system on Unix.
-backend-winit-wayland = ["i-slint-backend-selector/backend-winit-wayland", "std"]
+backend-winit-wayland = ["i-slint-backend-selector/backend-winit-wayland", "dep:i-slint-backend-winit", "std"]
 
 ## Alias to a backend and renderer that depends on the platform.
-backend-default = ["i-slint-backend-selector/default"]
+backend-default = ["i-slint-backend-selector/default", "dep:i-slint-backend-winit"]
 
 # deprecated aliases
 renderer-winit-femtovg = ["renderer-femtovg"]
@@ -314,13 +314,16 @@ unicode-segmentation = { workspace = true }
 wgpu-29 = { workspace = true, optional = true }
 wgpu-30 = { workspace = true, optional = true }
 
-i-slint-backend-winit = { workspace = true, optional = true }
 i-slint-renderer-skia = { workspace = true, optional = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 # FemtoVG is disabled on android because it doesn't compile without setting RUST_FONTCONFIG_DLOPEN=on
 # end even then wouldn't work because it can't load fonts
 i-slint-renderer-femtovg = { workspace = true, optional = true }
+# The winit backend (and its `render_thread` module) is desktop/embedded;
+# on Android the dedicated android-activity backend is selected instead, so
+# the optional winit dependency must not be activated there.
+i-slint-backend-winit = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 i-slint-backend-android-activity = { workspace = true, optional = true }

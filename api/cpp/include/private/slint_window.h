@@ -275,8 +275,6 @@ public:
                 new F(std::move(callback)));
     }
 
-    void request_redraw() const { cbindgen_private::slint_windowrc_request_redraw(&inner); }
-
     slint::PhysicalPosition position() const
     {
         slint::PhysicalPosition pos;
@@ -432,13 +430,6 @@ public:
     {
         private_api::assert_main_thread();
         return inner.on_close_requested(std::forward<F>(callback));
-    }
-
-    /// This function issues a request to the windowing system to redraw the contents of the window.
-    void request_redraw() const
-    {
-        private_api::assert_main_thread();
-        inner.request_redraw();
     }
 
     /// Returns the position of the window on the screen, in physical screen coordinates and

@@ -161,7 +161,7 @@ public:
                 auto height = (*app)->get_requested_texture_height();
                 auto texture = render(red, green, blue, width, height);
                 (*app)->set_texture(texture);
-                (*app)->window().request_redraw();
+                slint::render_thread::request_redraw();
             }
             break;
         case slint::RenderingState::AfterRendering:

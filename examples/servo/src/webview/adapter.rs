@@ -138,6 +138,6 @@ impl SlintServoAdapter {
         let slint_image = rendering_adapter.current_framebuffer_as_image();
 
         app.global::<WebviewLogic>().set_web_content(slint_image);
-        app.window().request_redraw();
+        slint::render_thread::request_redraw();
     }
 }

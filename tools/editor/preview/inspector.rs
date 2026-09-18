@@ -176,7 +176,7 @@ pub(super) fn cancel() {
         }
     }
     if let Some(instance) = component_instance() {
-        instance.window().request_redraw();
+        slint::render_thread::request_redraw();
     }
 }
 
@@ -212,7 +212,7 @@ fn preview_value(
     }
     drop(overrides);
     if let Some(instance) = component_instance() {
-        instance.window().request_redraw();
+        slint::render_thread::request_redraw();
     }
     true
 }

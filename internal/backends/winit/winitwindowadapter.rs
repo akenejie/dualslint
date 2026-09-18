@@ -1814,9 +1814,7 @@ impl WindowAdapter for WinitWindowAdapter {
         // We instead forward every request straight to winit and let the native
         // surface present/coalesce. This guarantees each `request_redraw()` ends
         // up as a `RedrawRequested` -> `window.draw()` in the same event cycle.
-        if let WinitWindowOrNone::HasWindow { window, .. } =
-            &*self.winit_window_or_none.borrow()
-        {
+        if let WinitWindowOrNone::HasWindow { window, .. } = &*self.winit_window_or_none.borrow() {
             window.request_redraw();
         }
     }

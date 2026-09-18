@@ -1399,7 +1399,7 @@ fn override_selected_element_rotation_impl(
         Some(())
     })?;
 
-    component_instance.window().request_redraw();
+    slint::render_thread::request_redraw();
     Some(new_rotation)
 }
 
@@ -1534,7 +1534,7 @@ fn override_selected_element_geometry_impl(
         }
     });
 
-    component_instance.window().request_redraw();
+    slint::render_thread::request_redraw();
 }
 
 fn override_selected_element_border_radius(
@@ -1584,7 +1584,7 @@ fn override_selected_element_border_radius(
         (**property_override).set(Some(slint_interpreter::Value::Number(length as f64)));
     });
 
-    component_instance.window().request_redraw();
+    slint::render_thread::request_redraw();
 }
 
 fn persist_selected_element_border_radius() {

@@ -531,11 +531,6 @@ impl Window {
         self.0.on_close_requested(callback);
     }
 
-    /// This function issues a request to the windowing system to redraw the contents of the window.
-    pub fn request_redraw(&self) {
-        self.0.window_adapter().request_redraw()
-    }
-
     /// This function returns the scale factor that allows converting between logical and
     /// physical pixels.
     pub fn scale_factor(&self) -> f32 {

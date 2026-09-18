@@ -6,7 +6,7 @@
 use crate::testing::{TestCaseOptions, compare_images};
 use i_slint_core::graphics::{IntRect, Rgb8Pixel, SharedPixelBuffer, euclid};
 use i_slint_core::lengths::LogicalRect;
-use i_slint_core::platform::PlatformError;
+use i_slint_core::platform::{PlatformError, WindowAdapter};
 use i_slint_core::renderer::RendererSealed;
 use slint::platform::software_renderer::{
     LineBufferProvider, MinimalSoftwareWindow, RenderingRotation,

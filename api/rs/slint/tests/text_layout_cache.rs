@@ -4,6 +4,7 @@
 mod common;
 
 use i_slint_core::input::{InternalKeyEvent, KeyEventType};
+use slint::platform::WindowAdapter;
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, SoftwareRenderer, TargetPixel,
 };

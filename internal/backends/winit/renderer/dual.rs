@@ -121,14 +121,13 @@ impl WinitCompatibleRenderer for DualThreadRenderer {
     ) -> Result<Arc<winit::window::Window>, PlatformError> {
         use crate::winit_compat::WindowSurfaceSizeExt;
 
-        let winit_window =
-            Arc::new(active_event_loop.create_window(window_attributes).map_err(
-                |winit_os_error| {
-                    PlatformError::from(format!(
-                        "dualslint: Could not create winit window for GL rendering: {winit_os_error}"
-                    ))
-                },
-            )?);
+        let winit_window = Arc::new(active_event_loop.create_window(window_attributes).map_err(
+            |winit_os_error| {
+                PlatformError::from(format!(
+                    "dualslint: Could not create winit window for GL rendering: {winit_os_error}"
+                ))
+            },
+        )?);
 
         #[cfg(target_family = "windows")]
         {

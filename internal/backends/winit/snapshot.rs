@@ -201,9 +201,9 @@ impl SnapshotEncoder {
         self.background = Some([color.red(), color.green(), color.blue(), color.alpha()]);
     }
 
-/// Finish encoding and return the complete `SceneFrame` plus the render-side
-/// item behind each control id.
-pub(crate) fn finish(self) -> (SceneFrame, Vec<(u64, ItemRc)>) {
+    /// Finish encoding and return the complete `SceneFrame` plus the render-side
+    /// item behind each control id.
+    pub(crate) fn finish(self) -> (SceneFrame, Vec<(u64, ItemRc)>) {
         let frame = SceneFrame {
             width: self.width,
             height: self.height,
@@ -948,15 +948,18 @@ pub(crate) fn encode_window_scene_full(
     let window_adapter = window_inner.window_adapter();
     let size = window_adapter.size();
     if size.width == 0 || size.height == 0 {
-        return Ok((SceneFrame {
-            width: 0,
-            height: 0,
-            scale_factor: scale_factor.get(),
-            background: None,
-            fonts: Vec::new(),
-            commands: Vec::new(),
-            controls: Vec::new(),
-        }, Vec::new()));
+        return Ok((
+            SceneFrame {
+                width: 0,
+                height: 0,
+                scale_factor: scale_factor.get(),
+                background: None,
+                fonts: Vec::new(),
+                commands: Vec::new(),
+                controls: Vec::new(),
+            },
+            Vec::new(),
+        ));
     }
 
     let mut encoder =

@@ -26,6 +26,10 @@
 #    include <memory>
 #endif
 
+/// Request a window repaint through the render thread; see
+/// `slint::render_thread::request_redraw()`.
+extern "C" void slint_render_thread_request_redraw();
+
 /// The `slint` namespace is the primary entry point into the Slint C++ API.
 /// All available types are in this namespace.
 ///
@@ -871,5 +875,24 @@ inline void set_xdg_app_id(std::string_view xdg_app_id)
     SharedString s = xdg_app_id;
     cbindgen_private::slint_set_xdg_app_id(&s);
 }
+
+/// The `render_thread` namespace groups entry points that address the render
+/// thread of the 2-thread render separation; the UI thread and worker threads
+/// use them instead of going through a window adapter. In particular
+/// [`slint::render_thread::request_redraw()`] requests a repaint of the
+/// window directly on the render thread, whether or not a mirror component is
+/// attached.
+inline namespace render_thread {
+    /// Request a window repaint through the render thread.
+    ///
+    /// This is the replacement for the removed `Window::request_redraw()`:
+    /// the render thread owns the mirror component and re-encodes and
+    /// re-presents the frame when asked, regardless of the UI-side window
+    /// state. It is a no-op when the render thread was never started.
+    inline void request_redraw()
+    {
+        slint_render_thread_request_redraw();
+    }
+} // namespace render_thread
 
 } // namespace slint

@@ -266,7 +266,7 @@ pub fn main() {
                 slint::RenderingState::BeforeRendering => {
                     if let (Some(underlay), Some(app)) = (underlay.as_mut(), app_weak.upgrade()) {
                         underlay.render(app.get_rotation_enabled());
-                        app.window().request_redraw();
+                        slint::render_thread::request_redraw();
                     }
                 }
                 slint::RenderingState::AfterRendering => {}

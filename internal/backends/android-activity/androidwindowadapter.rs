@@ -221,14 +221,30 @@ impl AndroidWindowAdapter {
                         )?;
                     }
 
-                    self.renderer.set_window_handle(
-                        Arc::new(w),
-                        Arc::new(DummyDisplayHandle),
-                        size,
-                        self.requested_graphics_api.borrow().clone(),
-                        false,
-                    )?;
-                    self.resize()?;
+                    if let Some(host) = crate::render_thread::host()
+                        && host.has_attached_component()
+                    {
+                        // 2-thread path: hand the native window to the render
+                        // thread, which binds its own SkiaRenderer to it. The
+                        // UI thread must not touch the surface any more.
+                        host.submit_configure(
+                            Arc::new(w),
+                            size.width,
+                            size.height,
+                            scale_factor,
+                            self.requested_graphics_api.borrow().clone(),
+                        );
+                        self.resize()?;
+                    } else {
+                        self.renderer.set_window_handle(
+                            Arc::new(w),
+                            Arc::new(DummyDisplayHandle),
+                            size,
+                            self.requested_graphics_api.borrow().clone(),
+                            false,
+                        )?;
+                        self.resize()?;
+                    }
 
                     // Fixes a problem for old Android versions: the soft input always prompt out on startup.
                     #[cfg(feature = "native-activity")]
@@ -269,6 +285,9 @@ impl AndroidWindowAdapter {
                 }
             }
             PollEvent::Main(MainEvent::Destroy) => {
+                if let Some(host) = crate::render_thread::host() {
+                    host.submit_suspend();
+                }
                 return Ok(ControlFlow::Break(()));
             }
             _ => (),
@@ -500,6 +519,14 @@ impl AndroidWindowAdapter {
         let Some(win) = self.app.native_window() else { return Ok(()) };
         let size = PhysicalSize { width: win.width() as u32, height: win.height() as u32 };
 
+        // Forward the new geometry to the render thread so its bound surface
+        // and the mirror layout track the native window.
+        if let Some(host) = crate::render_thread::host()
+            && host.has_attached_component()
+        {
+            host.submit_resize(size.width, size.height);
+        }
+
         let scale_factor = self.window.scale_factor();
         self.window.dispatch_event_with_result(WindowEvent::Resized {
             size: size.to_logical(scale_factor),
@@ -514,6 +541,14 @@ impl AndroidWindowAdapter {
     }
 
     pub fn do_render(&self) -> Result<(), PlatformError> {
+        if let Some(host) = crate::render_thread::host()
+            && host.has_attached_component()
+        {
+            // 2-thread path: the screen is produced solely by the render
+            // thread from its mirror component. Just kick a present.
+            host.request_redraw();
+            return Ok(());
+        }
         if let Some(win) = self.app.native_window() {
             let o = self.offset.get();
             let _ = self.renderer.render_transformed_with_post_callback(

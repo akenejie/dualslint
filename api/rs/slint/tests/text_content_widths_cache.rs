@@ -6,6 +6,7 @@
 
 mod common;
 
+use slint::platform::WindowAdapter;
 use slint::platform::software_renderer::{
     MinimalSoftwareWindow, PremultipliedRgbaColor, SoftwareRenderer, TargetPixel,
 };

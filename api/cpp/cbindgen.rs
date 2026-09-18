@@ -788,7 +788,6 @@ fn gen_corelib(
             "slint_windowrc_close_popup",
             "slint_windowrc_create_child_window_adapter",
             "slint_windowrc_set_rendering_notifier",
-            "slint_windowrc_request_redraw",
             "slint_windowrc_on_close_requested",
             "slint_windowrc_position",
             "slint_windowrc_set_logical_position",

@@ -11,6 +11,7 @@
 
 mod androidwindowadapter;
 mod javahelper;
+pub mod render_thread;
 mod vsync;
 
 #[cfg(all(not(feature = "aa-06"), feature = "aa-05"))]
@@ -64,6 +65,7 @@ impl AndroidPlatform {
     /// }
     /// ```
     pub fn new(app: AndroidApp) -> Self {
+        render_thread::ensure_render_thread();
         let window = AndroidWindowAdapter::new(app.clone());
         CURRENT_WINDOW.set(Rc::downgrade(&window));
         Self { app, window, event_listener: None, context: Default::default() }

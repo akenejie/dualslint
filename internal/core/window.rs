@@ -133,8 +133,6 @@ pub trait WindowAdapter {
     /// throttled to the screen refresh rate if possible.
     /// It is important not to query any Slint properties to avoid introducing a dependency loop in the properties,
     /// including the use of the render function, which itself queries properties.
-    ///
-    /// See also [`Window::request_redraw()`]
     fn request_redraw(&self) {}
 
     /// Return the renderer.
@@ -2900,15 +2898,6 @@ pub mod ffi {
             let with_user_data = WithUserData { callback, drop_user_data, user_data };
             let window_adapter = &*(handle as *const Rc<dyn WindowAdapter>);
             window_adapter.window().on_close_requested(move || with_user_data.call());
-        }
-    }
-
-    /// This function issues a request to the windowing system to redraw the contents of the window.
-    #[unsafe(no_mangle)]
-    pub unsafe extern "C" fn slint_windowrc_request_redraw(handle: *const WindowAdapterRcOpaque) {
-        unsafe {
-            let window_adapter = &*(handle as *const Rc<dyn WindowAdapter>);
-            window_adapter.request_redraw();
         }
     }
 

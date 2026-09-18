@@ -9,6 +9,7 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 // --- Slint platform integration imports ---
 use slint::platform::software_renderer::Rgb565Pixel;
+use slint::platform::WindowAdapter;
 // --- FT5x06 Touch Controller ---
 struct Ft5x06<I2C> {
     i2c: I2C,

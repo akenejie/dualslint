@@ -282,10 +282,14 @@ pub enum PaintDesc {
     /// Texture-mapped paint (image blit).
     ImagePaint {
         texture_key: u64,
-        x: f32, y: f32,
-        w: f32, h: f32,
-        tex_x: f32, tex_y: f32,
-        tex_w: f32, tex_h: f32,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        tex_x: f32,
+        tex_y: f32,
+        tex_w: f32,
+        tex_h: f32,
         flags: u32,
     },
 }
@@ -662,7 +666,8 @@ impl RenderHost {
         // In the 2-thread GL path, "redraw" means "request next snapshot
         // from the UI thread".  We signal via the winit event loop proxy.
         if let Some(proxy) = &self.event_loop_proxy {
-            let _ = proxy.send_event(crate::SlintEvent(crate::event_loop::CustomEvent::RequestRedraw));
+            let _ =
+                proxy.send_event(crate::SlintEvent(crate::event_loop::CustomEvent::RequestRedraw));
         }
     }
 
@@ -690,9 +695,7 @@ impl RenderHost {
         height: u32,
         scale_factor: f64,
     ) {
-        let _ = self
-            .sender
-            .send(RenderMessage::Configure { window, width, height, scale_factor });
+        let _ = self.sender.send(RenderMessage::Configure { window, width, height, scale_factor });
     }
 
     /// Notify the render thread that the GL surface was resized.
@@ -724,7 +727,9 @@ impl RenderHost {
         let _ = (width, height);
         self.send_user(move || {
             let _ = f;
-            panic!("dualslint: legacy paint() called in GL thread mode — use submit_scene() instead");
+            panic!(
+                "dualslint: legacy paint() called in GL thread mode — use submit_scene() instead"
+            );
         });
     }
 }
@@ -975,6 +980,14 @@ impl RenderCore {
                             let overlay = &self.overlay;
                             state.render_scene(frame, overlay, &self.frame_queue, &self.host);
                         }
+                    } else {
+                        // No render-owned component is attached, so the render
+                        // thread is not the visual authority: the active
+                        // renderer lives on the UI thread.  Forward the
+                        // repaint request back to it so that
+                        // `render_thread::request_redraw()` works for every
+                        // winit renderer, not just the 2-thread GL path.
+                        self.host.send_redraw();
                     }
                 }
                 RenderMessage::Suspend => {
@@ -1118,6 +1131,27 @@ pub fn host() -> Option<RenderHost> {
     GLOBAL_RENDER_HOST.get().cloned()
 }
 
+/// Request a window repaint through the render thread.
+///
+/// This is the replacement for the removed [`Window::request_redraw`] entry
+/// point: the render thread owns the mirror component and re-encodes and
+/// re-presents the frame when asked, regardless of the UI-side window state
+/// or whether a mirror is attached. It is safe to call from any thread.
+///
+/// This is a no-op when the render thread was never started.
+pub fn request_redraw() {
+    if let Some(host) = GLOBAL_RENDER_HOST.get() {
+        host.request_redraw();
+    }
+}
+
+/// C FFI entry point used by the C++ bindings to request a repaint through
+/// the render thread, mirroring [`request_redraw`].
+#[unsafe(no_mangle)]
+pub extern "C" fn slint_render_thread_request_redraw() {
+    request_redraw();
+}
+
 /// Forward the host's system accent colour to the render thread's mirror
 /// context.  Called whenever the winit backend resolves the accent from the
 /// OS (xdg-desktop-settings watcher or the winit window adapter); a no-op
@@ -1240,10 +1274,10 @@ impl GlRenderState {
         use glutin::surface::{GlSurface, SurfaceAttributesBuilder, WindowSurface};
         use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-        let raw_display = window.display_handle()
-            .map_err(|e| format!("Failed to get display handle: {e}"))?;
-        let raw_window = window.window_handle()
-            .map_err(|e| format!("Failed to get window handle: {e}"))?;
+        let raw_display =
+            window.display_handle().map_err(|e| format!("Failed to get display handle: {e}"))?;
+        let raw_window =
+            window.window_handle().map_err(|e| format!("Failed to get window handle: {e}"))?;
 
         // Build GL display on the render thread using the window's handles.
         // The `DisplayApiPreference` variants are cfg-gated by glutin per
@@ -1263,33 +1297,36 @@ impl GlRenderState {
         };
 
         let config_template = glutin::config::ConfigTemplateBuilder::new();
-        let config = unsafe { gl_display
-            .find_configs(config_template.build())
-            .map_err(|e| format!("glutin find_configs failed: {e}"))?
-            .next()
-            .ok_or_else(|| "No suitable GL config found".to_string())? };
+        let config = unsafe {
+            gl_display
+                .find_configs(config_template.build())
+                .map_err(|e| format!("glutin find_configs failed: {e}"))?
+                .next()
+                .ok_or_else(|| "No suitable GL config found".to_string())?
+        };
 
         let raw_window_handle = raw_window.as_raw();
 
         let context_attributes = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::Gles(Some(glutin::context::Version { major: 2, minor: 0 })))
+            .with_context_api(ContextApi::Gles(Some(glutin::context::Version {
+                major: 2,
+                minor: 0,
+            })))
             .build(Some(raw_window_handle));
 
         let not_current_ctx = unsafe {
-            gl_display.create_context(&config, &context_attributes)
+            gl_display
+                .create_context(&config, &context_attributes)
                 .or_else(|_| {
-                    let fallback = ContextAttributesBuilder::new()
-                        .build(Some(raw_window_handle));
+                    let fallback = ContextAttributesBuilder::new().build(Some(raw_window_handle));
                     gl_display.create_context(&config, &fallback)
                 })
                 .map_err(|e| format!("glutin create_context failed: {e}"))?
         };
 
         let size: winit::dpi::PhysicalSize<u32> = window.surface_size();
-        let non_zero_w = NonZeroU32::new(size.width.max(1))
-            .ok_or("Window width is zero")?;
-        let non_zero_h = NonZeroU32::new(size.height.max(1))
-            .ok_or("Window height is zero")?;
+        let non_zero_w = NonZeroU32::new(size.width.max(1)).ok_or("Window width is zero")?;
+        let non_zero_h = NonZeroU32::new(size.height.max(1)).ok_or("Window height is zero")?;
 
         let surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new().build(
             raw_window_handle,
@@ -1298,23 +1335,26 @@ impl GlRenderState {
         );
 
         let surface = unsafe {
-            gl_display.create_window_surface(&config, &surface_attributes)
+            gl_display
+                .create_window_surface(&config, &surface_attributes)
                 .map_err(|e| format!("glutin create_window_surface failed: {e}"))?
         };
 
-        let context = not_current_ctx.make_current(&surface)
+        let context = not_current_ctx
+            .make_current(&surface)
             .map_err(|e| format!("make_current failed: {e}"))?;
 
         // Set vsync
-        surface.set_swap_interval(
-            &context,
-            glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
-        ).ok();
+        surface
+            .set_swap_interval(
+                &context,
+                glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
+            )
+            .ok();
 
         // Build femtovg canvas
-        let proc_addr = |name: &std::ffi::CStr| -> *const c_void {
-            gl_display.get_proc_address(name)
-        };
+        let proc_addr =
+            |name: &std::ffi::CStr| -> *const c_void { gl_display.get_proc_address(name) };
         let backend = unsafe { femtovg::renderer::OpenGl::new_from_function_cstr(proc_addr) }
             .map_err(|e| format!("femtovg OpenGL init failed: {e}"))?;
         let text_context = femtovg::TextContext::default();
@@ -1348,9 +1388,7 @@ impl GlRenderState {
                 self.glutin_surface.resize(&self.glutin_context, nz_w, nz_h);
             }
         }
-        self.femtovg_canvas.borrow_mut().set_size(
-            width, height, self.scale_factor.ceil() as _,
-        );
+        self.femtovg_canvas.borrow_mut().set_size(width, height, self.scale_factor.ceil() as _);
     }
 
     /// Render the UI scene snapshot, retain it for later overlay/resize
@@ -1428,7 +1466,11 @@ impl GlRenderState {
         self.window.pre_present_notify();
     }
 
-    fn replay_command(&self, canvas: &RefCell<femtovg::Canvas<femtovg::renderer::OpenGl>>, cmd: &DrawCommand) {
+    fn replay_command(
+        &self,
+        canvas: &RefCell<femtovg::Canvas<femtovg::renderer::OpenGl>>,
+        cmd: &DrawCommand,
+    ) {
         match cmd {
             DrawCommand::Save => {
                 canvas.borrow_mut().save();
@@ -1450,7 +1492,10 @@ impl GlRenderState {
             }
             DrawCommand::CombineClip(rect) => {
                 canvas.borrow_mut().intersect_scissor(
-                    rect.origin.x, rect.origin.y, rect.size.width, rect.size.height,
+                    rect.origin.x,
+                    rect.origin.y,
+                    rect.size.width,
+                    rect.size.height,
                 );
             }
             DrawCommand::FillRect { rect, paint, anti_alias } => {
@@ -1478,7 +1523,15 @@ impl GlRenderState {
                     canvas.borrow_mut().stroke_path(&path, &p);
                 }
             }
-            DrawCommand::StrokePath { path, paint, line_width, line_cap, line_join, miter_limit, anti_alias } => {
+            DrawCommand::StrokePath {
+                path,
+                paint,
+                line_width,
+                line_cap,
+                line_join,
+                miter_limit,
+                anti_alias,
+            } => {
                 let paint_f = self.desc_to_paint_stroke(paint);
                 if let Some(mut p) = paint_f {
                     p.set_line_width(*line_width);
@@ -1511,11 +1564,26 @@ impl GlRenderState {
                 }
             }
             DrawCommand::DrawGlyphRun {
-                font_blob_id, font_index, font_size, normalized_coords,
-                paint, y_offset, glyphs, is_stroke,
+                font_blob_id,
+                font_index,
+                font_size,
+                normalized_coords,
+                paint,
+                y_offset,
+                glyphs,
+                is_stroke,
             } => {
-                self.replay_glyph_run(canvas, *font_blob_id, *font_index, *font_size,
-                    normalized_coords, paint, *y_offset, glyphs, *is_stroke);
+                self.replay_glyph_run(
+                    canvas,
+                    *font_blob_id,
+                    *font_index,
+                    *font_size,
+                    normalized_coords,
+                    paint,
+                    *y_offset,
+                    glyphs,
+                    *is_stroke,
+                );
             }
             DrawCommand::DrawText { x, y, text, font_size, paint, max_width } => {
                 self.replay_text(canvas, *x, *y, text, *font_size, paint, *max_width);
@@ -1525,11 +1593,15 @@ impl GlRenderState {
                 if let Some(p) = paint_f {
                     let mut path = femtovg::Path::new();
                     if *radius > 0.0 {
-                        path.rounded_rect(rect.origin.x, rect.origin.y,
-                            rect.size.width, rect.size.height, *radius);
+                        path.rounded_rect(
+                            rect.origin.x,
+                            rect.origin.y,
+                            rect.size.width,
+                            rect.size.height,
+                            *radius,
+                        );
                     } else {
-                        path.rect(rect.origin.x, rect.origin.y,
-                            rect.size.width, rect.size.height);
+                        path.rect(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height);
                     }
                     canvas.borrow_mut().fill_path(&path, &p);
                     if let Some((border_paint_desc, width)) = border {
@@ -1554,9 +1626,18 @@ impl GlRenderState {
             DrawCommand::Layer { width, height, origin, alpha_tint, commands } => {
                 self.render_layer(canvas, *width, *height, *origin, *alpha_tint, commands);
             }
-            DrawCommand::DrawBoxShadow { color, blur, offset_x, offset_y, width, height, radius } => {
-                self.render_box_shadow(canvas, color, *blur, *offset_x, *offset_y,
-                    *width, *height, *radius);
+            DrawCommand::DrawBoxShadow {
+                color,
+                blur,
+                offset_x,
+                offset_y,
+                width,
+                height,
+                radius,
+            } => {
+                self.render_box_shadow(
+                    canvas, color, *blur, *offset_x, *offset_y, *width, *height, *radius,
+                );
             }
             DrawCommand::CachedPixmap { key, width, height, pixels } => {
                 if !self.texture_cache.borrow().contains_key(key) {
@@ -1574,18 +1655,30 @@ impl GlRenderState {
             }
             PaintDesc::LinearGradient { start_x, start_y, end_x, end_y, stops } => {
                 let paint = femtovg::Paint::linear_gradient_stops(
-                    *start_x, *start_y, *end_x, *end_y,
+                    *start_x,
+                    *start_y,
+                    *end_x,
+                    *end_y,
                     stops.iter().map(|s| {
-                        (s.offset, femtovg::Color::rgba(s.color[0], s.color[1], s.color[2], s.color[3]))
+                        (
+                            s.offset,
+                            femtovg::Color::rgba(s.color[0], s.color[1], s.color[2], s.color[3]),
+                        )
                     }),
                 );
                 Some(paint)
             }
             PaintDesc::RadialGradient { cx, cy, radius, stops } => {
                 let paint = femtovg::Paint::radial_gradient_stops(
-                    *cx, *cy, 0.0, *radius,
+                    *cx,
+                    *cy,
+                    0.0,
+                    *radius,
                     stops.iter().map(|s| {
-                        (s.offset, femtovg::Color::rgba(s.color[0], s.color[1], s.color[2], s.color[3]))
+                        (
+                            s.offset,
+                            femtovg::Color::rgba(s.color[0], s.color[1], s.color[2], s.color[3]),
+                        )
                     }),
                 );
                 Some(paint)
@@ -1633,7 +1726,9 @@ impl GlRenderState {
     ) {
         use rgb::FromSlice;
         let img = imgref::Img::new(pixels.as_rgba(), width as usize, height as usize);
-        if let Ok(image_id) = canvas.borrow_mut().create_image(img, femtovg::ImageFlags::PREMULTIPLIED) {
+        if let Ok(image_id) =
+            canvas.borrow_mut().create_image(img, femtovg::ImageFlags::PREMULTIPLIED)
+        {
             self.texture_cache.borrow_mut().insert(key, image_id);
         }
     }
@@ -1652,12 +1747,12 @@ impl GlRenderState {
             drop(cv);
 
             let paint = femtovg::Paint::image(
-                image_id,
-                params[0], params[1], // x, y
+                image_id, params[0], params[1], // x, y
                 params[2], params[3], // w, h
                 params[4], // rotation
                 params[5], // opacity
-            ).with_anti_alias(false);
+            )
+            .with_anti_alias(false);
 
             let mut path = femtovg::Path::new();
             path.rect(params[0], params[1], params[2], params[3]);
@@ -1716,10 +1811,14 @@ impl GlRenderState {
             let mut cv = canvas.borrow_mut();
             let paint = femtovg::Paint::image(
                 image_id,
-                origin.x, origin.y,
-                width as f32, height as f32,
-                0.0, alpha_tint,
-            ).with_anti_alias(false);
+                origin.x,
+                origin.y,
+                width as f32,
+                height as f32,
+                0.0,
+                alpha_tint,
+            )
+            .with_anti_alias(false);
 
             let mut path = femtovg::Path::new();
             path.rect(origin.x, origin.y, width as f32, height as f32);
@@ -1777,18 +1876,12 @@ impl GlRenderState {
             cv.save();
             cv.set_render_target(femtovg::RenderTarget::Image(shadow_img));
             cv.reset();
-            cv.clear_rect(0, 0, shadow_img_w, shadow_img_h,
-                          femtovg::Color::rgba(0, 0, 0, 0));
+            cv.clear_rect(0, 0, shadow_img_w, shadow_img_h, femtovg::Color::rgba(0, 0, 0, 0));
 
-            let shadow_rect = PhysicalRect::new(
-                PhysicalPoint::default(),
-                euclid::Size2D::new(width, height),
-            );
+            let shadow_rect =
+                PhysicalRect::new(PhysicalPoint::default(), euclid::Size2D::new(width, height));
             let path = rounded_rect_to_femtovg_path(shadow_rect, radius);
-            cv.fill_path(
-                &path,
-                &femtovg::Paint::color(femtovg::Color::rgb(255, 255, 255)),
-            );
+            cv.fill_path(&path, &femtovg::Paint::color(femtovg::Color::rgb(255, 255, 255)));
         }
 
         // Apply blur if needed
@@ -1804,7 +1897,11 @@ impl GlRenderState {
                 );
                 match target {
                     Ok(id) => {
-                        cv.filter_image(id, femtovg::ImageFilter::GaussianBlur { sigma }, shadow_img);
+                        cv.filter_image(
+                            id,
+                            femtovg::ImageFilter::GaussianBlur { sigma },
+                            shadow_img,
+                        );
                         id
                     }
                     Err(_) => {
@@ -1829,10 +1926,7 @@ impl GlRenderState {
             cv.global_composite_operation(femtovg::CompositeOperation::SourceIn);
             let mut tint_path = femtovg::Path::new();
             tint_path.rect(0., 0., shadow_img_w as f32, shadow_img_h as f32);
-            cv.fill_path(
-                &tint_path,
-                &femtovg::Paint::color(shadow_color),
-            );
+            cv.fill_path(&tint_path, &femtovg::Paint::color(shadow_color));
             cv.restore();
         }
 
@@ -1846,10 +1940,14 @@ impl GlRenderState {
 
             let paint = femtovg::Paint::image(
                 final_img,
-                ox, oy,
-                shadow_img_w as f32, shadow_img_h as f32,
-                0.0, 1.0,
-            ).with_anti_alias(false);
+                ox,
+                oy,
+                shadow_img_w as f32,
+                shadow_img_h as f32,
+                0.0,
+                1.0,
+            )
+            .with_anti_alias(false);
             let mut path = femtovg::Path::new();
             path.rect(ox, oy, shadow_img_w as f32, shadow_img_h as f32);
             cv.fill_path(&path, &paint);
@@ -1875,39 +1973,47 @@ impl GlRenderState {
             None => return,
         };
         femtovg_paint.set_font_size(font_size);
-        let Some(font_id) = self.get_or_create_font(font_blob_id, font_index) else { return; };
+        let Some(font_id) = self.get_or_create_font(font_blob_id, font_index) else {
+            return;
+        };
 
-        let mapped: Vec<femtovg::PositionedGlyph> = glyphs.iter().map(|g| {
-            femtovg::PositionedGlyph {
-                x: g.x,
-                y: g.y + y_offset,
-                glyph_id: g.id,
-            }
-        }).collect();
+        let mapped: Vec<femtovg::PositionedGlyph> = glyphs
+            .iter()
+            .map(|g| femtovg::PositionedGlyph { x: g.x, y: g.y + y_offset, glyph_id: g.id })
+            .collect();
 
         // Pixel-align the canvas during text rendering, mirroring upstream
         // slint's align_canvas_during(): flush a translate-only transform to
         // integer pixels so glyphs rasterize on a crisp pixel grid.
         let original = canvas.borrow().transform();
         let [a, b, c, d, x, y] = original.0;
-        let translate_only = (a - 1.0).abs() < 1e-3
-            && b.abs() < 1e-3
-            && c.abs() < 1e-3
-            && (d - 1.0).abs() < 1e-3;
+        let translate_only =
+            (a - 1.0).abs() < 1e-3 && b.abs() < 1e-3 && c.abs() < 1e-3 && (d - 1.0).abs() < 1e-3;
         if translate_only {
             let floored = femtovg::Transform2D::new(
-                a.round(), b.round(), c.round(), d.round(), x.round(), y.round(),
+                a.round(),
+                b.round(),
+                c.round(),
+                d.round(),
+                x.round(),
+                y.round(),
             );
             let mut cv = canvas.borrow_mut();
             cv.reset_transform();
             cv.set_transform(&floored);
             if is_stroke {
                 let _ = cv.stroke_glyph_run(
-                    font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                    font_id,
+                    normalized_coords,
+                    mapped.into_iter(),
+                    &femtovg_paint,
                 );
             } else {
                 let _ = cv.fill_glyph_run(
-                    font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                    font_id,
+                    normalized_coords,
+                    mapped.into_iter(),
+                    &femtovg_paint,
                 );
             }
             cv.reset_transform();
@@ -1916,11 +2022,17 @@ impl GlRenderState {
             let mut cv = canvas.borrow_mut();
             if is_stroke {
                 let _ = cv.stroke_glyph_run(
-                    font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                    font_id,
+                    normalized_coords,
+                    mapped.into_iter(),
+                    &femtovg_paint,
                 );
             } else {
                 let _ = cv.fill_glyph_run(
-                    font_id, normalized_coords, mapped.into_iter(), &femtovg_paint,
+                    font_id,
+                    normalized_coords,
+                    mapped.into_iter(),
+                    &femtovg_paint,
                 );
             }
         }
@@ -1964,7 +2076,9 @@ impl GlRenderState {
         let mut seen_fonts = HashSet::new();
         for line in layout.lines() {
             for item in line.items() {
-                let parley::PositionedLayoutItem::GlyphRun(run) = item else { continue; };
+                let parley::PositionedLayoutItem::GlyphRun(run) = item else {
+                    continue;
+                };
                 let font = run.run().font();
                 let blob_id = font.data.id();
                 let font_index = font.index;
@@ -1979,9 +2093,10 @@ impl GlRenderState {
                         self.font_cache.borrow_mut().insert((blob_id, font_index), font_id);
                     }
                 }
-                let glyphs: Vec<PositionedGlyph> = run.positioned_glyphs().map(|g| {
-                    PositionedGlyph { x: x + g.x, y: g.y, id: g.id as u16 }
-                }).collect();
+                let glyphs: Vec<PositionedGlyph> = run
+                    .positioned_glyphs()
+                    .map(|g| PositionedGlyph { x: x + g.x, y: g.y, id: g.id as u16 })
+                    .collect();
                 if glyphs.is_empty() {
                     continue;
                 }
@@ -2026,21 +2141,20 @@ fn rounded_rect_to_femtovg_path(rect: PhysicalRect, radius: PhysicalBorderRadius
     let mut p = femtovg::Path::new();
     if let Some(r) = radius.as_uniform() {
         if r > 0.0 {
-            p.rounded_rect(
-                rect.origin.x, rect.origin.y,
-                rect.size.width, rect.size.height,
-                r,
-            );
+            p.rounded_rect(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, r);
         } else {
-            p.rect(rect.origin.x, rect.origin.y,
-                rect.size.width, rect.size.height);
+            p.rect(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height);
         }
     } else {
         p.rounded_rect_varying(
-            rect.origin.x, rect.origin.y,
-            rect.size.width, rect.size.height,
-            radius.top_left, radius.top_right,
-            radius.bottom_right, radius.bottom_left,
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+            radius.top_left,
+            radius.top_right,
+            radius.bottom_right,
+            radius.bottom_left,
         );
     }
     p
@@ -2050,13 +2164,21 @@ fn lyon_path_to_femtovg(events: &[PathEvent]) -> femtovg::Path {
     let mut p = femtovg::Path::new();
     for ev in events {
         match ev {
-            PathEvent::MoveTo(x, y) => { p.move_to(*x, *y); }
-            PathEvent::LineTo(x, y) => { p.line_to(*x, *y); }
-            PathEvent::QuadTo(cx, cy, x, y) => { p.quad_to(*cx, *cy, *x, *y); }
+            PathEvent::MoveTo(x, y) => {
+                p.move_to(*x, *y);
+            }
+            PathEvent::LineTo(x, y) => {
+                p.line_to(*x, *y);
+            }
+            PathEvent::QuadTo(cx, cy, x, y) => {
+                p.quad_to(*cx, *cy, *x, *y);
+            }
             PathEvent::CubicTo(c1x, c1y, c2x, c2y, x, y) => {
                 p.bezier_to(*c1x, *c1y, *c2x, *c2y, *x, *y);
             }
-            PathEvent::Close => { p.close(); }
+            PathEvent::Close => {
+                p.close();
+            }
         }
     }
     p
@@ -2081,15 +2203,17 @@ pub(crate) mod render_thread_legacy {
             if width == 0 || height == 0 {
                 return Err("pixel target must be non-empty".into());
             }
-            Ok(Self {
-                width,
-                height,
-                bytes: vec![0u8; (width * height * 4) as usize],
-            })
+            Ok(Self { width, height, bytes: vec![0u8; (width * height * 4) as usize] })
         }
-        pub fn width(&self) -> u32 { self.width }
-        pub fn height(&self) -> u32 { self.height }
-        pub fn bytes_mut(&mut self) -> &mut [u8] { &mut self.bytes }
+        pub fn width(&self) -> u32 {
+            self.width
+        }
+        pub fn height(&self) -> u32 {
+            self.height
+        }
+        pub fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.bytes
+        }
         pub fn mark_dirty(&mut self, _x: u32, _y: u32, _w: u32, _h: u32) {}
         pub fn mark_whole_dirty(&mut self) {}
         pub fn present(&mut self) {}

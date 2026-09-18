@@ -449,7 +449,7 @@ fn main() {
                             app.get_requested_texture_height() as u32,
                         );
                         app.set_texture(texture);
-                        app.window().request_redraw();
+                        slint::render_thread::request_redraw();
                     }
                 }
                 slint::RenderingState::AfterRendering => {}

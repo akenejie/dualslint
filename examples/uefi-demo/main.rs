@@ -17,7 +17,7 @@ use core::slice;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use core::time::Duration;
 use log::info;
-use slint::platform::{PointerEventButton, WindowEvent};
+use slint::platform::{PointerEventButton, WindowAdapter, WindowEvent};
 use slint::{SharedString, platform::software_renderer};
 use uefi::Char16;
 use uefi::boot::ScopedProtocol;

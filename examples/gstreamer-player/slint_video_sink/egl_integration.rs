@@ -33,7 +33,7 @@ pub fn init<App: slint::ComponentHandle + 'static>(
                         Box::new(move || {
                             app_weak
                                 .upgrade_in_event_loop(move |app| {
-                                    app.window().request_redraw();
+                                    slint::render_thread::request_redraw();
                                 })
                                 .ok();
                         }),

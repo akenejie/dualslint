@@ -240,6 +240,32 @@ pub use i_slint_core::translations::{SelectBundledTranslationError, select_bundl
 
 pub mod private_unstable_api;
 
+/// The render thread host API. When the winit backend is enabled, this module
+/// provides access to the dedicated rendering thread that owns the mirror
+/// component tree. Use [`render_thread::request_redraw`] to trigger a repaint
+/// from any thread; the UI-side `Window::request_redraw` API is removed in
+/// this fork, as it can silently no-op while a mirror is attached.
+#[cfg(all(
+    not(target_os = "android"),
+    any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland",
+        feature = "backend-default",
+    )
+))]
+pub use i_slint_backend_winit::render_thread;
+
+/// The render thread host API for the android-activity backend. On Android
+/// the render thread owns a `SkiaRenderer` bound to the `ANativeWindow`;
+/// `attach_component` mirrors the app's component tree onto the render thread
+/// which then becomes the visual authority.
+#[cfg(all(
+    target_os = "android",
+    any(feature = "backend-android-activity-06", feature = "backend-android-activity-05")
+))]
+pub use i_slint_backend_android_activity::render_thread;
+
 /// Enters the main event loop. This is necessary in order to receive
 /// events from the windowing system for rendering to the screen
 /// and reacting to user input.

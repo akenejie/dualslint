@@ -92,10 +92,10 @@ mod renderer {
         ) -> Result<Arc<winit::window::Window>, PlatformError>;
     }
 
+    #[cfg(any(feature = "renderer-femtovg", feature = "renderer-skia"))]
+    pub(crate) mod dual;
     #[cfg(enable_femtovg_renderer)]
     pub(crate) mod femtovg;
-    #[cfg(all(feature = "renderer-femtovg", supports_opengl, not(feature = "renderer-femtovg-wgpu")))]
-    pub(crate) mod dual;
     #[cfg(enable_skia_renderer)]
     pub(crate) mod skia;
 
@@ -831,10 +831,7 @@ pub(crate) fn ensure_render_thread(proxy: &winit::event_loop::EventLoopProxy<Sli
         let _ = render_thread::GLOBAL_RENDER_HOST.set(host);
         let _ = render_thread::GLOBAL_COORDINATE_MAP
             .set(Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
-        std::thread::Builder::new()
-            .name("slint-render".into())
-            .spawn(move || core.run())
-            .ok();
+        std::thread::Builder::new().name("slint-render".into()).spawn(move || core.run()).ok();
     }
 }
 

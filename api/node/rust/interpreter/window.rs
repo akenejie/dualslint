@@ -118,12 +118,6 @@ impl JsWindow {
         });
     }
 
-    /// Issues a request to the windowing system to re-render the contents of the window.
-    #[napi(js_name = "requestRedraw")]
-    pub fn request_redraw(&self) {
-        self.inner.request_redraw();
-    }
-
     /// Dispatch a window event to the scene.
     #[napi(js_name = "dispatchEvent", ts_return_type = "WindowEventDispatchResult")]
     pub fn dispatch_event(
