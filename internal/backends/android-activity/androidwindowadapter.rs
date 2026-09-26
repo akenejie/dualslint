@@ -283,6 +283,16 @@ impl AndroidWindowAdapter {
                             .unwrap_or_default(),
                     );
                 }
+
+                // Forward density changes to the render thread's mirror so its
+                // layout and scale track the native window (a scale change is
+                // not accompanied by a `WindowResized` event).
+                if let Some(host) = crate::render_thread::host()
+                    && host.has_attached_component()
+                {
+                    let size = self.size();
+                    host.submit_resize(size.width, size.height, scale_factor);
+                }
             }
             PollEvent::Main(MainEvent::Destroy) => {
                 if let Some(host) = crate::render_thread::host() {
@@ -519,15 +529,16 @@ impl AndroidWindowAdapter {
         let Some(win) = self.app.native_window() else { return Ok(()) };
         let size = PhysicalSize { width: win.width() as u32, height: win.height() as u32 };
 
+        let scale_factor = self.window.scale_factor();
+
         // Forward the new geometry to the render thread so its bound surface
         // and the mirror layout track the native window.
         if let Some(host) = crate::render_thread::host()
             && host.has_attached_component()
         {
-            host.submit_resize(size.width, size.height);
+            host.submit_resize(size.width, size.height, scale_factor);
         }
 
-        let scale_factor = self.window.scale_factor();
         self.window.dispatch_event_with_result(WindowEvent::Resized {
             size: size.to_logical(scale_factor),
         })?;

@@ -10,6 +10,8 @@
 #![cfg_attr(slint_nightly_test, warn(non_exhaustive_omitted_patterns))]
 
 mod androidwindowadapter;
+#[cfg(feature = "aa-06")]
+mod cpu_surface;
 mod javahelper;
 pub mod render_thread;
 mod vsync;

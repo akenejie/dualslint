@@ -16,6 +16,8 @@
 //! * The UI thread forwards the native window (`Configure`), size changes
 //!   (`Resize`) and repaint requests (`RequestRedraw`) over a channel.
 //! * The render thread owns the [`SkiaRenderer`] bound to the `ANativeWindow`.
+//!   With `aa-06` it rasterises into the window's own pixel buffer
+//!   ([`crate::cpu_surface`]); otherwise it goes through a GL surface.
 //! * When the application attaches a mirror component (see
 //!   [`RenderHost::attach_component`]), the render thread instantiates it
 //!   *there* (headless platform + [`SkiaRenderer::render()`]) and is then the
@@ -34,6 +36,23 @@ use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
+
+#[cfg(feature = "aa-06")]
+use crate::android_activity::ndk::native_window::NativeWindow;
+#[cfg(feature = "aa-06")]
+use crate::cpu_surface::NativeWindowSurface;
+
+/// The window handle the UI thread hands over in
+/// [`RenderMessage::Configure`].
+///
+/// With `aa-06` it is the concrete `ANativeWindow`, so the render thread can
+/// lock the buffer and rasterise into it (see [`crate::cpu_surface`]). `aa-05`
+/// only offers the erased `raw-window-handle`, and its ndk has no CPU buffer
+/// lock, so that platform keeps the GL surface.
+#[cfg(feature = "aa-06")]
+pub(crate) type ConfigureWindow = Arc<NativeWindow>;
+#[cfg(not(feature = "aa-06"))]
+pub(crate) type ConfigureWindow = Arc<dyn raw_window_handle::HasWindowHandle + Send + Sync>;
 
 /// The render thread host. Clone to share across threads (UI thread and
 /// workers are equal peers).
@@ -78,7 +97,7 @@ impl RenderHost {
     /// Configure the render thread with the native window + initial size.
     pub(crate) fn submit_configure(
         &self,
-        window: Arc<dyn raw_window_handle::HasWindowHandle + Send + Sync>,
+        window: ConfigureWindow,
         width: u32,
         height: u32,
         scale_factor: f32,
@@ -93,9 +112,11 @@ impl RenderHost {
         });
     }
 
-    /// Notify the render thread that the native window surface was resized.
-    pub(crate) fn submit_resize(&self, width: u32, height: u32) {
-        let _ = self.sender.send(RenderMessage::Resize { width, height });
+    /// Notify the render thread that the native window surface was resized, or
+    /// that its density changed. `scale_factor` lets the mirror layout reflow
+    /// even when the size itself did not change.
+    pub(crate) fn submit_resize(&self, width: u32, height: u32, scale_factor: f32) {
+        let _ = self.sender.send(RenderMessage::Resize { width, height, scale_factor });
     }
 
     /// Ask the render thread to release the native window surface (activity
@@ -108,7 +129,7 @@ impl RenderHost {
 /// Message protocol (UI thread → render thread).
 pub(crate) enum RenderMessage {
     Configure {
-        window: Arc<dyn raw_window_handle::HasWindowHandle + Send + Sync>,
+        window: ConfigureWindow,
         width: u32,
         height: u32,
         scale_factor: f32,
@@ -117,6 +138,7 @@ pub(crate) enum RenderMessage {
     Resize {
         width: u32,
         height: u32,
+        scale_factor: f32,
     },
     AttachComponent {
         factory: Box<dyn Fn() -> Box<dyn Any> + Send>,
@@ -228,13 +250,11 @@ impl RenderCore {
                     current_size = size;
                     current_scale_factor = scale_factor;
                     if let Some(adapter) = &render_window_adapter {
-                        if let Err(e) = adapter.renderer.set_window_handle(
-                            window.clone(),
-                            Arc::new(DummyDisplayHandle),
-                            size,
-                            requested_graphics_api,
-                            false,
-                        ) {
+                        // The window came back or changed: keep the mirror
+                        // tree and swap the surface it draws into.
+                        if let Err(e) =
+                            rebind_renderer(&adapter.renderer, window, size, requested_graphics_api)
+                        {
                             eprintln!("dualslint render thread: surface re-init failed: {e}");
                         } else {
                             adapter_configured(adapter, size, scale_factor);
@@ -242,18 +262,15 @@ impl RenderCore {
                     } else {
                         // First window: create the renderer on this thread and
                         // bind it to the native window.
-                        let renderer = new_skia_renderer();
-                        if let Err(e) = renderer.set_window_handle(
-                            window.clone(),
-                            Arc::new(DummyDisplayHandle),
-                            size,
-                            requested_graphics_api,
-                            false,
-                        ) {
-                            eprintln!("dualslint render thread: surface init failed: {e}");
-                            continue;
-                        }
-                        RENDERER_SLOT.with(|slot| *slot.borrow_mut() = Some(renderer.clone()));
+                        let renderer =
+                            match new_bound_renderer(window, size, requested_graphics_api) {
+                                Ok(renderer) => renderer,
+                                Err(e) => {
+                                    eprintln!("dualslint render thread: surface init failed: {e}");
+                                    continue;
+                                }
+                            };
+                        RENDERER_SLOT.with(|slot| *slot.borrow_mut() = Some(renderer));
                         if let Some(f) = &factory {
                             attach_component(
                                 f,
@@ -265,8 +282,9 @@ impl RenderCore {
                         }
                     }
                 }
-                RenderMessage::Resize { width, height } => {
+                RenderMessage::Resize { width, height, scale_factor } => {
                     current_size = PhysicalSize { width, height };
+                    current_scale_factor = scale_factor;
                     if let Some(adapter) = &render_window_adapter {
                         adapter_configured(adapter, current_size, current_scale_factor);
                     }
@@ -312,6 +330,70 @@ impl RenderCore {
     }
 }
 
+/// Creates the renderer's surface for the first configured window.
+///
+/// On `aa-06` the surface rasterises into the window's CPU buffer, so the
+/// renderer is built around it directly; the concrete `NativeWindow` cannot be
+/// recovered from an erased `HasWindowHandle` later on.
+#[cfg(feature = "aa-06")]
+fn new_bound_renderer(
+    window: ConfigureWindow,
+    size: PhysicalSize,
+    _requested_graphics_api: Option<RequestedGraphicsAPI>,
+) -> Result<Rc<SkiaRenderer>, PlatformError> {
+    Ok(Rc::new(SkiaRenderer::new_with_surface(
+        &SkiaSharedContext::default(),
+        Box::new(NativeWindowSurface::new(window, size)),
+    )))
+}
+
+/// Points an existing renderer at a reconfigured window.
+#[cfg(feature = "aa-06")]
+fn rebind_renderer(
+    renderer: &Rc<SkiaRenderer>,
+    window: ConfigureWindow,
+    size: PhysicalSize,
+    _requested_graphics_api: Option<RequestedGraphicsAPI>,
+) -> Result<(), PlatformError> {
+    // Swapping the surface releases the previous one and its caches.
+    renderer.set_surface(Box::new(NativeWindowSurface::new(window, size)));
+    Ok(())
+}
+
+#[cfg(not(feature = "aa-06"))]
+fn new_bound_renderer(
+    window: ConfigureWindow,
+    size: PhysicalSize,
+    requested_graphics_api: Option<RequestedGraphicsAPI>,
+) -> Result<Rc<SkiaRenderer>, PlatformError> {
+    let renderer = new_skia_renderer();
+    renderer.set_window_handle(
+        window,
+        Arc::new(DummyDisplayHandle),
+        size,
+        requested_graphics_api,
+        false,
+    )?;
+    Ok(renderer)
+}
+
+#[cfg(not(feature = "aa-06"))]
+fn rebind_renderer(
+    renderer: &Rc<SkiaRenderer>,
+    window: ConfigureWindow,
+    size: PhysicalSize,
+    requested_graphics_api: Option<RequestedGraphicsAPI>,
+) -> Result<(), PlatformError> {
+    renderer.set_window_handle(
+        window,
+        Arc::new(DummyDisplayHandle),
+        size,
+        requested_graphics_api,
+        false,
+    )
+}
+
+#[cfg(not(feature = "aa-06"))]
 fn new_skia_renderer() -> Rc<SkiaRenderer> {
     #[cfg(not(any(feature = "unstable-wgpu-29", feature = "unstable-wgpu-30")))]
     return Rc::new(SkiaRenderer::default(&SkiaSharedContext::default()));
@@ -395,7 +477,9 @@ pub fn request_redraw() {
 
 /// A dummy display handle that's `Send + Sync`. Required by wgpu, but
 /// harmless as `raw_window_handle::AndroidDisplayHandle` is an empty struct.
+#[cfg(not(feature = "aa-06"))]
 struct DummyDisplayHandle;
+#[cfg(not(feature = "aa-06"))]
 impl raw_window_handle::HasDisplayHandle for DummyDisplayHandle {
     fn display_handle(
         &self,
