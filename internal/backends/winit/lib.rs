@@ -39,6 +39,10 @@ mod ios;
 pub mod render_thread;
 pub(crate) mod snapshot;
 
+use i_slint_backend_scene::PointerPhase;
+
+use i_slint_backend_scene::PublishedControls;
+
 /// Re-export of the winit crate.
 pub use winit;
 
@@ -414,9 +418,16 @@ impl BackendBuilder {
 
 fn dispatch_mouse_move(window: &Weak<WinitWindowAdapter>, position: LogicalPoint) {
     if let Some(window) = window.upgrade() {
-        window.window().dispatch_event(i_slint_core::platform::WindowEvent::internal(
+        let event = i_slint_core::platform::WindowEvent::internal(
             i_slint_core::input::BackendMouseEvent::Moved { position, touch_finger_id: 0 },
-        ));
+        );
+        // The render thread owns the controls: resolve the move against the
+        // geometry it published and report the hover that follows from it.
+        if WinitWindowAdapter::render_owns_controls() {
+            window.drive_render_control_state(PointerPhase::Moved, position);
+        } else {
+            window.window().dispatch_event(event);
+        }
     }
 }
 
@@ -830,7 +841,7 @@ pub(crate) fn ensure_render_thread(proxy: &winit::event_loop::EventLoopProxy<Sli
         let _ = render_thread::GLOBAL_FRAME_QUEUE.set(frame_queue);
         let _ = render_thread::GLOBAL_RENDER_HOST.set(host);
         let _ = render_thread::GLOBAL_COORDINATE_MAP
-            .set(Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
+            .set(Arc::new(std::sync::Mutex::new(PublishedControls::default())));
         std::thread::Builder::new().name("slint-render".into()).spawn(move || core.run()).ok();
     }
 }

@@ -58,7 +58,7 @@ pub(crate) static GLOBAL_RENDER_HOST: OnceLock<RenderHost> = OnceLock::new();
 /// composited controls' geometry + state) and the UI thread / workers
 /// (reader: hit-testing during event processing).  Initialised together with
 /// the render host in `ensure_render_thread`.
-pub(crate) static GLOBAL_COORDINATE_MAP: OnceLock<Arc<Mutex<CoordinateMap>>> = OnceLock::new();
+pub(crate) static GLOBAL_COORDINATE_MAP: OnceLock<Arc<Mutex<PublishedControls>>> = OnceLock::new();
 
 /// Global HWND (Windows only) stored when the winit window is created.
 #[cfg(target_os = "windows")]
@@ -356,6 +356,19 @@ impl RenderHost {
         rx.recv().unwrap_or(None)
     }
 
+    /// The control that owns the logical point `(x, y)`, read from the geometry
+    /// the render thread last composited.
+    ///
+    /// Unlike [`Self::hit_test`] this does not wait for the render thread, which
+    /// is what makes it usable for pointer moves: the pointer position only
+    /// exists on the thread that received the OS event, so blocking that thread
+    /// on every move would put the render thread in the input path and stall
+    /// input behind compositing.  The answer is one composite old at worst,
+    /// which for a pointer move is imperceptible.
+    pub fn control_at(&self, x: f32, y: f32) -> Option<u64> {
+        coordinate_map()?.lock().unwrap().control_at(x, y)
+    }
+
     /// Send an arbitrary closure to execute on the render thread.
     pub fn send_user(&self, f: impl FnOnce() + Send + 'static) {
         let _ = self.sender.send(RenderMessage::User(Box::new(f)));
@@ -468,6 +481,9 @@ impl RenderCore {
         // `RenderCore` non-Send otherwise.
         let mut render_window_adapter: Option<Rc<dyn WindowAdapter>> = None;
         let mut render_controls: HashMap<u64, ControlRegion> = HashMap::new();
+        // The same control ids in paint order, so a hit test can tell which of
+        // several overlapping controls is on top.
+        let mut render_control_order: Vec<u64> = Vec::new();
         // Render-side item behind each control id, so property loans can
         // assign to the mirror tree item directly.  Stays on this thread.
         let mut render_item_rcs: HashMap<u64, ItemRc> = HashMap::new();
@@ -493,6 +509,7 @@ impl RenderCore {
                                 if let Some(frame) = re_encode_mirror(
                                     &render_window_adapter,
                                     &mut render_controls,
+                                    &mut render_control_order,
                                     &mut render_item_rcs,
                                     &mut interaction,
                                 ) {
@@ -576,6 +593,7 @@ impl RenderCore {
                     if let Some(frame) = re_encode_mirror(
                         &render_window_adapter,
                         &mut render_controls,
+                        &mut render_control_order,
                         &mut render_item_rcs,
                         &mut interaction,
                     ) {
@@ -623,6 +641,7 @@ impl RenderCore {
                         if let Some(frame) = re_encode_mirror(
                             &render_window_adapter,
                             &mut render_controls,
+                            &mut render_control_order,
                             &mut render_item_rcs,
                             &mut interaction,
                         ) {
@@ -651,6 +670,7 @@ impl RenderCore {
                         if let Some(frame) = re_encode_mirror(
                             &render_window_adapter,
                             &mut render_controls,
+                            &mut render_control_order,
                             &mut render_item_rcs,
                             &mut interaction,
                         ) {
@@ -668,22 +688,27 @@ impl RenderCore {
                     }
                 }
                 RenderMessage::HitTest { x, y, response } => {
-                    // Smallest containing control wins, so nested elements hit
-                    // before their parent rectangle.
-                    let hit = render_controls
-                        .values()
-                        .filter(|r| r.geometry.contains(LogicalPoint::new(x, y)))
-                        .min_by_key(|r| {
-                            let g = r.geometry;
-                            (g.width() * g.height()) as u32
+                    // The last control in paint order that contains the point is
+                    // the topmost one, which is the one the user is pointing at.
+                    // Same rule as `control_at`, so a caller that reads the
+                    // published table and a caller that asks the render thread
+                    // cannot disagree.
+                    let hit = render_control_order
+                        .iter()
+                        .rev()
+                        .find(|id| {
+                            render_controls
+                                .get(id)
+                                .is_some_and(|r| r.geometry.contains(LogicalPoint::new(x, y)))
                         })
-                        .map(|r| r.id);
+                        .copied();
                     let _ = response.send(hit);
                 }
                 RenderMessage::RequestRedraw => {
                     if let Some(frame) = re_encode_mirror(
                         &render_window_adapter,
                         &mut render_controls,
+                        &mut render_control_order,
                         &mut render_item_rcs,
                         &mut interaction,
                     ) {
@@ -714,6 +739,7 @@ impl RenderCore {
                     render_window_adapter = None;
                     render_component = None;
                     render_controls.clear();
+                    render_control_order.clear();
                     render_item_rcs.clear();
                     interaction.clear();
                 }
@@ -733,6 +759,7 @@ impl RenderCore {
 fn re_encode_mirror(
     render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     render_controls: &mut HashMap<u64, ControlRegion>,
+    render_control_order: &mut Vec<u64>,
     render_item_rcs: &mut HashMap<u64, ItemRc>,
     interaction: &mut ControlInteraction,
 ) -> Option<SceneFrame> {
@@ -744,6 +771,8 @@ fn re_encode_mirror(
     i_slint_core::platform::update_timers_and_animations();
     let (frame, item_refs) = crate::snapshot::encode_window_scene_full(adapter.window()).ok()?;
     *render_controls = frame.controls.iter().map(|r| (r.id, r.clone())).collect();
+    render_control_order.clear();
+    render_control_order.extend(frame.controls.iter().map(|r| r.id));
     render_item_rcs.clear();
     render_item_rcs.extend(item_refs);
     interaction.retain(&frame.controls);
@@ -888,7 +917,7 @@ pub fn forward_system_accent(color: Color) {
 /// backend has been configured (`ensure_render_thread`).  UI thread and
 /// workers call this during event processing to hit-test the pointer against
 /// the latest geometry that the render thread actually composited.
-pub fn coordinate_map() -> Option<Arc<Mutex<CoordinateMap>>> {
+pub fn coordinate_map() -> Option<Arc<Mutex<PublishedControls>>> {
     GLOBAL_COORDINATE_MAP.get().cloned()
 }
 
