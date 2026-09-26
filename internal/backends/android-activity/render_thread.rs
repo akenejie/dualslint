@@ -28,7 +28,7 @@
 
 use i_slint_core::api::{PhysicalSize, PlatformError, Window as SlintApiWindow};
 use i_slint_core::graphics::RequestedGraphicsAPI;
-use i_slint_core::platform::{Platform, WindowAdapter, WindowEvent, WindowEventDispatchResult};
+use i_slint_core::platform::{Platform, WindowAdapter, WindowEvent};
 use i_slint_core::renderer::RendererSealed;
 use i_slint_renderer_skia::{SkiaRenderer, SkiaSharedContext};
 use std::any::Any;
@@ -94,35 +94,6 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::RequestRedraw);
     }
 
-    /// Hand a translated input event to the render thread and wait for its
-    /// verdict.
-    ///
-    /// Only the UI thread reads the Android input queue, but the control tree
-    /// is on the render thread, so the event has to be delivered there for the
-    /// hit testing, the focus handling and the item callbacks to run against
-    /// the tree that is actually on screen. The verdict tells the UI thread
-    /// whether the widget tree consumed the event, which is what Android needs
-    /// to decide about its own back gesture and IME handling.
-    ///
-    /// The round trip costs what dispatching on the UI thread used to cost:
-    /// the render thread is a plain receive loop with no other blocking
-    /// caller, so it replies as soon as it finishes the frame in flight.
-    pub(crate) fn forward_input(&self, event: WindowEvent) -> WindowEventDispatchResult {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        let _ = self
-            .sender
-            .send(RenderMessage::ForwardInput { event: Box::new(event), response: Some(tx) });
-        rx.recv().unwrap_or(WindowEventDispatchResult::Rejected)
-    }
-
-    /// Hand a translated input event to the render thread without waiting for
-    /// an answer. For the events whose outcome the UI thread has no use for.
-    pub(crate) fn forward_input_detached(&self, event: WindowEvent) {
-        let _ = self
-            .sender
-            .send(RenderMessage::ForwardInput { event: Box::new(event), response: None });
-    }
-
     /// Configure the render thread with the native window + initial size.
     pub(crate) fn submit_configure(
         &self,
@@ -173,21 +144,6 @@ pub(crate) enum RenderMessage {
         factory: Box<dyn Fn() -> Box<dyn Any> + Send>,
     },
     RequestRedraw,
-    /// An input event, already translated from the Android input queue by the
-    /// UI thread.
-    ///
-    /// The UI thread is the only side that reads the input queue, but the
-    /// control tree lives on the render thread, so the hit testing, the focus
-    /// handling and the item callbacks have to run there.
-    ForwardInput {
-        /// The event, in logical window coordinates.
-        event: Box<WindowEvent>,
-        /// Android decides whether to run its own default handling (the back
-        /// gesture, the IME) from what the widget tree answers, so the sender
-        /// asks for the verdict. `None` when the caller has no use for it, as
-        /// for a pointer move.
-        response: Option<std::sync::mpsc::SyncSender<WindowEventDispatchResult>>,
-    },
     Suspend,
 }
 
@@ -202,10 +158,6 @@ thread_local! {
     /// `App::new()` returns.
     static HEADLESS_ADAPTER_SLOT: RefCell<Option<Rc<RenderWindowAdapter>>> =
         const { RefCell::new(None) };
-    /// Set by [`RenderWindowAdapter::request_redraw`] when the core dirties a
-    /// rendered property. The render loop consumes it after applying an input
-    /// event, so a pointer move that changes nothing costs no re-encode.
-    static MIRROR_NEEDS_REDRAW: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Minimal window adapter for the render-thread component. The Slint runtime
@@ -236,10 +188,8 @@ impl WindowAdapter for RenderWindowAdapter {
     }
 
     fn request_redraw(&self) {
-        // The core marks a rendered property dirty. The render loop has no
-        // event source of its own to notice that, so record it and repaint
-        // once the message that caused it has been handled.
-        MIRROR_NEEDS_REDRAW.with(|dirty| dirty.set(true));
+        // The render thread redraws on demand when a request arrives; nothing
+        // to do here.
     }
 }
 
@@ -366,28 +316,6 @@ impl RenderCore {
                     // (upstream `SkiaRenderer` path), so there is nothing to
                     // present here.
                 }
-                RenderMessage::ForwardInput { event, response } => {
-                    // The control tree is ours, so the hit testing, the focus
-                    // handling and the item callbacks run here rather than on
-                    // the UI thread.
-                    let mut verdict = WindowEventDispatchResult::Rejected;
-                    if let Some(adapter) = &render_window_adapter {
-                        verdict = i_slint_core::api::Window::dispatch_event_with_result(
-                            adapter.window(),
-                            *event,
-                        )
-                        .unwrap_or(WindowEventDispatchResult::Rejected);
-                        // Repaint only when the event actually dirtied a
-                        // rendered property, so a pointer move that changes
-                        // nothing stays free.
-                        if MIRROR_NEEDS_REDRAW.with(|dirty| dirty.replace(false)) {
-                            present(adapter);
-                        }
-                    }
-                    if let Some(response) = response {
-                        let _ = response.send(verdict);
-                    }
-                }
                 RenderMessage::Suspend => {
                     // Release the surface + context and the mirror tree. The
                     // factory and geometry are retained so the mirror can be
@@ -504,9 +432,6 @@ fn present(adapter: &RenderWindowAdapter) {
     if let Err(e) = adapter.renderer.render() {
         eprintln!("dualslint render thread: present failed: {e}");
     }
-    // Everything the tree had to show is on screen now, so a dirtiness
-    // reported from here on belongs to the next frame.
-    MIRROR_NEEDS_REDRAW.with(|dirty| dirty.set(false));
 }
 
 /// The render thread host, once started.
@@ -533,18 +458,6 @@ pub(crate) fn ensure_render_thread() {
 /// has been configured ([`ensure_render_thread`]).
 pub fn host() -> Option<RenderHost> {
     GLOBAL_RENDER_HOST.get().cloned()
-}
-
-/// The side that currently owns the control tree, for input routing.
-///
-/// Returns the render host only once an application has attached a
-/// render-owned component; until then the UI thread keeps its own tree and
-/// keeps handling input the upstream way. The window adapter asks this before
-/// every input event instead of testing the flag itself, so the "who owns the
-/// controls" decision has a single answer.
-pub(crate) fn input_owner() -> Option<&'static RenderHost> {
-    let host = GLOBAL_RENDER_HOST.get()?;
-    host.has_attached_component().then_some(host)
 }
 
 /// Request a window repaint through the render thread.

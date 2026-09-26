@@ -109,19 +109,9 @@ impl WindowAdapter for RenderWindowAdapter {
     }
 
     fn request_redraw(&self) {
-        // The core marks a rendered property dirty.  The render loop has no
-        // event source of its own to notice that, so record it and repaint
-        // once the message that caused it has been handled.
-        MIRROR_NEEDS_REDRAW.with(|dirty| dirty.set(true));
+        // The render thread redraws on demand when a scene is submitted or
+        // a control state is changed; nothing to do here.
     }
-}
-
-thread_local! {
-    /// Set by [`RenderWindowAdapter::request_redraw`] when the core dirties a
-    /// rendered property.  The render loop consumes it after applying an
-    /// input event, so a pointer move that changes nothing costs no
-    /// re-encode.
-    static MIRROR_NEEDS_REDRAW: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Headless platform for the render thread.  Only `create_window_adapter` is
@@ -248,19 +238,6 @@ pub enum RenderMessage {
     /// explicit redraw command; also used implicitly after every property
     /// assignment and control-state change.
     RequestRedraw,
-    /// An input event, already translated from the windowing system by the UI
-    /// thread.
-    ///
-    /// The UI thread is the only side that talks to the OS, but the control
-    /// tree lives here, so the hit testing, the focus handling and the item
-    /// callbacks all have to run here.  Delivery is fire-and-forget: a widget
-    /// callback must never block the windowing-system thread, and the core
-    /// reports whether anything needs repainting through
-    /// [`RenderWindowAdapter::request_redraw`].
-    ForwardInput {
-        /// The event, in logical window coordinates.
-        event: Box<WindowEvent>,
-    },
     /// Forward the host's system accent colour (from the OS/xdg settings) to
     /// the mirror context.  The mirror has no OS connection of its own, so
     /// without this its widget palette would fall back to the default accent.
@@ -331,16 +308,6 @@ impl RenderHost {
     {
         self.attached.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = self.sender.send(RenderMessage::AttachComponent { factory: Box::new(factory) });
-    }
-
-    /// Hand a translated input event to the render thread.
-    ///
-    /// Only the UI thread talks to the windowing system, but the control tree
-    /// lives on the render thread, so the event has to be delivered there for
-    /// the hit testing, the focus handling and the item callbacks to run
-    /// against the tree that is actually on screen.
-    pub fn forward_input(&self, event: WindowEvent) {
-        let _ = self.sender.send(RenderMessage::ForwardInput { event: Box::new(event) });
     }
 
     /// Request the render thread to apply a pointer state to the given control
@@ -731,28 +698,6 @@ impl RenderCore {
                         self.host.send_redraw();
                     }
                 }
-                RenderMessage::ForwardInput { event } => {
-                    // The control tree is ours, so the hit testing, the focus
-                    // handling and the item callbacks run here rather than on
-                    // the UI thread.  Anything the callback changes dirties a
-                    // property, which the adapter reports through
-                    // `request_redraw`; only then is a repaint worth its
-                    // encode.
-                    if let Some(mirror) = &render_window_adapter {
-                        i_slint_core::api::Window::dispatch_event(mirror.window(), *event);
-                        if MIRROR_NEEDS_REDRAW.with(|dirty| dirty.replace(false))
-                            && let Some(frame) = re_encode_mirror(
-                                &render_window_adapter,
-                                &mut render_controls,
-                                &mut render_item_rcs,
-                            )
-                            && let Some(state) = &mut gl_state
-                        {
-                            let overlay = &self.overlay;
-                            state.render_scene(frame, overlay, &self.frame_queue, &self.host);
-                        }
-                    }
-                }
                 RenderMessage::Suspend => {
                     // Drop the GL context + canvas and release the winit window
                     // Arc so the UI thread can destroy the native window.
@@ -792,9 +737,6 @@ fn re_encode_mirror(
     *render_controls = frame.controls.iter().map(|r| (r.id, r.clone())).collect();
     render_item_rcs.clear();
     render_item_rcs.extend(item_refs);
-    // Everything the tree had to show is in `frame` now, so a dirtiness
-    // reported from here on belongs to the next frame.
-    MIRROR_NEEDS_REDRAW.with(|dirty| dirty.set(false));
     Some(frame)
 }
 
@@ -899,18 +841,6 @@ pub(crate) fn channel(
 /// Obtain the [`RenderHost`] for the current process.
 pub fn host() -> Option<RenderHost> {
     GLOBAL_RENDER_HOST.get().cloned()
-}
-
-/// The side that currently owns the control tree, for input routing.
-///
-/// Returns the render host only once an application has attached a
-/// render-owned component; until then the UI thread keeps its own tree and
-/// keeps handling input the upstream way.  The window adapter asks this before
-/// every input event instead of testing the flag itself, so the "who owns the
-/// controls" decision has a single answer.
-pub(crate) fn input_owner() -> Option<&'static RenderHost> {
-    let host = GLOBAL_RENDER_HOST.get()?;
-    host.has_attached_component().then_some(host)
 }
 
 /// Request a window repaint through the render thread.

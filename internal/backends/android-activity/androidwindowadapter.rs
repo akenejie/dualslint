@@ -261,10 +261,10 @@ impl AndroidWindowAdapter {
                 self.do_render()?;
             }
             PollEvent::Main(MainEvent::GainedFocus) => {
-                self.deliver_input(WindowEvent::WindowActiveChanged(true))?;
+                self.window.dispatch_event_with_result(WindowEvent::WindowActiveChanged(true))?;
             }
             PollEvent::Main(MainEvent::LostFocus) => {
-                self.deliver_input(WindowEvent::WindowActiveChanged(false))?;
+                self.window.dispatch_event_with_result(WindowEvent::WindowActiveChanged(false))?;
             }
             PollEvent::Main(MainEvent::ConfigChanged { .. }) => {
                 let scale_factor =
@@ -305,32 +305,6 @@ impl AndroidWindowAdapter {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Deliver an input event to whichever side owns the control tree and
-    /// report what that side answered.
-    ///
-    /// Only this thread reads the Android input queue, but a render-owned
-    /// component lives on the render thread, so the event goes there and the
-    /// hit testing and the item callbacks run against the tree that is on
-    /// screen. Android needs the answer either way: it decides about its own
-    /// back gesture and IME handling from it.
-    fn deliver_input(
-        &self,
-        event: WindowEvent,
-    ) -> Result<WindowEventDispatchResult, PlatformError> {
-        match crate::render_thread::input_owner() {
-            Some(host) => Ok(host.forward_input(event)),
-            None => self.window.dispatch_event_with_result(event),
-        }
-    }
-
-    /// Deliver an input event whose outcome this thread has no use for.
-    fn deliver_input_detached(&self, event: WindowEvent) {
-        match crate::render_thread::input_owner() {
-            Some(host) => host.forward_input_detached(event),
-            None => self.window.dispatch_event(event),
-        }
-    }
-
     fn process_inputs(&self) -> Result<(), PlatformError> {
         let mut iter =
             self.app.input_events_iter().map_err(|e| PlatformError::Other(e.to_string()))?;
@@ -338,7 +312,7 @@ impl AndroidWindowAdapter {
             let mut result = Ok(());
             let read_input = iter.next(|event| match event {
                 InputEvent::KeyEvent(key_event) => match map_key_event(key_event) {
-                    Some(ev) => match self.deliver_input(ev) {
+                    Some(ev) => match self.window.dispatch_event_with_result(ev) {
                         Ok(WindowEventDispatchResult::Accepted) => InputStatus::Handled,
                         Ok(_) => InputStatus::Unhandled,
                         Err(e) => {
@@ -400,7 +374,7 @@ impl AndroidWindowAdapter {
                             );
                             self.long_press.replace(Some(LongPressDetection { position, _timer }));
                             if let Some(p) = motion_event.pointers().next() {
-                                self.deliver_input_detached(WindowEvent::internal(
+                                self.window.dispatch_event(WindowEvent::internal(
                                     InternalEvent::Touch {
                                         id: p.pointer_id(),
                                         position: touch_pos(&p),
@@ -413,7 +387,7 @@ impl AndroidWindowAdapter {
                         MotionAction::Up => {
                             self.long_press.take();
                             if let Some(p) = motion_event.pointers().next() {
-                                self.deliver_input_detached(WindowEvent::internal(
+                                self.window.dispatch_event(WindowEvent::internal(
                                     InternalEvent::Touch {
                                         id: p.pointer_id(),
                                         position: touch_pos(&p),
@@ -437,7 +411,7 @@ impl AndroidWindowAdapter {
                             drop(lp);
 
                             for p in motion_event.pointers() {
-                                self.deliver_input_detached(WindowEvent::internal(
+                                self.window.dispatch_event(WindowEvent::internal(
                                     InternalEvent::Touch {
                                         id: p.pointer_id(),
                                         position: touch_pos(&p),
@@ -452,7 +426,7 @@ impl AndroidWindowAdapter {
                             self.long_press.take();
                             let idx = motion_event.pointer_index();
                             if let Some(p) = motion_event.pointers().nth(idx) {
-                                self.deliver_input_detached(WindowEvent::internal(
+                                self.window.dispatch_event(WindowEvent::internal(
                                     InternalEvent::Touch {
                                         id: p.pointer_id(),
                                         position: touch_pos(&p),
@@ -465,7 +439,7 @@ impl AndroidWindowAdapter {
                         MotionAction::PointerUp => {
                             let idx = motion_event.pointer_index();
                             if let Some(p) = motion_event.pointers().nth(idx) {
-                                self.deliver_input_detached(WindowEvent::internal(
+                                self.window.dispatch_event(WindowEvent::internal(
                                     InternalEvent::Touch {
                                         id: p.pointer_id(),
                                         position: touch_pos(&p),
@@ -478,13 +452,14 @@ impl AndroidWindowAdapter {
                         MotionAction::HoverMove => {
                             let position = position_for_event(motion_event, offset, scale);
                             let window_event = WindowEvent::PointerMoved { position };
-                            result = self.deliver_input(window_event).map(|_| ());
+                            result =
+                                self.window.dispatch_event_with_result(window_event).map(|_| ());
                             InputStatus::Handled
                         }
                         MotionAction::Cancel | MotionAction::Outside => {
                             self.long_press.take();
                             for p in motion_event.pointers() {
-                                self.deliver_input_detached(WindowEvent::internal(
+                                self.window.dispatch_event(WindowEvent::internal(
                                     InternalEvent::Touch {
                                         id: p.pointer_id(),
                                         position: touch_pos(&p),
@@ -536,7 +511,7 @@ impl AndroidWindowAdapter {
                             ..Default::default()
                         }
                     };
-                    self.deliver_input_detached(WindowEvent::internal(event));
+                    self.window.dispatch_event(WindowEvent::internal(event));
                     InputStatus::Handled
                 }
                 _ => InputStatus::Unhandled,

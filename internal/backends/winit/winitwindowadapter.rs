@@ -1195,16 +1195,9 @@ impl WinitWindowAdapter {
         // We don't render popups as separate windows yet, so treat
         // focus to be the same as being active.
         if have_focus != runtime_window.active() {
-            let event = corelib::platform::WindowEvent::WindowActiveChanged(have_focus);
-            // Focus belongs to the control tree, so it follows the tree: to
-            // the render thread when a render-owned component is attached, and
-            // to the UI thread's own tree otherwise.
-            match crate::render_thread::input_owner() {
-                Some(host) => host.forward_input(event),
-                None => {
-                    slint_window.dispatch_event_with_result(event)?;
-                }
-            }
+            slint_window.dispatch_event_with_result(
+                corelib::platform::WindowEvent::WindowActiveChanged(have_focus),
+            )?;
         }
 
         #[cfg(all(muda, target_os = "macos"))]
@@ -1230,16 +1223,7 @@ impl WinitWindowAdapter {
     }
 
     fn dispatch_internal_event(&self, event: impl Into<corelib::platform::InternalEvent>) {
-        let event = WindowEvent::internal(event.into());
-        // Pointer, touch, scroll and IME input all arrive here.  While a
-        // render-owned component is attached the control tree is on the render
-        // thread, so the event goes there and the hit testing and the item
-        // callbacks run against the tree that is actually on screen.  This
-        // thread stays the windowing-system side and only translates.
-        match crate::render_thread::input_owner() {
-            Some(host) => host.forward_input(event),
-            None => self.window().dispatch_event(event),
-        }
+        self.window().dispatch_event(WindowEvent::internal(event));
     }
 
     /// Handles a winit window event for this window: applies the window event filter, feeds

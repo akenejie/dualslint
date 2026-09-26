@@ -414,15 +414,9 @@ impl BackendBuilder {
 
 fn dispatch_mouse_move(window: &Weak<WinitWindowAdapter>, position: LogicalPoint) {
     if let Some(window) = window.upgrade() {
-        let event = i_slint_core::platform::WindowEvent::internal(
+        window.window().dispatch_event(i_slint_core::platform::WindowEvent::internal(
             i_slint_core::input::BackendMouseEvent::Moved { position, touch_finger_id: 0 },
-        );
-        // A coalesced move is input like any other, so it follows the tree
-        // that owns the controls.
-        match render_thread::input_owner() {
-            Some(host) => host.forward_input(event),
-            None => window.window().dispatch_event(event),
-        }
+        ));
     }
 }
 
