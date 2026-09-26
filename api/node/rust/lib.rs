@@ -155,6 +155,22 @@ pub fn set_xdg_app_id(app_id: String) -> napi::Result<()> {
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
+/// Request a window repaint through the render thread.
+///
+/// The winit backend owns presentation on a dedicated thread, so a repaint
+/// request has to go there rather than to a UI-side window. The UI thread and
+/// worker threads are equal peers here: both may call this. It is a no-op when
+/// the render thread was never started.
+#[napi]
+pub fn request_redraw() {
+    #[cfg(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    ))]
+    slint_interpreter::render_thread::request_redraw();
+}
+
 pub fn print_to_console(env: Env, function: &str, arguments: core::fmt::Arguments) {
     let Ok(global) = env.get_global() else {
         eprintln!("Unable to obtain global object");

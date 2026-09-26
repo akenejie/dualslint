@@ -75,15 +75,27 @@ backend-qt = ["i-slint-backend-selector/backend-qt", "std"]
 ## The [winit](https://crates.io/crates/log) crate is used for the event loop and windowing system integration.
 ## With this feature, both x11 and wayland windowing systems are supported. For a smaller build, omit
 ## this feature and select one of the other specific `backend-winit-XX` features.
-backend-winit = ["i-slint-backend-selector/backend-winit", "std"]
+backend-winit = [
+    "i-slint-backend-selector/backend-winit",
+    "std",
+    "dep:i-slint-backend-winit",
+]
 
 ## Similar to `backend-winit` this enables the winit based event loop but only
 ## with support for the X Window System on Unix.
-backend-winit-x11 = ["i-slint-backend-selector/backend-winit-x11", "std"]
+backend-winit-x11 = [
+    "i-slint-backend-selector/backend-winit-x11",
+    "std",
+    "dep:i-slint-backend-winit",
+]
 
 ## Similar to `backend-winit` this enables the winit based event loop but only
 ## with support for the Wayland window system on Unix.
-backend-winit-wayland = ["i-slint-backend-selector/backend-winit-wayland", "std"]
+backend-winit-wayland = [
+    "i-slint-backend-selector/backend-winit-wayland",
+    "std",
+    "dep:i-slint-backend-winit",
+]
 
 ## KMS with Vulkan or EGL on Linux is used to render the application in full screen mode, without any
 ## windowing system.
@@ -192,6 +204,10 @@ web-sys = { workspace = true, features = ["Navigator"] }
 # always need the decoders. The browser decodes images on the web.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 i-slint-core = { workspace = true, features = ["image-decoders", "svg"] }
+# Named directly so that the `render_thread` API of the winit backend can be
+# re-exported from `api`; the selector already pulls the crate in when a winit
+# backend feature is on, so this adds no extra build cost.
+i-slint-backend-winit = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # this line is there to add the "enable" feature by default, but only on linux

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from . import language
+from . import render_thread
 from ._native import native
 from .loop import SlintEventLoop
 from .models import ListModel, Model
@@ -679,6 +680,7 @@ __all__ = [
     "load_file",
     "loader",
     "quit_event_loop",
+    "render_thread",
     "run_event_loop",
     "set_xdg_app_id",
 ]

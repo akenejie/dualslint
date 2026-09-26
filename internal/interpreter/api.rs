@@ -27,6 +27,25 @@ pub use i_slint_compiler::diagnostics::{Diagnostic, DiagnosticLevel};
 pub use i_slint_backend_selector::api::*;
 pub use i_slint_core::api::*;
 
+/// The render thread host API, mirroring `slint::render_thread`.
+///
+/// The winit backend runs a dedicated thread that owns the mirror component
+/// tree and presents frames, so a repaint request has to be addressed to that
+/// thread rather than to a UI-side window adapter. Use
+/// [`render_thread::request_redraw`] from the UI thread or from any worker
+/// thread; both are equal peers of the render thread.
+///
+/// This is a no-op when the render thread was never started.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland",
+    )
+))]
+pub use i_slint_backend_winit::render_thread;
+
 /// Argument of [`Compiler::set_default_translation_context()`]
 ///
 pub use i_slint_compiler::DefaultTranslationContext;

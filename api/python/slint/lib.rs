@@ -68,6 +68,22 @@ fn set_xdg_app_id(app_id: String) -> Result<(), errors::PyPlatformError> {
     slint_interpreter::set_xdg_app_id(app_id).map_err(|e| e.into())
 }
 
+/// Request a window repaint through the render thread.
+///
+/// The winit backend owns presentation on a dedicated thread, so a repaint
+/// request has to be addressed there rather than to a UI-side window. The UI
+/// thread and worker threads are equal peers here: both may call this. It is a
+/// no-op when the render thread was never started.
+#[pyfunction]
+fn request_redraw() {
+    #[cfg(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    ))]
+    slint_interpreter::render_thread::request_redraw();
+}
+
 #[pyfunction]
 fn invoke_from_event_loop(callable: Py<PyAny>) -> Result<(), errors::PyEventLoopError> {
     slint_interpreter::invoke_from_event_loop(move || {
@@ -226,6 +242,7 @@ fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run_event_loop, m)?)?;
     m.add_function(wrap_pyfunction!(quit_event_loop, m)?)?;
     m.add_function(wrap_pyfunction!(set_xdg_app_id, m)?)?;
+    m.add_function(wrap_pyfunction!(request_redraw, m)?)?;
     m.add_function(wrap_pyfunction!(invoke_from_event_loop, m)?)?;
     m.add_function(wrap_pyfunction!(init_translations, m)?)?;
     m.add_function(wrap_pyfunction!(build_features, m)?)?;
