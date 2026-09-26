@@ -66,6 +66,7 @@ default = []
 
 [dependencies]
 i-slint-core = { workspace = true, features = ["default", "box-shadow-cache"] }
+i-slint-backend-scene = { workspace = true }
 i-slint-core-macros = { workspace = true, features = ["default"] }
 i-slint-common = { workspace = true, features = ["default"] }
 

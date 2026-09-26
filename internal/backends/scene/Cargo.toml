@@ -1,0 +1,30 @@
+# Copyright © akenejie
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# SceneFrame / DrawCommand types and the snapshot encoder for 2-thread
+# backends.  The types are plain `Send` data crossed over a channel; the
+# encoder walks a Slint item tree and is renderer-agnostic (the replay target
+# decides how to draw the commands).  The winit backend replays these onto
+# FemtoVG/GL; other platforms can ignore the protocol and present from their
+# own render thread instead.
+
+[package]
+name = "i-slint-backend-scene"
+description = "SceneFrame snapshot types and encoder for the 2-thread backends"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["std", "image-decoders", "svg"]
+std = ["i-slint-core/std"]
+image-decoders = ["i-slint-core/image-decoders"]
+svg = ["i-slint-core/svg"]
+
+[dependencies]
+i-slint-core = { workspace = true, features = ["default", "box-shadow-cache"] }
+lyon_path = { workspace = true }
