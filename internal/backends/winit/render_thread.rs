@@ -25,10 +25,9 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use i_slint_core::api::{PhysicalSize, Window as SlintApiWindow};
 use i_slint_core::graphics::{Color, euclid};
-use i_slint_core::input::{BackendMouseEvent, PointerEventButton};
 use i_slint_core::item_tree::ItemRc;
-use i_slint_core::lengths::{LogicalLength, LogicalPoint, PhysicalBorderRadius};
-use i_slint_core::platform::{Platform, PlatformError, WindowEvent};
+use i_slint_core::lengths::{LogicalPoint, PhysicalBorderRadius};
+use i_slint_core::platform::{Platform, PlatformError};
 use i_slint_core::window::{WindowAdapter, WindowInner};
 
 use crate::winit_compat::WindowSurfaceSizeExt;
@@ -472,8 +471,7 @@ impl RenderCore {
         // Render-side item behind each control id, so property loans can
         // assign to the mirror tree item directly.  Stays on this thread.
         let mut render_item_rcs: HashMap<u64, ItemRc> = HashMap::new();
-        let mut hovered_controls: HashSet<u64> = HashSet::new();
-        let mut pressed_controls: HashSet<u64> = HashSet::new();
+        let mut interaction = ControlInteraction::default();
         // Keeps the mirror component tree alive for the lifetime of the
         // render thread (the strong handle owns the ItemTree).  Moved in
         // only from `AttachComponent`; never leaves this thread.
@@ -496,6 +494,7 @@ impl RenderCore {
                                     &render_window_adapter,
                                     &mut render_controls,
                                     &mut render_item_rcs,
+                                    &mut interaction,
                                 ) {
                                     let overlay = &self.overlay;
                                     gl_state.as_mut().unwrap().render_scene(
@@ -503,6 +502,7 @@ impl RenderCore {
                                         overlay,
                                         &self.frame_queue,
                                         &self.host,
+                                        &interaction,
                                     );
                                 }
                             }
@@ -525,7 +525,13 @@ impl RenderCore {
                 RenderMessage::RenderScene { frame } => {
                     if let Some(state) = &mut gl_state {
                         let overlay = &self.overlay;
-                        state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                        state.render_scene(
+                            frame,
+                            overlay,
+                            &self.frame_queue,
+                            &self.host,
+                            &interaction,
+                        );
                     }
                 }
                 RenderMessage::SetOverlay { overlay } => {
@@ -571,76 +577,65 @@ impl RenderCore {
                         &render_window_adapter,
                         &mut render_controls,
                         &mut render_item_rcs,
+                        &mut interaction,
                     ) {
                         if let Some(state) = &mut gl_state {
                             let overlay = &self.overlay;
-                            state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                            state.render_scene(
+                                frame,
+                                overlay,
+                                &self.frame_queue,
+                                &self.host,
+                                &interaction,
+                            );
                         }
                     }
                 }
                 RenderMessage::ApplyControlState { id, hovered, pressed } => {
-                    let Some(mirror) = &render_window_adapter else {
+                    // The UI thread resolved the pointer against the published
+                    // geometry and decided what this control looks like now, so
+                    // the state is *assigned* here instead of a mouse event
+                    // being replayed at the control's centre: the centre is not
+                    // where the pointer is, and a click callback would fire
+                    // from a position the user never chose.
+                    let Some(item_rc) = render_item_rcs.get(&id) else {
                         continue;
                     };
-                    let Some(region) = render_controls.get(&id).cloned() else {
-                        continue;
-                    };
-                    let geometry = region.geometry;
-                    let center = LogicalPoint::from_lengths(
-                        LogicalLength::new(geometry.min_x() + geometry.width() / 2.0),
-                        LogicalLength::new(geometry.min_y() + geometry.height() / 2.0),
-                    );
-                    // Hover transition
-                    if hovered && hovered_controls.insert(id) {
-                        i_slint_core::api::Window::dispatch_event(
-                            mirror.window(),
-                            WindowEvent::internal(BackendMouseEvent::Moved {
-                                position: center,
-                                touch_finger_id: 0,
-                            }),
-                        );
-                    } else if !hovered && hovered_controls.remove(&id) {
-                        i_slint_core::api::Window::dispatch_event(
-                            mirror.window(),
-                            WindowEvent::internal(BackendMouseEvent::Moved {
-                                position: center,
-                                touch_finger_id: 0,
-                            }),
+                    let mut changed = false;
+                    if hovered != interaction.is_hovered(id) {
+                        interaction.set_hovered(id, hovered);
+                        changed |= apply_control_property(
+                            item_rc,
+                            "has-hover",
+                            &ControlPropertyValue::Bool(hovered),
                         );
                     }
-                    // Press / release transitions: only send an edge so a
-                    // held button keeps `pressed` visible across re-encodes.
-                    if pressed && pressed_controls.insert(id) {
-                        i_slint_core::api::Window::dispatch_event(
-                            mirror.window(),
-                            WindowEvent::internal(BackendMouseEvent::Pressed {
-                                position: center,
-                                button: PointerEventButton::Left,
-                                click_count: 0,
-                                touch_finger_id: 0,
-                            }),
-                        );
-                    } else if !pressed && pressed_controls.remove(&id) {
-                        i_slint_core::api::Window::dispatch_event(
-                            mirror.window(),
-                            WindowEvent::internal(BackendMouseEvent::Released {
-                                position: center,
-                                button: PointerEventButton::Left,
-                                click_count: 0,
-                                touch_finger_id: 0,
-                            }),
+                    if pressed != interaction.is_pressed(id) {
+                        interaction.set_pressed(id, pressed);
+                        changed |= apply_control_property(
+                            item_rc,
+                            "pressed",
+                            &ControlPropertyValue::Bool(pressed),
                         );
                     }
-                    // Re-encode and present from the mirror tree so the
-                    // button state update is visible.
-                    if let Some(frame) = re_encode_mirror(
-                        &render_window_adapter,
-                        &mut render_controls,
-                        &mut render_item_rcs,
-                    ) {
-                        if let Some(state) = &mut gl_state {
-                            let overlay = &self.overlay;
-                            state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                    if changed {
+                        // Re-encode and present so the new state is visible.
+                        if let Some(frame) = re_encode_mirror(
+                            &render_window_adapter,
+                            &mut render_controls,
+                            &mut render_item_rcs,
+                            &mut interaction,
+                        ) {
+                            if let Some(state) = &mut gl_state {
+                                let overlay = &self.overlay;
+                                state.render_scene(
+                                    frame,
+                                    overlay,
+                                    &self.frame_queue,
+                                    &self.host,
+                                    &interaction,
+                                );
+                            }
                         }
                     }
                 }
@@ -657,10 +652,17 @@ impl RenderCore {
                             &render_window_adapter,
                             &mut render_controls,
                             &mut render_item_rcs,
+                            &mut interaction,
                         ) {
                             if let Some(state) = &mut gl_state {
                                 let overlay = &self.overlay;
-                                state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                                state.render_scene(
+                                    frame,
+                                    overlay,
+                                    &self.frame_queue,
+                                    &self.host,
+                                    &interaction,
+                                );
                             }
                         }
                     }
@@ -683,10 +685,17 @@ impl RenderCore {
                         &render_window_adapter,
                         &mut render_controls,
                         &mut render_item_rcs,
+                        &mut interaction,
                     ) {
                         if let Some(state) = &mut gl_state {
                             let overlay = &self.overlay;
-                            state.render_scene(frame, overlay, &self.frame_queue, &self.host);
+                            state.render_scene(
+                                frame,
+                                overlay,
+                                &self.frame_queue,
+                                &self.host,
+                                &interaction,
+                            );
                         }
                     } else {
                         // No render-owned component is attached, so the render
@@ -706,8 +715,7 @@ impl RenderCore {
                     render_component = None;
                     render_controls.clear();
                     render_item_rcs.clear();
-                    hovered_controls.clear();
-                    pressed_controls.clear();
+                    interaction.clear();
                 }
                 RenderMessage::Quit => break,
             }
@@ -726,6 +734,7 @@ fn re_encode_mirror(
     render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     render_controls: &mut HashMap<u64, ControlRegion>,
     render_item_rcs: &mut HashMap<u64, ItemRc>,
+    interaction: &mut ControlInteraction,
 ) -> Option<SceneFrame> {
     let adapter = render_window_adapter.as_ref()?;
     let adapter: &dyn WindowAdapter = &**adapter;
@@ -737,6 +746,7 @@ fn re_encode_mirror(
     *render_controls = frame.controls.iter().map(|r| (r.id, r.clone())).collect();
     render_item_rcs.clear();
     render_item_rcs.extend(item_refs);
+    interaction.retain(&frame.controls);
     Some(frame)
 }
 
@@ -885,7 +895,56 @@ pub fn coordinate_map() -> Option<Arc<Mutex<CoordinateMap>>> {
 /// Replace the shared coordinate table with the given control regions.
 /// Called on the render thread when a scene is composited, so the published
 /// geometry always reflects what was actually drawn.
-pub(crate) fn publish_control_coords(controls: &[ControlRegion]) {
+/// The pointer state the render thread holds for the render-owned controls.
+///
+/// The UI thread decides what this should be (it owns the OS event and does the
+/// hit-testing) and the render thread applies it, so the state lives here as the
+/// applied truth and is republished for the peers to read.
+#[derive(Default)]
+struct ControlInteraction {
+    hovered: HashSet<u64>,
+    pressed: HashSet<u64>,
+}
+
+impl ControlInteraction {
+    fn is_hovered(&self, id: u64) -> bool {
+        self.hovered.contains(&id)
+    }
+
+    fn is_pressed(&self, id: u64) -> bool {
+        self.pressed.contains(&id)
+    }
+
+    fn set_hovered(&mut self, id: u64, hovered: bool) {
+        if hovered {
+            self.hovered.insert(id);
+        } else {
+            self.hovered.remove(&id);
+        }
+    }
+
+    fn set_pressed(&mut self, id: u64, pressed: bool) {
+        if pressed {
+            self.pressed.insert(id);
+        } else {
+            self.pressed.remove(&id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.hovered.clear();
+        self.pressed.clear();
+    }
+
+    /// Forget the controls that the latest encode no longer contains, so that a
+    /// control that comes back does not inherit a stale hover or press.
+    fn retain(&mut self, controls: &[ControlRegion]) {
+        self.hovered.retain(|id| controls.iter().any(|c| c.id == *id));
+        self.pressed.retain(|id| controls.iter().any(|c| c.id == *id));
+    }
+}
+
+fn publish_control_coords(controls: &[ControlRegion], interaction: &ControlInteraction) {
     let Some(map) = coordinate_map() else { return };
     let mut map = map.lock().unwrap();
     map.clear();
@@ -897,8 +956,8 @@ pub(crate) fn publish_control_coords(controls: &[ControlRegion]) {
                 y: c.geometry.origin.y,
                 width: c.geometry.size.width,
                 height: c.geometry.size.height,
-                hovered: false,
-                pressed: false,
+                hovered: interaction.is_hovered(c.id),
+                pressed: interaction.is_pressed(c.id),
             },
         );
     }
@@ -1111,12 +1170,15 @@ impl GlRenderState {
         overlay: &OverlayFrame,
         _frame_queue: &FrameQueue,
         _host: &RenderHost,
+        interaction: &ControlInteraction,
     ) {
         // Publish the controls that are actually part of this composited
         // frame into the shared coordinate table, so the UI thread can
         // hit-test during event processing from the render thread's (the
-        // authority's) view without blocking it.
-        publish_control_coords(&frame.controls);
+        // authority's) view without blocking it.  The interaction state goes
+        // out with the geometry, because a peer that reads the table to decide
+        // what to do next needs both halves.
+        publish_control_coords(&frame.controls, interaction);
         self.last_frame = Some(frame);
         let Some(frame) = &self.last_frame else { return };
         self.composite_and_present(frame, overlay);

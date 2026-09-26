@@ -222,20 +222,48 @@ impl SnapshotEncoder {
         k
     }
 
-    /// Publish this item as a control region (a target for hit-testing and
-    /// `RenderHost::apply_control_state`).  Geometry is in window-space logical
-    /// pixels.
-    fn push_control(&mut self, item: &ItemRc, size: LogicalSize) {
-        if size.is_empty() {
+    /// Publish this item as a control region: a target for hit-testing and for
+    /// `RenderHost::apply_control_state`.  Geometry is in window-space logical
+    /// pixels, taken from the laid-out item so that the published rectangle is
+    /// the one the user can point at rather than the one that happened to be
+    /// drawn.
+    fn push_control(&mut self, item: &ItemRc) {
+        let geometry = item.geometry();
+        if geometry.size.is_empty() {
             return;
         }
-        let origin = item.geometry().origin;
-        let window_origin = item.map_to_window(origin);
+        let window_origin = item.map_to_window(geometry.origin);
         self.controls.push(ControlRegion {
             id: item_rc_as_id(item),
-            geometry: LogicalRect::new(window_origin, size),
+            geometry: LogicalRect::new(window_origin, geometry.size),
         });
         self.item_refs.push((item_rc_as_id(item), item.clone()));
+    }
+
+    /// Publish the interactive items of `component` as control regions.
+    ///
+    /// Whether an item is painted and whether it can be pointed at are two
+    /// different questions: a `TouchArea` without a background is never asked to
+    /// draw anything yet is still a hit target, and a plain rectangle is drawn
+    /// but not interactive.  So the controls are found by walking the tree
+    /// rather than by watching the draw calls, and the walk runs back to front
+    /// so that a later entry paints over an earlier one — which lets the
+    /// hit-test take the last match as the topmost control.
+    fn collect_interactive_controls(&mut self, component: &i_slint_core::item_tree::ItemTreeRc) {
+        i_slint_core::item_tree::visit_items(
+            component,
+            i_slint_core::item_tree::TraversalOrder::BackToFront,
+            |component, _item, index, _state| {
+                let item_rc = ItemRc::new(component.clone(), index);
+                let interactive = item_rc.downcast::<i_slint_core::items::TouchArea>().is_some()
+                    || item_rc.downcast::<i_slint_core::items::FocusScope>().is_some();
+                if interactive {
+                    self.push_control(&item_rc);
+                }
+                i_slint_core::item_tree::ItemVisitorResult::Continue(())
+            },
+            (),
+        );
     }
 
     fn push(&mut self, cmd: DrawCommand) {
@@ -251,7 +279,7 @@ impl ItemRenderer for SnapshotEncoder {
     fn draw_rectangle(
         &mut self,
         rect: Pin<&dyn RenderRectangle>,
-        self_rc: &ItemRc,
+        _self_rc: &ItemRc,
         size: LogicalSize,
         _cache: &CachedRenderingData,
     ) {
@@ -266,13 +294,12 @@ impl ItemRenderer for SnapshotEncoder {
             None => return,
         };
         self.push(DrawCommand::FillRect { rect: geometry, paint, anti_alias: false });
-        self.push_control(self_rc, size);
     }
 
     fn draw_border_rectangle(
         &mut self,
         rect: Pin<&dyn RenderBorderRectangle>,
-        self_rc: &ItemRc,
+        _self_rc: &ItemRc,
         size: LogicalSize,
         _cache: &CachedRenderingData,
     ) {
@@ -307,7 +334,6 @@ impl ItemRenderer for SnapshotEncoder {
                 });
             }
         }
-        self.push_control(self_rc, size);
     }
 
     fn draw_window_background(
@@ -413,7 +439,6 @@ impl ItemRenderer for SnapshotEncoder {
         let layout_cache = std::mem::take(&mut self.text_layout_cache);
         sharedparley::draw_text(self, text, Some(self_rc), size, Some(&layout_cache));
         self.text_layout_cache = layout_cache;
-        self.push_control(self_rc, size);
     }
 
     fn draw_text_input(
@@ -987,6 +1012,12 @@ pub fn encode_window_scene_full(
         }
         post_render(&mut encoder);
     });
+
+    // After the draw pass, so that the interactive items are visited whether or
+    // not they contributed a draw command.
+    if let Some(window_item_rc) = window_inner.window_item_rc() {
+        encoder.collect_interactive_controls(window_item_rc.item_tree());
+    }
 
     Ok(encoder.finish())
 }

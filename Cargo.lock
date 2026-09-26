@@ -7592,6 +7592,7 @@ dependencies = [
  "i-slint-backend-android-activity",
  "i-slint-backend-linuxkms",
  "i-slint-backend-qt",
+ "i-slint-backend-scene",
  "i-slint-backend-selector",
  "i-slint-backend-testing",
  "i-slint-backend-winit",
