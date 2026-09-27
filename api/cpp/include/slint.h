@@ -30,6 +30,35 @@
 /// `slint::render_thread::request_redraw()`.
 extern "C" void slint_render_thread_request_redraw();
 
+extern "C" uint64_t slint_render_thread_control_at(float x, float y);
+extern "C" uint64_t slint_render_thread_hit_test(float x, float y);
+extern "C" void slint_render_thread_apply_control_state(uint64_t id, bool hovered, bool pressed);
+/// Creates a component on the calling (render) thread and returns the address
+/// of a heap-allocated owning pointer to it; see
+/// `slint::render_thread::attach_component()`.
+using SlintRenderThreadFactory = void *(*)();
+extern "C" bool slint_render_thread_attach_component(SlintRenderThreadFactory factory);
+
+/// Tag values of `SlintControlPropertyValue::tag`.
+#define SLINT_CONTROL_PROPERTY_BOOL 0u
+#define SLINT_CONTROL_PROPERTY_NUMBER 1u
+#define SLINT_CONTROL_PROPERTY_TEXT 2u
+#define SLINT_CONTROL_PROPERTY_COLOR 3u
+
+/// A property value to assign to a borrowed control, as a tagged struct; see
+/// `slint::render_thread::PropertyValue`.
+struct SlintControlPropertyValue {
+    uint32_t tag;
+    float number;
+    bool bool_;
+    uint8_t color[4];
+    /// NUL-terminated UTF-8, or null for the empty string.
+    const char *text;
+};
+
+extern "C" bool slint_render_thread_set_control_property(
+        uint64_t id, const char *property, SlintControlPropertyValue value);
+
 /// The `slint` namespace is the primary entry point into the Slint C++ API.
 /// All available types are in this namespace.
 ///
@@ -882,6 +911,11 @@ inline void set_xdg_app_id(std::string_view xdg_app_id)
 /// [`slint::render_thread::request_redraw()`] requests a repaint of the
 /// window directly on the render thread, whether or not a mirror component is
 /// attached.
+///
+/// The render thread owns the controls, so a program that wants to touch one
+/// borrows it here: identify the control, then assign a property. The UI thread
+/// and any worker thread are equal peers on this API; neither is more
+/// privileged than the other.
 inline namespace render_thread {
     /// Request a window repaint through the render thread.
     ///
@@ -892,6 +926,151 @@ inline namespace render_thread {
     inline void request_redraw()
     {
         slint_render_thread_request_redraw();
+    }
+
+    /// A control owned by the render thread, or the empty value when no control
+    /// was found.
+    ///
+    /// Ids are only meaningful to the render thread that published them, and
+    /// they stay valid for as long as that control exists.
+    struct ControlId {
+        /// Zero means "no control": a real control never has this id.
+        uint64_t value = 0;
+
+        /// Whether this refers to a control at all.
+        bool has_value() const { return value != 0; }
+        explicit operator bool() const { return has_value(); }
+
+        bool operator==(const ControlId &) const = default;
+    };
+
+    /// The control under the logical point `x`, `y`.
+    ///
+    /// Reads the geometry the render thread last composited and does not wait
+    /// for it, so it is cheap enough for a pointer move. Use
+    /// [`hit_test()`] instead when the answer must reflect the present rather
+    /// than the last frame.
+    [[nodiscard]] inline ControlId control_at(float x, float y)
+    {
+        return ControlId { slint_render_thread_control_at(x, y) };
+    }
+
+    /// The control under the logical point `x`, `y`, resolved on the render
+    /// thread itself. Blocks until the render thread answers, which is what
+    /// makes it right for a click and wrong for a pointer move.
+    [[nodiscard]] inline ControlId hit_test(float x, float y)
+    {
+        return ControlId { slint_render_thread_hit_test(x, y) };
+    }
+
+    /// A property value to assign to a borrowed control.
+    struct PropertyValue {
+        /// Which of the fields below carries the value.
+        enum class Kind : uint32_t {
+            Boolean,
+            Number,
+            Text,
+            Color,
+        };
+
+        Kind kind = Kind::Boolean;
+        bool boolean = false;
+        float number = 0;
+        /// RGBA, each component 0-255.
+        uint8_t color[4] = { 0, 0, 0, 0 };
+        /// NUL-terminated UTF-8. Only read when `kind` is `Text`.
+        const char *text = nullptr;
+
+        /// A `bool` property, such as a `TouchArea`'s `enabled`.
+        static PropertyValue from_bool(bool v) noexcept
+        {
+            PropertyValue p;
+            p.kind = Kind::Boolean;
+            p.boolean = v;
+            return p;
+        }
+
+        /// A numeric property, such as `opacity` or `width`.
+        static PropertyValue from_number(float v) noexcept
+        {
+            PropertyValue p;
+            p.kind = Kind::Number;
+            p.number = v;
+            return p;
+        }
+
+        /// A string property, such as a `Text`'s `text`.
+        static PropertyValue from_text(const char *v) noexcept
+        {
+            PropertyValue p;
+            p.kind = Kind::Text;
+            p.text = v;
+            return p;
+        }
+
+        /// A color property, such as a `Text`'s `color`.
+        static PropertyValue from_color(uint8_t r, uint8_t g, uint8_t b,
+                                        uint8_t a = 255) noexcept
+        {
+            PropertyValue p;
+            p.kind = Kind::Color;
+            p.color[0] = r;
+            p.color[1] = g;
+            p.color[2] = b;
+            p.color[3] = a;
+            return p;
+        }
+    };
+
+    /// Assign one property of a borrowed control, blocking until the render
+    /// thread confirms the assignment. Returns whether the property name
+    /// resolved and the value was applied.
+    ///
+    /// A property that has a binding is detached first, the same way assigning
+    /// through the normal API behaves.
+    inline bool set_control_property(ControlId id, const char *property,
+                                     PropertyValue value)
+    {
+        if (!id.has_value() || property == nullptr) {
+            return false;
+        }
+        return slint_render_thread_set_control_property(
+                id.value, property,
+                SlintControlPropertyValue { static_cast<uint32_t>(value.kind),
+                                            value.number, value.boolean,
+                                            { value.color[0], value.color[1],
+                                              value.color[2], value.color[3] },
+                                            value.text });
+    }
+
+    /// Report a control as hovered and/or pressed on the render thread.
+    ///
+    /// This is how a pointer state that the program resolved itself is handed
+    /// over; the UI thread does it for real pointer input, and a worker driving
+    /// a control from its own logic (a gamepad cursor, a scripted highlight)
+    /// does it the same way.
+    inline void apply_control_state(ControlId id, bool hovered, bool pressed)
+    {
+        if (id.has_value()) {
+            slint_render_thread_apply_control_state(id.value, hovered, pressed);
+        }
+    }
+
+    /// Hand the render thread a component to instantiate, which makes the
+    /// render thread the owner of the controls from then on.
+    ///
+    /// `factory` is called on the render thread, so the component it creates
+    /// belongs to that thread. It must return the address of a heap-allocated
+    /// owning pointer to the component -- the result of `Box::into_raw` on a
+    /// boxed component, not the address of the component itself. Once handed
+    /// over the render thread owns that allocation and keeps the component alive
+    /// for as long as it draws.
+    ///
+    /// Only available when the C++ API is built against a render-thread capable
+    /// backend; returns false otherwise.
+    inline bool attach_component(SlintRenderThreadFactory factory)
+    {
+        return factory != nullptr && slint_render_thread_attach_component(factory);
     }
 } // namespace render_thread
 

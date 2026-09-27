@@ -146,21 +146,6 @@ pub struct Frame {
 
 pub(crate) type FrameQueue = Arc<Mutex<VecDeque<Frame>>>;
 
-/// A value to assign to a borrowed (lent-out) control property.  The render
-/// thread converts it to the concrete Slint property type (upstream
-/// semantics, including detaching a previous binding) on the mirror tree.
-#[derive(Clone, Debug)]
-pub enum ControlPropertyValue {
-    /// For `Text.text`, `TextInput.text`, ...
-    Text(String),
-    /// RGBA, for `Rectangle.background`, `Text.color`, ...
-    Color { r: u8, g: u8, b: u8, a: u8 },
-    /// For `TouchArea.enabled` / `pressed` / `has-hover`, ...
-    Bool(bool),
-    /// For numeric properties (`opacity`, `width`, ...).
-    Number(f32),
-}
-
 /// Messages the UI thread sends to the render thread.
 pub enum RenderMessage {
     /// Provide the winit window + initial configuration. The render thread
@@ -901,6 +886,117 @@ pub fn request_redraw() {
 #[unsafe(no_mangle)]
 pub extern "C" fn slint_render_thread_request_redraw() {
     request_redraw();
+}
+
+// ---------------------------------------------------------------------------
+// C ABI for borrowing the render-owned controls
+//
+// The languages that have no handle type of their own (C++, and anything built
+// on the C ABI) reach the same borrow protocol the Rust API offers: identify a
+// control, then assign one of its properties.  The property value crosses as
+// [`CSlintControlPropertyValue`] rather than a Rust enum so the layout is
+// fixed; it is defined next to the enum it mirrors, in the scene crate.
+// ---------------------------------------------------------------------------
+
+/// Borrow the control under the logical point `(x, y)`.
+///
+/// Returns the control id, or `0` when the point is over no control or nothing
+/// has been composited yet.  Control ids are never `0`, so `0` is unambiguous
+/// as "no control".  This reads the published geometry and does not wait for the
+/// render thread, so it is usable from a pointer move.
+#[unsafe(no_mangle)]
+pub extern "C" fn slint_render_thread_control_at(x: f32, y: f32) -> u64 {
+    host().and_then(|host| host.control_at(x, y)).unwrap_or(0)
+}
+
+/// Like [`slint_render_thread_control_at`], but waits for the render thread to
+/// answer from the control tree as it stands now rather than from the last
+/// composited frame.  Use this when the answer has to be current, such as
+/// resolving a click.
+#[unsafe(no_mangle)]
+pub extern "C" fn slint_render_thread_hit_test(x: f32, y: f32) -> u64 {
+    host().and_then(|host| host.hit_test(x, y)).unwrap_or(0)
+}
+
+/// Assign one property of a borrowed control, blocking until the render thread
+/// confirms it.  Returns whether the property name resolved and the value was
+/// applied.
+///
+/// # Safety
+///
+/// `property` must be null or point to a NUL-terminated string, and `value.text`
+/// must be null or point to a NUL-terminated string, or the call is undefined
+/// behaviour.  The ABI is unchanged for C callers; this only records a contract
+/// that a C caller cannot be checked against.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slint_render_thread_set_control_property(
+    id: u64,
+    property: *const std::os::raw::c_char,
+    value: CSlintControlPropertyValue,
+) -> bool {
+    if id == 0 || property.is_null() {
+        return false;
+    }
+    // SAFETY: the caller of this unsafe function promised that `property` is
+    // null or a NUL-terminated string, which is checked just above.
+    let Some(property) = (unsafe { std::ffi::CStr::from_ptr(property) }).to_str().ok() else {
+        return false;
+    };
+    // SAFETY: the caller of this unsafe function promised that `value.text` is
+    // null or a NUL-terminated string.
+    let Some(value) = (unsafe { value.to_value() }) else { return false };
+    host().is_some_and(|host| host.set_control_property(id, property, value))
+}
+
+/// Report a control as hovered and/or pressed on the render thread.
+///
+/// This is the pointer state the UI thread resolved for itself; a worker that
+/// drives a control from its own logic (a gamepad cursor, a scripted
+/// highlight) uses it the same way, and neither side is more privileged.
+#[unsafe(no_mangle)]
+pub extern "C" fn slint_render_thread_apply_control_state(id: u64, hovered: bool, pressed: bool) {
+    if id == 0 {
+        return;
+    }
+    if let Some(host) = host() {
+        host.apply_control_state(id, hovered, pressed);
+    }
+}
+
+/// Hand the application a component to be instantiated on the render thread,
+/// making the render thread the owner of the controls.
+///
+/// `factory` runs on the render thread and must create the component there.  It
+/// returns the address of a heap-allocated `Box<dyn Any>` holding the component
+/// -- that is, the result of `Box::into_raw` on that box, not the address of the
+/// component itself, because a trait object is a fat pointer and cannot travel
+/// through a C ABI.  Ownership of the box passes to the render thread, which
+/// keeps the component alive for as long as it draws.  A null `factory` is
+/// refused, because the render thread cannot ask for the component later; a
+/// factory that returns null has broken its promise and ends the render thread
+/// with a message saying so, rather than leaving it to fail later on a
+/// component that is not there.
+#[unsafe(no_mangle)]
+pub extern "C" fn slint_render_thread_attach_component(
+    factory: Option<extern "C" fn() -> *mut c_void>,
+) -> bool {
+    let Some(factory) = factory else { return false };
+    let Some(host) = host() else { return false };
+    host.attach_component(move || {
+        // The pointer comes from `factory`, which the caller promised to
+        // produce on the calling thread and to hand over.  The render thread is
+        // the calling thread, and it takes over the box here.
+        let leaked = factory();
+        assert!(
+            !leaked.is_null(),
+            "the component factory passed to slint_render_thread_attach_component returned null, \
+             so there is no component for the render thread to own"
+        );
+        // The pointer is the address of a `Box<dyn Any>` that the caller leaked
+        // and handed over, so it is ours to free.
+        unsafe { *Box::from_raw(leaked as *mut Box<dyn std::any::Any>) }
+    });
+    true
 }
 
 /// Forward the host's system accent colour to the render thread's mirror

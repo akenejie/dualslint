@@ -851,6 +851,10 @@ export function quitEventLoop() {
  *  Entry points that address the render thread of the 2-thread render separation.
  *  The UI thread and worker threads are equal peers of the render thread: both use
  *  these instead of going through a window adapter.
+ *
+ *  The render thread owns the controls, so a program that wants to touch one
+ *  borrows it: identify the control, then assign a property. Neither the UI
+ *  thread nor a worker is more privileged here.
  */
 export namespace renderThread {
     /**
@@ -863,6 +867,78 @@ export namespace renderThread {
      */
     export function requestRedraw(): void {
         napi.requestRedraw();
+    }
+
+    /**
+     * A value to assign to a borrowed control's property.
+     *
+     * A color is written as `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`; one that
+     * cannot be read is refused rather than replaced by a default, so a typo
+     * cannot quietly paint the wrong thing.
+     */
+    export type ControlPropertyValue =
+        | { type: "bool"; value: boolean }
+        | { type: "number"; value: number }
+        | { type: "text"; value: string }
+        | { type: "color"; value: string };
+
+    /**
+     * The control under the logical point `x`, `y`, or `null` when there is none.
+     *
+     * Reads the geometry the render thread last composited and does not wait for
+     * it, so it is cheap enough for a pointer move. Use {@link hitTest} when the
+     * answer must reflect the present rather than the last frame.
+     */
+    export function controlAt(x: number, y: number): number | null {
+        return napi.controlAt(x, y);
+    }
+
+    /**
+     * The control under the logical point `x`, `y`, resolved on the render thread
+     * itself, or `null` when there is none.
+     *
+     * Blocks until the render thread answers, which is what makes it right for a
+     * click and wrong for a pointer move.
+     */
+    export function hitTest(x: number, y: number): number | null {
+        return napi.hitTest(x, y);
+    }
+
+    /**
+     * Assigns one property of a borrowed control, blocking until the render thread
+     * confirms it.
+     *
+     * Returns whether the property name resolved and the value was applied. A
+     * property that had a binding is detached first, the same way assigning through
+     * the normal API behaves.
+     */
+    export function setControlProperty(
+        id: number,
+        property: string,
+        value: ControlPropertyValue,
+    ): boolean {
+        return napi.setControlProperty(id, property, {
+            kind: value.type,
+            boolean: value.type === "bool" ? value.value : undefined,
+            number: value.type === "number" ? value.value : undefined,
+            text: value.type === "text" ? value.value : undefined,
+            color: value.type === "color" ? value.value : undefined,
+        });
+    }
+
+    /**
+     * Reports a borrowed control as hovered and/or pressed on the render thread.
+     *
+     * This is how a pointer state the program resolved itself is handed over: the
+     * UI thread does it for real pointer input, and a worker driving a control from
+     * its own logic does it the same way.
+     */
+    export function applyControlState(
+        id: number,
+        hovered: boolean,
+        pressed: boolean,
+    ): void {
+        napi.applyControlState(id, hovered, pressed);
     }
 }
 

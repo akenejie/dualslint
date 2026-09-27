@@ -171,6 +171,188 @@ pub fn request_redraw() {
     slint_interpreter::render_thread::request_redraw();
 }
 
+// ---------------------------------------------------------------------------
+// Borrowing the render-owned controls
+//
+// The render thread owns the controls, so a program that wants to touch one
+// borrows it: identify the control, then assign a property. The UI thread and
+// any worker are equal peers on this API.
+// ---------------------------------------------------------------------------
+
+/// A value to assign to a borrowed control's property.
+///
+/// Tagged the same way as the C ABI, so the four kinds travel as one value
+/// rather than as four functions: `kind` selects the field to read, and the
+/// others are ignored.
+#[napi(object)]
+pub struct ControlPropertyValue {
+    /// One of `bool`, `number`, `text` or `color`.
+    pub kind: String,
+    /// A `bool` property, such as a `TouchArea`'s `enabled`.
+    pub boolean: Option<bool>,
+    /// A numeric property, such as `opacity` or `width`.
+    pub number: Option<f64>,
+    /// A string property, such as a `Text`'s `text`.
+    pub text: Option<String>,
+    /// A color property, given as `#rgb`, `#rgba`, `#rrggbb` or `#rrggbbaa`, such
+    /// as a `Text`'s `color`. A color that cannot be read is refused rather than
+    /// replaced by a default, so a typo cannot quietly paint the wrong thing.
+    pub color: Option<String>,
+}
+
+impl ControlPropertyValue {
+    /// Resolve the tag to a value. A tag that is not one of the four kinds, or a
+    /// kind whose field is missing, has nothing to assign and is refused.
+    fn into_slint(self) -> Option<slint_interpreter::render_thread::ControlPropertyValue> {
+        use slint_interpreter::render_thread::ControlPropertyValue as Value;
+        let value = match self.kind.as_str() {
+            "bool" => Value::Bool(self.boolean?),
+            "number" => Value::Number(self.number? as f32),
+            "text" => Value::Text(self.text?),
+            "color" => {
+                let (r, g, b, a) = parse_color(&self.color?)?;
+                Value::Color { r, g, b, a }
+            }
+            _ => return None,
+        };
+        Some(value)
+    }
+}
+
+/// Parse `#rgb`, `#rgba`, `#rrggbb` and `#rrggbbaa`, with or without the `#`.
+///
+/// Returns `None` for anything else, including a color name: the Python binding
+/// takes a `slint.Color` and so understands names, and this one deliberately
+/// stays a plain hex reader. A color it cannot read is refused by the caller
+/// rather than turned into a default, because writing a color nobody asked for
+/// is worse than doing nothing.
+fn parse_color(text: &str) -> Option<(u8, u8, u8, u8)> {
+    let digits = text.strip_prefix('#').unwrap_or(text);
+    let byte = |i: usize| u8::from_str_radix(digits.get(i * 2..i * 2 + 2)?, 16).ok();
+    match digits.len() {
+        // The short forms, where each nibble is doubled, so `#abc` is
+        // `#aabbcc`.
+        3 | 4 => {
+            let mut rgba = [0u8; 4];
+            rgba[3] = 0xff;
+            for (index, slot) in rgba.iter_mut().enumerate().take(digits.len()) {
+                let nibble = *digits.as_bytes().get(index)?;
+                *slot = match nibble {
+                    c @ b'0'..=b'9' => c - b'0',
+                    c @ b'a'..=b'f' => c - b'a' + 10,
+                    c @ b'A'..=b'F' => c - b'A' + 10,
+                    _ => return None,
+                };
+                *slot *= 17;
+            }
+            Some((rgba[0], rgba[1], rgba[2], rgba[3]))
+        }
+        6 => Some((byte(0)?, byte(1)?, byte(2)?, 0xff)),
+        8 => Some((byte(0)?, byte(1)?, byte(2)?, byte(3)?)),
+        _ => None,
+    }
+}
+
+/// The control under the logical point `x`, `y`, or `null` for none.
+///
+/// Reads the geometry the render thread last composited and does not wait for
+/// it, so it is cheap enough for a pointer move. Use `hitTest` when the answer
+/// must reflect the present rather than the last frame.
+#[napi]
+pub fn control_at(x: f64, y: f64) -> Option<i64> {
+    #[cfg(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    ))]
+    {
+        return slint_interpreter::render_thread::host()
+            .and_then(|host| host.control_at(x as f32, y as f32))
+            .map(|id| id as i64);
+    }
+    #[cfg(not(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    )))]
+    None
+}
+
+/// The control under the logical point `x`, `y`, resolved on the render thread
+/// itself. Blocks until the render thread answers, which is what makes it right
+/// for a click and wrong for a pointer move.
+#[napi]
+pub fn hit_test(x: f64, y: f64) -> Option<i64> {
+    #[cfg(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    ))]
+    {
+        return slint_interpreter::render_thread::host()
+            .and_then(|host| host.hit_test(x as f32, y as f32))
+            .map(|id| id as i64);
+    }
+    #[cfg(not(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    )))]
+    None
+}
+
+/// Assign one property of a borrowed control, blocking until the render thread
+/// confirms it. Returns whether the property name resolved and the value was
+/// applied; a property that had a binding is detached first, the same way
+/// assigning through the normal API behaves.
+#[napi]
+pub fn set_control_property(id: i64, property: String, value: ControlPropertyValue) -> bool {
+    #[cfg(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    ))]
+    {
+        if id <= 0 {
+            return false;
+        }
+        // A tag that names no known kind, or a kind whose field is missing, has
+        // no value to assign. Refuse it rather than fall back to a default,
+        // which would write that default into whatever property was named.
+        let Some(value) = value.into_slint() else { return false };
+        return slint_interpreter::render_thread::host()
+            .is_some_and(|host| host.set_control_property(id as u64, &property, value));
+    }
+    #[cfg(not(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    )))]
+    {
+        let _ = (id, property, value);
+        false
+    }
+}
+
+/// Report a borrowed control as hovered and/or pressed on the render thread.
+///
+/// This is how a pointer state the program resolved itself is handed over; the
+/// UI thread does it for real pointer input, and a worker driving a control from
+/// its own logic does it the same way.
+#[napi]
+pub fn apply_control_state(id: i64, hovered: bool, pressed: bool) {
+    #[cfg(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    ))]
+    if id > 0 {
+        if let Some(host) = slint_interpreter::render_thread::host() {
+            host.apply_control_state(id as u64, hovered, pressed);
+        }
+    }
+}
+
 pub fn print_to_console(env: Env, function: &str, arguments: core::fmt::Arguments) {
     let Ok(global) = env.get_global() else {
         eprintln!("Unable to obtain global object");
@@ -237,4 +419,96 @@ pub(crate) fn install_log_message_handler(env: &Env, ctx: &i_slint_core::SlintCo
             i_slint_core::debug_log::default_log_message(arguments);
         }
     })));
+}
+
+#[cfg(test)]
+mod control_property_tests {
+    use super::{ControlPropertyValue, parse_color};
+    use slint_interpreter::render_thread::ControlPropertyValue as Value;
+
+    /// A value naming `kind` and carrying one field, leaving the rest missing.
+    /// Building values field by field is the point: a value that is missing its
+    /// own field has to be refused, so tests need to be able to leave holes.
+    fn with(kind: &str, field: &str) -> ControlPropertyValue {
+        let mut v = bare(kind);
+        match field {
+            "boolean" => v.boolean = Some(true),
+            "number" => v.number = Some(0.5),
+            "text" => v.text = Some("x".into()),
+            "color" => v.color = Some("#ff8000".into()),
+            other => panic!("unknown field {other}"),
+        }
+        v
+    }
+
+    /// A value naming `kind` and carrying nothing else, so a test can fill in
+    /// one field and leave the rest missing.
+    fn bare(kind: &str) -> ControlPropertyValue {
+        ControlPropertyValue {
+            kind: kind.into(),
+            boolean: None,
+            number: None,
+            text: None,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn parses_the_css_color_forms() {
+        // The long forms.
+        assert_eq!(parse_color("#ff8000"), Some((255, 128, 0, 255)));
+        assert_eq!(parse_color("#ff800080"), Some((255, 128, 0, 128)));
+        // The short forms, where each nibble is doubled.
+        assert_eq!(parse_color("#abc"), Some((0xaa, 0xbb, 0xcc, 255)));
+        assert_eq!(parse_color("#abcd"), Some((0xaa, 0xbb, 0xcc, 0xdd)));
+        // Upper and lower case both work, and the `#` is optional.
+        assert_eq!(parse_color("#AABBCC"), Some((0xaa, 0xbb, 0xcc, 255)));
+        assert_eq!(parse_color("aabbcc"), Some((0xaa, 0xbb, 0xcc, 255)));
+        // Eight digits is a valid `#rrggbbaa`, whatever it happens to look like.
+        assert_eq!(parse_color("#abcdefff"), Some((0xab, 0xcd, 0xef, 0xff)));
+    }
+
+    #[test]
+    fn a_color_it_cannot_read_is_refused() {
+        // Writing a default instead would paint something nobody asked for, so
+        // every unreadable form has to come back as "no value".
+        for text in ["", "#", "#xyz", "#abcde", "#12345", "rebeccapurple", "#gghhii", "#1234567g"] {
+            assert_eq!(parse_color(text), None, "{text:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn every_kind_converts_to_a_value() {
+        assert!(matches!(with("bool", "boolean").into_slint(), Some(Value::Bool(true))));
+        assert!(
+            matches!(with("number", "number").into_slint(), Some(Value::Number(n)) if n == 0.5)
+        );
+        assert!(matches!(with("text", "text").into_slint(), Some(Value::Text(t)) if t == "x"));
+        assert!(matches!(
+            with("color", "color").into_slint(),
+            Some(Value::Color { r: 255, g: 128, b: 0, a: 255 })
+        ));
+    }
+
+    #[test]
+    fn a_kind_without_its_field_is_refused() {
+        // Naming a kind but leaving its field out means the caller meant to send
+        // a value and did not, so there is nothing to assign.
+        assert!(bare("text").into_slint().is_none());
+        assert!(bare("bool").into_slint().is_none());
+    }
+
+    #[test]
+    fn an_unknown_kind_is_refused() {
+        // Refused for the same reason as a missing field: there is no value to
+        // assign, and defaulting would write that default into the named
+        // property.
+        assert!(bare("colour").into_slint().is_none());
+        assert!(bare("").into_slint().is_none());
+        // A known kind whose value is unreadable is refused the same way, since
+        // there is no value to assign either.
+        let bad_color =
+            ControlPropertyValue { color: Some("rebeccapurple".into()), ..bare("color") };
+        assert!(bad_color.into_slint().is_none());
+    }
 }
