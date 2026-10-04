@@ -9,6 +9,7 @@
 use crate::expression_tree::{BuiltinFunction, ImageReference};
 use crate::langtype::Type;
 use crate::llr::{CompilationUnit, ContextMap, EvaluationContext, Expression};
+use std::sync::atomic::Ordering;
 
 const PROPERTY_ACCESS_COST: isize = 1000;
 const ALLOC_COST: isize = 700;
@@ -200,7 +201,7 @@ pub fn inline_simple_expressions(root: &CompilationUnit) {
     // Counter to give each inlined function's argument locals a unique name.
     let mut counter = 0usize;
     root.for_each_expression(&mut |e, ctx| {
-        inline_simple_expressions_in_expression(&mut e.borrow_mut(), ctx, &mut counter)
+        inline_simple_expressions_in_expression(&mut e.write(), ctx, &mut counter)
     })
 }
 
@@ -212,14 +213,16 @@ fn inline_simple_expressions_in_expression(
     // Inline a call to a function that is called exactly once: move its body to the call site.
     if let Expression::FunctionCall { function, .. } = expr {
         let inline_target = ctx.function_info(function).and_then(|(f, map)| {
-            if f.use_count.get() != 1 || !body_is_inline_safe(&f.code.borrow(), &map) {
+            if f.use_count.load(Ordering::Relaxed) != 1
+                || !body_is_inline_safe(&f.code.read(), &map)
+            {
                 return None;
             }
-            f.use_count.set(0);
+            f.use_count.store(0, Ordering::Relaxed);
             // count_property_use counts the body in the function's context; re-home the use
             // counts to the call site, where a reference can resolve to a parent-set binding
             // (e.g. `height: 100%`) that is invisible in the function and so under-counted.
-            adjust_use_count(&f.code.borrow(), &map.map_context(ctx), -1);
+            adjust_use_count(&f.code.read(), &map.map_context(ctx), -1);
             // Take the body out so it isn't also inlined in place when
             // `for_each_expression` reaches it, which would double-count uses.
             let body = f.code.replace(Expression::CodeBlock(Vec::new()));
@@ -264,8 +267,8 @@ fn inline_simple_expressions_in_expression(
             if let Some((binding, map)) = prop_info.binding {
                 if binding.animation.is_none() && binding.kind != super::super::BindingKind::State {
                     let mapped_ctx = map.map_context(ctx);
-                    let cost = expression_cost(&binding.expression.borrow(), &mapped_ctx);
-                    let use_count = binding.use_count.get();
+                    let cost = expression_cost(&binding.expression.read(), &mapped_ctx);
+                    let use_count = binding.use_count.load(Ordering::Relaxed);
                     debug_assert!(
                         use_count > 0,
                         "We use a property and its count is zero: {}",
@@ -275,16 +278,17 @@ fn inline_simple_expressions_in_expression(
                         || (use_count == 1 && cost <= INLINE_SINGLE_THRESHOLD)
                     {
                         // Perform inlining
-                        *expr = binding.expression.borrow().clone();
+                        *expr = binding.expression.read().clone();
                         map.map_expression(expr);
                         // adjust use count
-                        binding.use_count.set(use_count - 1);
+                        binding.use_count.store(use_count - 1, Ordering::Relaxed);
                         if let Some(use_count) = prop_info.use_count {
-                            use_count.set(use_count.get() - 1);
+                            use_count
+                                .store(use_count.load(Ordering::Relaxed) - 1, Ordering::Relaxed);
                         }
                         adjust_use_count(expr, ctx, 1);
                         if use_count == 1 {
-                            adjust_use_count(&binding.expression.borrow(), &mapped_ctx, -1);
+                            adjust_use_count(&binding.expression.read(), &mapped_ctx, -1);
                             binding.expression.replace(Expression::CodeBlock(Vec::new()));
                         }
                     }
@@ -292,7 +296,7 @@ fn inline_simple_expressions_in_expression(
             } else if let Some(use_count) = prop_info.use_count
                 && let Some(e) = Expression::default_value_for_type(&prop_info.ty)
             {
-                use_count.set(use_count.get() - 1);
+                use_count.store(use_count.load(Ordering::Relaxed) - 1, Ordering::Relaxed);
                 *expr = e;
             }
         }
@@ -351,11 +355,15 @@ fn adjust_use_count(expr: &Expression, ctx: &EvaluationContext, adjust: isize) {
     expr.visit_property_references(ctx, &mut |p, ctx| {
         let prop_info = ctx.property_info(p);
         if let Some(use_count) = prop_info.use_count {
-            use_count.set(use_count.get().checked_add_signed(adjust).unwrap());
+            use_count.store(
+                use_count.load(Ordering::Relaxed).checked_add_signed(adjust).unwrap(),
+                Ordering::Relaxed,
+            );
         }
         if let Some((binding, _)) = prop_info.binding {
-            let use_count = binding.use_count.get().checked_add_signed(adjust).unwrap();
-            binding.use_count.set(use_count);
+            let use_count =
+                binding.use_count.load(Ordering::Relaxed).checked_add_signed(adjust).unwrap();
+            binding.use_count.store(use_count, Ordering::Relaxed);
         }
     });
 }

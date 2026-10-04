@@ -23,6 +23,7 @@ use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 /// Dynamic context for one expression evaluation.
 pub struct EvalContext {
@@ -31,7 +32,7 @@ pub struct EvalContext {
     pub current: Option<Pin<Rc<SubComponentInstance>>>,
     /// The compilation unit, for type resolution even when `current` is
     /// `None` (global context).
-    pub compilation_unit: Rc<llr::CompilationUnit>,
+    pub compilation_unit: Arc<llr::CompilationUnit>,
     /// Shared global storage, used to resolve `MemberReference::Global`.
     pub globals: Weak<GlobalStorage>,
     /// Local variables introduced by `StoreLocalVariable`.
@@ -67,7 +68,7 @@ impl EvalContext {
     }
 
     /// Context rooted in a global. Only `MemberReference::Global` is valid.
-    pub fn for_global(globals: Weak<GlobalStorage>, cu: Rc<llr::CompilationUnit>) -> Self {
+    pub fn for_global(globals: Weak<GlobalStorage>, cu: Arc<llr::CompilationUnit>) -> Self {
         Self {
             current: None,
             compilation_unit: cu,
@@ -440,7 +441,7 @@ pub fn invoke_function(ctx: &EvalContext, mr: &MemberReference, args: Vec<Value>
                 panic!("invoke_function on non-function global reference")
             };
             let function = &global.compilation_unit.globals[global.global_idx].functions[*idx];
-            let code = function.code.borrow().clone();
+            let code = function.code.read().clone();
             let mut inner_ctx =
                 EvalContext::for_global(ctx.globals.clone(), global.compilation_unit.clone());
             inner_ctx.function_arg_types = function.args.clone();
@@ -454,7 +455,7 @@ pub fn invoke_function(ctx: &EvalContext, mr: &MemberReference, args: Vec<Value>
             };
             let sc = &instance.compilation_unit.sub_components[instance.sub_component_idx];
             let function = &sc.functions[*idx];
-            let code = function.code.borrow().clone();
+            let code = function.code.read().clone();
             let mut inner_ctx = EvalContext::with_arguments(instance.clone(), args);
             inner_ctx.function_arg_types = function.args.clone();
             eval_expression(&mut inner_ctx, &code)
@@ -1552,7 +1553,7 @@ fn push_repeater_grid_input_data(
         // column repeater this is the full result.
         let mut statics: Vec<Value> = vec![Value::Void; static_count];
         if let Some(expr) = &sc.grid_layout_input_for_repeated {
-            let expr = expr.borrow();
+            let expr = expr.read();
             let mut inner_ctx = EvalContext::new(inner_sub.clone());
             let result_model: Rc<VecModel<Value>> = Rc::new(VecModel::default());
             for _ in 0..static_count {
@@ -1650,7 +1651,7 @@ fn eval_grid_input_for_repeated(
     let Some(expr) = &sc.grid_layout_input_for_repeated else {
         return vec![auto_grid_input_data()];
     };
-    let expr = expr.borrow();
+    let expr = expr.read();
     let mut ctx = EvalContext::new(sub.clone());
     let result_model: Rc<VecModel<Value>> = Rc::new(VecModel::default());
     for _ in 0..count {

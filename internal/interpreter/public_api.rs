@@ -13,11 +13,16 @@ use crate::api::SetPropertyError;
 use crate::eval::{EvalContext, invoke_callback, invoke_function, load_property, store_property};
 use crate::instance::{Instance, SubComponentInstance};
 use i_slint_compiler::langtype::Type;
-use i_slint_compiler::llr::{MemberReference, PublicComponent, PublicProperty};
-use i_slint_core::item_tree::ItemTreeVTable;
+use i_slint_compiler::llr::{
+    CompilationUnit, LocalMemberIndex, LocalMemberReference, MemberReference, PublicComponent,
+    PublicProperty, SubComponentPublicProperty,
+};
+use i_slint_compiler::object_tree::PropertyVisibility;
+use i_slint_core::item_tree::{ItemRc, ItemTreeVTable};
 use i_slint_core::model::Model;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use vtable::VRc;
 
 /// Look up a public property by name on the given public component.
@@ -61,6 +66,235 @@ pub fn set(
     }
     let ctx = EvalContext::new(sub);
     store_property(&ctx, &prop.prop, value);
+    Ok(())
+}
+
+/// The sub-component that owns the item at `flat_item_index`, together with the
+/// compilation unit its declarations live in.
+///
+/// `item_table` maps a flat tree index to the `(sub_component_path, local_item)`
+/// that backs it.  The unit is returned by `Rc` so the caller can look a
+/// declaration up in it without borrowing through the instance.
+fn resolve_item(
+    instance: &VRc<ItemTreeVTable, Instance>,
+    flat_item_index: u32,
+) -> Option<(Arc<CompilationUnit>, Pin<Rc<SubComponentInstance>>)> {
+    let entry = instance.item_table.get(flat_item_index as usize)?.as_ref()?;
+    let mut owner = instance.root_sub_component.clone();
+    for &sub_idx in entry.0.iter() {
+        owner = owner.sub_components[sub_idx].clone();
+    }
+    let cu = owner.compilation_unit.clone();
+    Some((cu, owner))
+}
+
+/// The `Instance` whose item tree `target` is.
+///
+/// An [`ItemRc`] names its item by the item tree it lives in plus an index
+/// within that tree, and an item tree belongs to one *instance*: a repeated
+/// element gets one of its own, so index 3 of a list row and index 3 of the
+/// window are different items. A caller that only holds the root instance
+/// therefore has to find out which instance an item actually came from before
+/// the index means anything.
+fn instance_of_item_tree(
+    target: &vtable::VRc<ItemTreeVTable>,
+    root: &VRc<ItemTreeVTable, Instance>,
+) -> Option<VRc<ItemTreeVTable, Instance>> {
+    fn walk(
+        sub: &Pin<Rc<crate::instance::SubComponentInstance>>,
+        target: &vtable::VRc<ItemTreeVTable>,
+    ) -> Option<VRc<ItemTreeVTable, Instance>> {
+        for repeater in &sub.repeaters {
+            for instance in repeater.instances_vec() {
+                if vtable::VRc::ptr_eq(target, &vtable::VRc::into_dyn(instance.clone())) {
+                    return Some(instance);
+                }
+                // The match was the whole sub-tree, but a nested repeated
+                // element under it can be the one that was asked for.
+                if let Some(found) = walk(&instance.root_sub_component, target) {
+                    return Some(found);
+                }
+            }
+        }
+        for nested in &sub.sub_components {
+            if let Some(found) = walk(nested, target) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    let root_dyn = vtable::VRc::into_dyn(root.clone());
+    if vtable::VRc::ptr_eq(target, &root_dyn) {
+        return Some(root.clone());
+    }
+    walk(&root.root_sub_component, target)
+}
+
+/// The component that owns `item`, found the way a caller that was handed an
+/// item rather than an index has to.
+fn resolve_item_rc(
+    instance: &VRc<ItemTreeVTable, Instance>,
+    item: &ItemRc,
+) -> Option<(Arc<CompilationUnit>, Pin<Rc<SubComponentInstance>>)> {
+    let owner = instance_of_item_tree(item.item_tree(), instance)?;
+    resolve_item(&owner, item.index())
+}
+
+/// The public property named `name`, found on the component that owns the item
+/// or on one of the components around it, together with the sub-component whose
+/// state holds it.
+///
+/// A composite component is not an item: a `CheckBox` contributes a `TouchArea`
+/// and a few more items to the tree, and the `checked` property the user wrote
+/// is compiled into bindings on them.  The items are what a caller can point at,
+/// but the property lives on the component around them, so a name has to be
+/// resolved against the component that owns the item rather than the item.
+///
+/// The search therefore walks towards the root.  It has to: a widget's own
+/// property is declared on the outer component, while the item the user pointed
+/// at may sit in a private sub-component that declares nothing of its own.  The
+/// walk stops at the first component that declares the name, so the innermost
+/// declaration wins, which is the one closest to the item.
+///
+/// Returning the sub-component alongside the declaration matters: the
+/// declaration names where the value is, but the state lives in the instance,
+/// and for a property found on an ancestor those are two different objects.
+fn find_property_of_item<'a>(
+    cu: &'a CompilationUnit,
+    owner: &Pin<Rc<SubComponentInstance>>,
+    name: &str,
+) -> Option<(&'a SubComponentPublicProperty, Pin<Rc<SubComponentInstance>>)> {
+    let mut current = Some(owner.clone());
+    while let Some(sub) = current {
+        if let Some(prop) = cu.sub_components[sub.sub_component_idx].public_properties.get(name) {
+            return Some((prop, sub));
+        }
+        current = sub.parent.upgrade().map(Pin::new);
+    }
+    None
+}
+
+/// Where the value of a public property of the sub-component lives.
+///
+/// The LLR records the property by name, because a [`MemberReference`] would
+/// have to be renumbered by the passes that drop unused members. Looking the
+/// name up in the sub-component's own properties is the same lookup the
+/// interpreter does for a component instantiated from `.slint` code.
+fn member_reference_of(
+    cu: &CompilationUnit,
+    sub: &Pin<Rc<SubComponentInstance>>,
+    prop: &SubComponentPublicProperty,
+) -> MemberReference {
+    let sc = &cu.sub_components[sub.sub_component_idx];
+    let index = sc
+        .properties
+        .iter_enumerated()
+        .find(|(_, p)| p.name == prop.property_name)
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| {
+            panic!(
+                "public property `{}` is not a property of the sub-component",
+                prop.property_name
+            )
+        });
+    MemberReference::Relative {
+        parent_level: 0,
+        local_reference: LocalMemberReference {
+            sub_component_path: Vec::new(),
+            reference: LocalMemberIndex::Property(index),
+        },
+    }
+}
+
+/// Read a public property of the component that owns the item at
+/// `flat_item_index`.
+///
+/// This is the composite-component counterpart of [`get`]: a caller that can
+/// name an item can also reach the properties of the components that item lives
+/// in, which is how `CheckBox.checked` is answered even though no item in the
+/// tree is named `checked`.
+pub fn get_for_item(
+    instance: &VRc<ItemTreeVTable, Instance>,
+    flat_item_index: u32,
+    name: &str,
+) -> Option<Value> {
+    let (cu, owner) = resolve_item(instance, flat_item_index)?;
+    read_property_of_component(&cu, &owner, name)
+}
+
+/// Read a public property of the component that owns `item`.
+///
+/// The counterpart of [`get_for_item`] for a caller that was handed the item
+/// itself, which is what the render thread has.
+pub fn get_for_item_rc(
+    instance: &VRc<ItemTreeVTable, Instance>,
+    item: &ItemRc,
+    name: &str,
+) -> Option<Value> {
+    let (cu, owner) = resolve_item_rc(instance, item)?;
+    read_property_of_component(&cu, &owner, name)
+}
+
+/// Write a public property of the component that owns the item at
+/// `flat_item_index`: the counterpart of [`get_for_item`].
+pub fn set_for_item(
+    instance: &VRc<ItemTreeVTable, Instance>,
+    flat_item_index: u32,
+    name: &str,
+    value: Value,
+) -> Result<(), SetPropertyError> {
+    let (cu, owner) =
+        resolve_item(instance, flat_item_index).ok_or(SetPropertyError::NoSuchProperty)?;
+    write_property_of_component(&cu, &owner, name, value)
+}
+
+/// Write a public property of the component that owns `item`: the counterpart
+/// of [`get_for_item_rc`].
+pub fn set_for_item_rc(
+    instance: &VRc<ItemTreeVTable, Instance>,
+    item: &ItemRc,
+    name: &str,
+    value: Value,
+) -> Result<(), SetPropertyError> {
+    let (cu, owner) = resolve_item_rc(instance, item).ok_or(SetPropertyError::NoSuchProperty)?;
+    write_property_of_component(&cu, &owner, name, value)
+}
+
+fn read_property_of_component(
+    cu: &Arc<CompilationUnit>,
+    owner: &Pin<Rc<SubComponentInstance>>,
+    name: &str,
+) -> Option<Value> {
+    let (prop, sub) = find_property_of_item(cu, owner, name)?;
+    if !prop.ty.is_property_type() {
+        return None;
+    }
+    let reference = member_reference_of(cu, &sub, prop);
+    let ctx = EvalContext::new(sub);
+    Some(load_property(&ctx, &reference))
+}
+
+fn write_property_of_component(
+    cu: &Arc<CompilationUnit>,
+    owner: &Pin<Rc<SubComponentInstance>>,
+    name: &str,
+    mut value: Value,
+) -> Result<(), SetPropertyError> {
+    let (prop, sub) =
+        find_property_of_item(cu, owner, name).ok_or(SetPropertyError::NoSuchProperty)?;
+    if !prop.ty.is_property_type() {
+        return Err(SetPropertyError::NoSuchProperty);
+    }
+    if prop.visibility == PropertyVisibility::Output {
+        return Err(SetPropertyError::AccessDenied);
+    }
+    if !check_and_coerce(&mut value, &prop.ty) {
+        return Err(SetPropertyError::WrongType);
+    }
+    let reference = member_reference_of(cu, &sub, prop);
+    let ctx = EvalContext::new(sub);
+    store_property(&ctx, &reference, value);
     Ok(())
 }
 
@@ -339,7 +573,6 @@ pub fn invoke_global(
     name: &str,
     args: &[Value],
 ) -> Option<Value> {
-    use i_slint_compiler::llr::LocalMemberIndex;
     let (prop, source_inst) = resolve_global(instance, global_name, name)?;
     let (target_inst, member) = resolve_global_property(instance, source_inst, prop)?;
     match member {
@@ -358,7 +591,7 @@ pub fn invoke_global(
             let cu = &instance.root_sub_component.compilation_unit;
             let global = &cu.globals[target_inst.global_idx];
             let function = &global.functions[fn_idx];
-            let expr = function.code.borrow().clone();
+            let expr = function.code.read().clone();
             let mut ctx = crate::eval::EvalContext::for_global(
                 std::rc::Rc::downgrade(&instance.globals),
                 cu.clone(),
@@ -377,4 +610,270 @@ fn walk_to(
     path: &[i_slint_compiler::llr::SubComponentInstanceIdx],
 ) -> Pin<Rc<SubComponentInstance>> {
     crate::eval::walk_sub_path(crate::eval::walk_parent(&start, parent_level), path)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The composite-component case: a name that no item answers to, resolved
+    //! against the component that owns the item.
+
+    use super::*;
+    use crate::api::Compiler;
+    use i_slint_core::item_tree::TraversalOrder;
+    use i_slint_core::items::{TextInput, TouchArea};
+
+    fn compile(code: &str, name: &str) -> crate::api::ComponentInstance {
+        i_slint_backend_testing::init_no_event_loop();
+        let compiler = spin_on::spin_on(
+            Compiler::default().build_from_source(code.into(), Default::default()),
+        );
+        assert!(!compiler.has_errors(), "{:?}", compiler.diagnostics().collect::<Vec<_>>());
+        compiler.component(name).expect("component compiles").create().unwrap()
+    }
+
+    /// The flat index of the first `TouchArea` in the tree, which is how a
+    /// caller that hit-tested one arrives here: a control is an item, and the
+    /// index is what says which item.
+    fn first_touch_area(instance: &VRc<ItemTreeVTable, Instance>) -> u32 {
+        let mut found = None;
+        i_slint_core::item_tree::visit_items(
+            &VRc::into_dyn(instance.clone()),
+            TraversalOrder::BackToFront,
+            |tree, _item, index, _| {
+                if found.is_none()
+                    && ItemRc::new(tree.clone(), index).downcast::<TouchArea>().is_some()
+                {
+                    found = Some(index);
+                }
+                i_slint_core::item_tree::ItemVisitorResult::Continue(())
+            },
+            (),
+        );
+        found.expect("the component has a TouchArea")
+    }
+
+    /// Every `TouchArea` in the tree, as the item reference a caller would
+    /// hold after a hit test.
+    fn touch_areas(instance: &VRc<ItemTreeVTable, Instance>) -> Vec<ItemRc> {
+        let mut found = Vec::new();
+        i_slint_core::item_tree::visit_items(
+            &VRc::into_dyn(instance.clone()),
+            TraversalOrder::BackToFront,
+            |tree, _item, index, _| {
+                let item = ItemRc::new(tree.clone(), index);
+                if item.downcast::<TouchArea>().is_some() {
+                    found.push(item);
+                }
+                i_slint_core::item_tree::ItemVisitorResult::Continue(())
+            },
+            (),
+        );
+        found
+    }
+
+    /// A repeated element gets an item tree of its own, so the same index in
+    /// two rows names two different items. A caller that passes the item it
+    /// hit-tested must still reach the row that item belongs to, rather than
+    /// whatever row happens to sit at that index in the first one found.
+    #[test]
+    fn a_repeated_element_is_reached_through_its_own_item() {
+        let mut instance = compile(
+            r#"
+                import { CheckBox } from "std-widgets.slint";
+                export struct Row { title: string, done: bool }
+                export component TestCase inherits Window {
+                    width: 300px; height: 300px;
+                    in property <[Row]> rows: [
+                        { title: "first", done: false },
+                        { title: "second", done: false },
+                    ];
+                    for row in root.rows: HorizontalLayout {
+                        CheckBox {
+                            text: row.title;
+                            checked <=> row.done;
+                        }
+                    }
+                }
+            "#,
+            "TestCase",
+        );
+        let areas = touch_areas(instance.inner.vrc());
+        assert_eq!(areas.len(), 2, "one CheckBox TouchArea per row");
+        // The rows are the same component, so the indices agree -- which is
+        // exactly what makes it possible to answer for the wrong one.
+        assert_eq!(areas[0].index(), areas[1].index());
+        assert!(!vtable::VRc::ptr_eq(areas[0].item_tree(), areas[1].item_tree(),));
+
+        for (area, expected) in areas.iter().zip(["first", "second"]) {
+            assert_eq!(
+                get_for_item_rc(instance.inner.vrc(), area, "text"),
+                Some(Value::String(expected.into()))
+            );
+        }
+
+        // A write through one row's item reaches that row's component and not
+        // the other, which is the property that the shared index cannot give.
+        // The write is aimed at the `CheckBox`, so it travels down the two-way
+        // link into the row of the model it came from, and only that one.
+        set_for_item_rc(instance.inner.vrc(), &areas[1], "checked", Value::Bool(true)).unwrap();
+        assert_eq!(
+            get_for_item_rc(instance.inner.vrc(), &areas[1], "checked"),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(
+            get_for_item_rc(instance.inner.vrc(), &areas[0], "checked"),
+            Some(Value::Bool(false))
+        );
+    }
+
+    /// A property declared on the component that owns the pointed-at item is
+    /// reached by naming the item, which is the whole point: the caller has an
+    /// item, and the property belongs to the component around it.
+    #[test]
+    fn property_of_the_owning_component_is_reached_through_its_item() {
+        let instance = compile(
+            r#"
+                export component TestCase inherits Window {
+                    width: 200px; height: 100px;
+                    in-out property <bool> flagged: true;
+                    in-out property <int> counter: 7;
+                    TouchArea { }
+                }
+            "#,
+            "TestCase",
+        );
+        let root = instance.inner.vrc().clone();
+        let root = &root;
+        let flat = first_touch_area(root);
+
+        assert_eq!(get_for_item(root, flat, "flagged"), Some(Value::Bool(true)));
+        assert_eq!(get_for_item(root, flat, "counter"), Some(Value::Number(7.)));
+        // A name the component does not declare resolves to nothing rather
+        // than to a default.
+        assert_eq!(get_for_item(root, flat, "nope"), None);
+
+        set_for_item(root, flat, "flagged", Value::Bool(false)).unwrap();
+        assert_eq!(get_for_item(root, flat, "flagged"), Some(Value::Bool(false)));
+
+        // A name the component does not declare, and a wrongly typed value, are
+        // both refused rather than quietly doing something else.
+        assert_eq!(
+            set_for_item(root, flat, "nope", Value::Bool(false)),
+            Err(SetPropertyError::NoSuchProperty)
+        );
+        assert_eq!(
+            set_for_item(root, flat, "flagged", Value::String("x".into())),
+            Err(SetPropertyError::WrongType)
+        );
+    }
+
+    /// The property of a component that comes from another file, which is what
+    /// every built-in widget is.
+    ///
+    /// `std-widgets.slint` is compiled into its own compilation unit, and a
+    /// `CheckBox` inlined into the importing file has its state in the
+    /// importing file's unit. Reaching `checked` therefore cannot go through
+    /// that unit's `PublicComponent` list, where the widget is absent.
+    #[test]
+    fn property_of_a_component_from_another_file_is_reached_through_its_item() {
+        let instance = compile(
+            r#"
+                import { CheckBox } from "std-widgets.slint";
+                export component TestCase inherits Window {
+                    width: 200px; height: 100px;
+                    CheckBox { text: "with milk"; checked: true; }
+                }
+            "#,
+            "TestCase",
+        );
+        let root = instance.inner.vrc().clone();
+        let root = &root;
+        let flat = first_touch_area(root);
+
+        assert_eq!(get_for_item(root, flat, "checked"), Some(Value::Bool(true)));
+        // The rest of the widget's public API resolves the same way.
+        assert_eq!(get_for_item(root, flat, "text"), Some(Value::String("with milk".into())));
+        // The window's own property is not reachable from the widget, because
+        // the search walks the other way.
+        assert_eq!(get_for_item(root, flat, "width"), None);
+
+        set_for_item(root, flat, "checked", Value::Bool(false)).unwrap();
+        assert_eq!(get_for_item(root, flat, "checked"), Some(Value::Bool(false)));
+    }
+
+    /// A `LineEdit` is the case that matters for typing, and it is the one
+    /// that shows what a property has to be written through.
+    ///
+    /// `text` is declared on the widget and two-way bound to the application,
+    /// so the value the application reads has to be the value the user typed.
+    /// A write straight to the `TextInput` item detaches the binding that
+    /// carries the value out, and the application is left with a field it can
+    /// see the text in and cannot read.
+    #[test]
+    fn what_was_typed_reaches_the_application_through_the_widgets_own_property() {
+        let instance = compile(
+            r#"
+                import { LineEdit } from "std-widgets.slint";
+                export component TestCase inherits Window {
+                    width: 200px; height: 100px;
+                    in-out property <string> typed <=> line-edit.text;
+                    line-edit := LineEdit { }
+                }
+            "#,
+            "TestCase",
+        );
+        let root = instance.inner.vrc().clone();
+        let root = &root;
+        let text_input = first_text_input(root).downcast::<TextInput>().unwrap();
+        text_input.text.set("buy milk".into());
+
+        assert_eq!(
+            instance.get_property("typed"),
+            Ok(Value::String("buy milk".into())),
+            "the application must see what was typed into its widget"
+        );
+    }
+
+    /// A widget property that `remove_aliases` folded into the item it was
+    /// bound to is not a property of the sub-component, so there is no name to
+    /// find it under. The item table is the only route to it, which is why the
+    /// component seam is a fallback and not the whole of the lookup.
+    #[test]
+    fn a_widget_property_that_lives_on_the_item_is_not_in_the_components_public_api() {
+        let instance = compile(
+            r#"
+                import { LineEdit } from "std-widgets.slint";
+                export component TestCase inherits Window {
+                    width: 200px; height: 100px;
+                    line-edit := LineEdit { }
+                }
+            "#,
+            "TestCase",
+        );
+        let root = instance.inner.vrc().clone();
+        let root = &root;
+        let text_input = first_text_input(root);
+
+        assert_eq!(get_for_item_rc(root, &text_input, "text"), None);
+    }
+
+    fn first_text_input(instance: &VRc<ItemTreeVTable, Instance>) -> ItemRc {
+        let mut found = None;
+        i_slint_core::item_tree::visit_items(
+            &VRc::into_dyn(instance.clone()),
+            TraversalOrder::BackToFront,
+            |tree, _item, index, _| {
+                if found.is_none()
+                    && ItemRc::new(tree.clone(), index)
+                        .downcast::<i_slint_core::items::TextInput>()
+                        .is_some()
+                {
+                    found = Some(ItemRc::new(tree.clone(), index));
+                }
+                i_slint_core::item_tree::ItemVisitorResult::Continue(())
+            },
+            (),
+        );
+        found.expect("the component has a TextInput")
+    }
 }

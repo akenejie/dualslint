@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 use crate::llr::*;
+use std::sync::atomic::Ordering;
 use typed_index_collections::TiVec;
 
 struct Mapping {
@@ -63,7 +64,7 @@ pub fn remove_unused(root: &mut CompilationUnit) {
         let mut property_init_mapping = Vec::new();
         let mut i = 0;
         sc.property_init.retain(|(x, v)| {
-            if keep(x) && v.use_count.get() > 0 {
+            if keep(x) && v.use_count.load(Ordering::Relaxed) > 0 {
                 property_init_mapping.push(Some(i));
                 i += 1;
                 true
@@ -128,9 +129,13 @@ fn create_mapping(
     functions: &mut TiVec<FunctionIdx, Function>,
 ) -> Mapping {
     Mapping {
-        prop_mapping: create_vec_mapping(properties, |p| p.use_count.get() > 0),
-        callback_mapping: create_vec_mapping(callbacks, |c| c.use_count.get() > 0),
-        function_mapping: create_vec_mapping(functions, |f| f.use_count.get() > 0),
+        prop_mapping: create_vec_mapping(properties, |p| p.use_count.load(Ordering::Relaxed) > 0),
+        callback_mapping: create_vec_mapping(callbacks, |c| {
+            c.use_count.load(Ordering::Relaxed) > 0
+        }),
+        function_mapping: create_vec_mapping(functions, |f| {
+            f.use_count.load(Ordering::Relaxed) > 0
+        }),
     }
 }
 
@@ -157,7 +162,7 @@ fn clean_vec<T>(vec: &mut TiVec<PropertyIdx, T>, properties: &TiVec<PropertyIdx,
     let mut idx = 0;
     vec.retain(|_| {
         idx += 1;
-        properties[PropertyIdx::from(idx - 1)].use_count.get() >= 1
+        properties[PropertyIdx::from(idx - 1)].use_count.load(Ordering::Relaxed) >= 1
     });
 }
 
@@ -305,6 +310,7 @@ mod visitor {
         idx: SubComponentIdx,
         SubComponent {
             name: _,
+            public_properties: _,
             properties: _,
             callbacks: _,
             functions,

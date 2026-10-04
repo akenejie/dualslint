@@ -848,6 +848,109 @@ fn accent_color_reachable_from_global() {
     assert_ne!(before, after, "accent-background should follow the system accent color");
 }
 
+/// A component loaded at runtime has to offer a backend that owns the drawing a
+/// way to build a second instance of itself, because an item tree cannot cross a
+/// thread boundary and only this code knows how the tree comes about. What
+/// crosses is the compiled unit, which is why a definition can hand it over at
+/// all.
+#[test]
+fn a_window_rooted_component_leaves_a_factory_on_its_window() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_core::window::WindowInner;
+
+    let code = r#"
+        export component App inherits Window {
+            in property <string> who: "app";
+            out property <string> seen: who;
+        }
+        // A component that is not a window has no window to leave a factory on.
+        export component Widget inherits Rectangle {
+            out property <int> size: 12;
+        }
+    "#;
+    let mut compiler = crate::Compiler::default();
+    compiler.set_style("fluent".into());
+    let result = spin_on::spin_on(compiler.build_from_source(code.into(), Default::default()));
+    assert!(!result.has_errors(), "{:?}", result.diagnostics().collect::<Vec<_>>());
+
+    let app = result.component("App").unwrap().create().unwrap();
+    let factory = WindowInner::from_pub(app.window()).render_factory();
+    assert!(factory.is_some(), "a backend that draws the window needs a way to build its own tree");
+
+    // Nothing to leave a factory on, and nothing that needs one.
+    let widget = result.component("Widget").unwrap().create().unwrap();
+    assert_eq!(widget.get_property("size").unwrap(), crate::Value::Number(12.));
+}
+
+/// The factory the definition leaves behind has to work on the thread that runs
+/// it, which is the whole point of the handover: the render thread builds its own
+/// tree there, from the same program, and neither tree can see the other.
+#[test]
+fn the_leftover_factory_builds_a_second_instance_on_another_thread() {
+    i_slint_backend_testing::init_no_event_loop();
+    use i_slint_core::item_tree::ItemTreeVTable;
+    use i_slint_core::window::WindowInner;
+
+    let code = r#"
+        export component App inherits Window {
+            in property <string> who: "app";
+            in property <int> ticks: 1;
+            out property <int> doubled: ticks * 2;
+        }
+    "#;
+    let mut compiler = crate::Compiler::default();
+    compiler.set_style("fluent".into());
+    let result = spin_on::spin_on(compiler.build_from_source(code.into(), Default::default()));
+    assert!(!result.has_errors(), "{:?}", result.diagnostics().collect::<Vec<_>>());
+
+    let app = result.component("App").unwrap().create().unwrap();
+    let factory = WindowInner::from_pub(app.window())
+        .render_factory()
+        .expect("the definition left one behind");
+
+    app.set_property("who", crate::Value::from(crate::SharedString::from("written by the app")))
+        .unwrap();
+    app.set_property("ticks", crate::Value::Number(21.)).unwrap();
+
+    let seen = std::thread::spawn(move || {
+        // A thread that has no context cannot build a tree; the render thread
+        // seeds a platform of its own before it runs a factory, and so does this.
+        i_slint_core::platform::set_platform(Box::new(
+            i_slint_backend_testing::TestingBackend::new(
+                i_slint_backend_testing::TestingBackendOptions {
+                    mock_time: true,
+                    ..Default::default()
+                },
+            ),
+        ))
+        .expect("the worker thread has no platform yet");
+
+        let built = *factory()
+            .downcast::<vtable::VRc<ItemTreeVTable, crate::instance::Instance>>()
+            .expect("the factory built an interpreter instance");
+        let built = crate::component::ComponentInstanceInner(built);
+        // Read as plain data: a tree cannot come back across, which is the rule
+        // this test is about, so nothing but the answers may.
+        (format!("{:?}", built.get_property("who")), format!("{:?}", built.get_property("doubled")))
+    })
+    .join()
+    .expect("the factory ran on the worker thread");
+
+    assert_eq!(
+        seen.0, "Some(Value::String(\"app\"))",
+        "a fresh tree starts from the program's own values"
+    );
+    assert_eq!(seen.1, "Some(Value::Number(2.0))", "the second tree evaluates its own bindings");
+    assert_eq!(
+        (format!("{:?}", app.get_property("who")), format!("{:?}", app.get_property("ticks"))),
+        (
+            "Ok(Value::String(\"written by the app\"))".to_owned(),
+            "Ok(Value::Number(21.0))".to_owned()
+        ),
+        "the application kept writing to its own tree"
+    );
+}
+
 #[test]
 fn text_runs_belong_to_the_nearest_accessible_item() {
     i_slint_backend_testing::init_no_event_loop();

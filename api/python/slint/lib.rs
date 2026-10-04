@@ -136,6 +136,53 @@ fn hit_test(x: f32, y: f32) -> Option<u64> {
     }
 }
 
+/// Read one property of a borrowed control, blocking until the render thread
+/// answers.
+///
+/// Returns the value in the shape {@link set_control_property} takes, or `None`
+/// when the id or the property name does not resolve. That means a value read
+/// can be handed straight back to the setter.
+///
+/// The `.slint` side of the tree belongs to the render thread, so a caller that
+/// needs to know what a control looks like asks here instead of keeping a second
+/// copy of the component.
+#[pyfunction]
+#[pyo3(signature = (id, property))]
+fn get_control_property<'py>(
+    py: Python<'py>,
+    id: u64,
+    property: &str,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
+    #[cfg(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    ))]
+    let value = slint_interpreter::render_thread::host()
+        .and_then(|host| host.get_control_property(id, property));
+    #[cfg(not(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    )))]
+    let value = {
+        let _ = (id, property);
+        None
+    };
+
+    let Some(value) = value else { return Ok(None) };
+    use slint_interpreter::render_thread::ControlPropertyValue;
+    Ok(Some(match value {
+        ControlPropertyValue::Bool(v) => v.into_pyobject(py)?.to_owned().into_any(),
+        ControlPropertyValue::Number(v) => (v as f64).into_pyobject(py)?.into_any(),
+        ControlPropertyValue::Text(v) => v.into_pyobject(py)?.into_any(),
+        ControlPropertyValue::Color { r, g, b, a } => {
+            // The setter takes a `slint.Color`, so the read hands one back.
+            Bound::new(py, brush::PyColor::from_argb_u8(a, r, g, b))?.into_any()
+        }
+    }))
+}
+
 /// Assign one property of a borrowed control, blocking until the render thread
 /// confirms it.
 ///
@@ -375,6 +422,7 @@ fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(request_redraw, m)?)?;
     m.add_function(wrap_pyfunction!(control_at, m)?)?;
     m.add_function(wrap_pyfunction!(hit_test, m)?)?;
+    m.add_function(wrap_pyfunction!(get_control_property, m)?)?;
     m.add_function(wrap_pyfunction!(set_control_property, m)?)?;
     m.add_function(wrap_pyfunction!(apply_control_state, m)?)?;
     m.add_function(wrap_pyfunction!(invoke_from_event_loop, m)?)?;

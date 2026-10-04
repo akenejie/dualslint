@@ -29,6 +29,8 @@ use crate::renderer::Renderer;
 use crate::{Callback, Coord, SharedString, SharedVector};
 use alloc::boxed::Box;
 use alloc::rc::{Rc, Weak};
+#[cfg(feature = "std")]
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::num::NonZeroU32;
@@ -676,6 +678,10 @@ pub struct WindowInner {
     /// fallback, and lets a drop back onto this same window restore the source's `DataTransfer`:
     /// the OS round-trip can't carry in-app `user_data`.
     native_drag: RefCell<Option<NativePendingDrag>>,
+
+    /// Set by [`Self::set_render_factory`].
+    #[cfg(feature = "std")]
+    render_factory: RefCell<Option<Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>>>,
 }
 
 impl Drop for WindowInner {
@@ -690,6 +696,11 @@ impl WindowInner {
     /// Create a new instance of the window, given the window_adapter factory fn
     pub fn new(window_adapter_weak: Weak<dyn WindowAdapter>) -> Self {
         #![allow(unused_mut)]
+
+        #[cfg(feature = "std")]
+        let render_factory: RefCell<
+            Option<Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>>,
+        > = RefCell::new(None);
 
         let mut window_properties_tracker =
             PropertyTracker::new_with_dirty_handler(WindowPropertiesTracker {
@@ -741,6 +752,8 @@ impl WindowInner {
             ctx: Default::default(),
             menubar: Default::default(),
             native_drag: Default::default(),
+            #[cfg(feature = "std")]
+            render_factory,
         }
     }
 
@@ -1160,6 +1173,31 @@ impl WindowInner {
     /// back, and a drop back onto this window can restore the data. Set by `offer_native_drag`.
     pub(crate) fn set_native_drag(&self, drag: Option<NativePendingDrag>) {
         *self.native_drag.borrow_mut() = drag;
+    }
+
+    /// Remember how to make another instance of this window's component, for a
+    /// backend that draws from a tree of its own.
+    ///
+    /// A tree cannot be shared between the thread that takes input and the
+    /// thread that draws it.
+    /// It holds `Rc`s and a `RefCell`, and one thread reading a property while
+    /// the other draws the same item is a race that no lock orders.
+    /// So that backend builds a second tree, and only the component's own
+    /// generated code knows how.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn set_render_factory(
+        &self,
+        factory: Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>,
+    ) {
+        *self.render_factory.borrow_mut() = Some(factory);
+    }
+
+    /// The factory given to [`Self::set_render_factory`], if there is one.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn render_factory(&self) -> Option<Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>> {
+        self.render_factory.borrow().clone()
     }
 
     /// Report that the in-flight native drag finished with `action`.
@@ -2639,6 +2677,37 @@ pub mod ffi {
         unsafe {
             let window_adapter = &*(handle as *const Rc<dyn WindowAdapter>);
             WindowInner::from_pub(window_adapter.window()).ensure_tree_instantiated();
+        }
+    }
+
+    /// Remember how to make another instance of the component showing in `handle`.
+    ///
+    /// `ctor` and `dtor` are the generated code's own: only it knows how to build
+    /// a second tree, and a backend that draws from a tree of its own has to ask
+    /// for one. Both run on the thread that asks, which is not the thread that
+    /// generated them.
+    #[cfg(feature = "std")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_windowrc_set_render_factory(
+        handle: *const WindowAdapterRcOpaque,
+        ctor: extern "C" fn() -> *mut core::ffi::c_void,
+        dtor: extern "C" fn(*mut core::ffi::c_void),
+    ) {
+        unsafe {
+            let window_adapter = &*(handle as *const Rc<dyn WindowAdapter>);
+            WindowInner::from_pub(window_adapter.window()).set_render_factory(Arc::new(
+                move || Box::new(OpaqueInstance(ctor(), dtor)) as Box<dyn core::any::Any>,
+            ));
+        }
+    }
+
+    /// A component instance owned by foreign code: the constructor that made it
+    /// and the destructor that has to free it, on this thread.
+    struct OpaqueInstance(*mut core::ffi::c_void, extern "C" fn(*mut core::ffi::c_void));
+
+    impl Drop for OpaqueInstance {
+        fn drop(&mut self) {
+            (self.1)(self.0)
         }
     }
 

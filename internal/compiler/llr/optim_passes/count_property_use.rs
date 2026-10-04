@@ -9,6 +9,7 @@ use crate::llr::{
     Animation, BindingExpression, CompilationUnit, EvaluationContext, Expression,
     LocalMemberReference, MemberReference, ParentScope,
 };
+use std::sync::atomic::Ordering;
 
 pub fn count_property_use(root: &CompilationUnit) {
     // Visit the root properties that are used.
@@ -20,6 +21,25 @@ pub fn count_property_use(root: &CompilationUnit) {
             visit_property(&p.prop, &root_ctx);
         }
     }
+    // A component from another document is inlined here as a plain
+    // sub-component, so its public properties are not in `public_components`
+    // and nothing would otherwise keep them alive. `CheckBox.checked` has no
+    // reader inside the widget: the value it drives is read from the items
+    // instead, so without this the property is dropped and the widget cannot
+    // be asked for the value it shows.
+    root.for_each_sub_components(&mut |_, sc, _| {
+        for public in sc.public_properties.values() {
+            if let Some((index, _)) =
+                sc.properties.iter_enumerated().find(|(_, p)| p.name == public.property_name)
+            {
+                sc.properties[index].use_count.store(
+                    sc.properties[index].use_count.load(Ordering::Relaxed).max(1),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    });
+
     for (idx, g) in root.globals.iter_enumerated().filter(|(_, g)| g.exported) {
         let ctx = EvaluationContext::new_global(root, idx, ());
         for p in g.public_properties.values() {
@@ -30,19 +50,19 @@ pub fn count_property_use(root: &CompilationUnit) {
     root.for_each_sub_components(&mut |_, sc, ctx| {
         // 2. the native items and bindings of properties
         for (_, expr) in &sc.property_init {
-            let c = expr.use_count.get();
-            expr.use_count.set(c + 1);
+            let c = expr.use_count.load(Ordering::Relaxed);
+            expr.use_count.store(c + 1, Ordering::Relaxed);
             if c == 0 {
                 visit_binding_expression(expr, ctx)
             }
         }
         // 3. the init code
         for expr in sc.pre_init_code.iter().chain(&sc.init_code) {
-            expr.borrow().visit_property_references(ctx, &mut visit_property);
+            expr.read().visit_property_references(ctx, &mut visit_property);
         }
         // 4. the models
         for (idx, r) in sc.repeated.iter_enumerated() {
-            r.model.borrow().visit_property_references(ctx, &mut visit_property);
+            r.model.read().visit_property_references(ctx, &mut visit_property);
             if let Some(lv) = &r.listview {
                 visit_property(&lv.content_y, ctx);
                 if let Some(content_height) = &lv.content_height {
@@ -67,7 +87,7 @@ pub fn count_property_use(root: &CompilationUnit) {
             for idx in r.data_prop.iter().chain(r.index_prop.iter()) {
                 // prevent optimizing model properties
                 let p = &root.sub_components[r.sub_tree.root].properties[*idx];
-                p.use_count.set(2);
+                p.use_count.store(2, Ordering::Relaxed);
             }
             if let Some(z_idx) = &r.dynamic_z {
                 let parent_ctx = ParentScope::new(ctx, Some(idx));
@@ -82,40 +102,40 @@ pub fn count_property_use(root: &CompilationUnit) {
         }
 
         // 5. the layout info
-        sc.layout_info_h.borrow().visit_property_references(ctx, &mut visit_property);
-        sc.layout_info_v.borrow().visit_property_references(ctx, &mut visit_property);
+        sc.layout_info_h.read().visit_property_references(ctx, &mut visit_property);
+        sc.layout_info_v.read().visit_property_references(ctx, &mut visit_property);
         if let Some(e) = &sc.grid_layout_input_for_repeated {
-            e.borrow().visit_property_references(ctx, &mut visit_property);
+            e.read().visit_property_references(ctx, &mut visit_property);
         }
         if let Some(e) = &sc.flexbox_layout_item_info_for_repeated {
-            e.borrow().visit_property_references(ctx, &mut visit_property);
+            e.read().visit_property_references(ctx, &mut visit_property);
         }
         if let Some((_, e)) = &sc.cross_axis_self_alignment_for_repeated {
-            e.borrow().visit_property_references(ctx, &mut visit_property);
+            e.read().visit_property_references(ctx, &mut visit_property);
         }
         if let Some((_, e)) = &sc.layout_order_for_repeated {
-            e.borrow().visit_property_references(ctx, &mut visit_property);
+            e.read().visit_property_references(ctx, &mut visit_property);
         }
         if let Some(e) = &sc.layout_info_v_constrained_for_repeated {
-            e.borrow().visit_property_references(ctx, &mut visit_property);
+            e.read().visit_property_references(ctx, &mut visit_property);
         }
         if let Some(e) = &sc.layout_info_v_at_cross_width_for_repeated {
-            e.borrow().visit_property_references(ctx, &mut visit_property);
+            e.read().visit_property_references(ctx, &mut visit_property);
         }
         if let Some(e) = &sc.grid_row_child_cross_width {
-            e.borrow().visit_property_references(ctx, &mut visit_property);
+            e.read().visit_property_references(ctx, &mut visit_property);
         }
         for child in &sc.grid_layout_children {
-            child.layout_info_h.borrow().visit_property_references(ctx, &mut visit_property);
-            child.layout_info_v.borrow().visit_property_references(ctx, &mut visit_property);
+            child.layout_info_h.read().visit_property_references(ctx, &mut visit_property);
+            child.layout_info_v.read().visit_property_references(ctx, &mut visit_property);
         }
 
         // 6. accessibility props and geometries
         for b in sc.accessible_prop.values() {
-            b.borrow().visit_property_references(ctx, &mut visit_property)
+            b.read().visit_property_references(ctx, &mut visit_property)
         }
         for i in sc.geometries.iter().filter_map(Option::as_ref) {
-            i.borrow().visit_property_references(ctx, &mut visit_property)
+            i.read().visit_property_references(ctx, &mut visit_property)
         }
 
         // 7. aliases (if they were not optimized, they are probably used)
@@ -144,7 +164,7 @@ pub fn count_property_use(root: &CompilationUnit) {
         // 9. change callbacks
         for (p, e) in &sc.change_callbacks {
             visit_property(p, ctx);
-            e.borrow().visit_property_references(ctx, &mut visit_property);
+            e.read().visit_property_references(ctx, &mut visit_property);
         }
 
         // 10. popup x/y coordinates
@@ -156,13 +176,13 @@ pub fn count_property_use(root: &CompilationUnit) {
                 (),
                 Some(&parent_ctx),
             );
-            popup.position.borrow().visit_property_references(&popup_ctx, &mut visit_property)
+            popup.position.read().visit_property_references(&popup_ctx, &mut visit_property)
         }
         // 11. timer
         for timer in &sc.timers {
-            timer.interval.borrow().visit_property_references(ctx, &mut visit_property);
-            timer.running.borrow().visit_property_references(ctx, &mut visit_property);
-            timer.triggered.borrow().visit_property_references(ctx, &mut visit_property);
+            timer.interval.read().visit_property_references(ctx, &mut visit_property);
+            timer.running.read().visit_property_references(ctx, &mut visit_property);
+            timer.triggered.read().visit_property_references(ctx, &mut visit_property);
         }
     });
 
@@ -171,7 +191,7 @@ pub fn count_property_use(root: &CompilationUnit) {
 
         for (p, e) in &g.change_callbacks {
             visit_property(&LocalMemberReference::from(*p).into(), &ctx);
-            e.borrow().visit_property_references(&ctx, &mut visit_property);
+            e.read().visit_property_references(&ctx, &mut visit_property);
         }
     }
 
@@ -184,7 +204,7 @@ pub fn count_property_use(root: &CompilationUnit) {
 
     // The z-order expressions are evaluated on every children visit
     root.for_each_z_order_expression(&mut |e, ctx| {
-        e.borrow().visit_property_references(ctx, &mut visit_property)
+        e.read().visit_property_references(ctx, &mut visit_property)
     });
 
     clean_unused_bindings(root);
@@ -193,11 +213,11 @@ pub fn count_property_use(root: &CompilationUnit) {
 fn visit_property(pr: &MemberReference, ctx: &EvaluationContext) {
     let p_info = ctx.property_info(pr);
     if let Some(use_count) = &p_info.use_count {
-        use_count.set(use_count.get() + 1);
+        use_count.store(use_count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
     }
     if let Some((binding, map)) = &p_info.binding {
-        let c = binding.use_count.get();
-        binding.use_count.set(c + 1);
+        let c = binding.use_count.load(Ordering::Relaxed);
+        binding.use_count.store(c + 1, Ordering::Relaxed);
         if c == 0 {
             let ctx2 = map.map_context(ctx);
             visit_binding_expression(binding, &ctx2);
@@ -206,17 +226,17 @@ fn visit_property(pr: &MemberReference, ctx: &EvaluationContext) {
     // A reference to a function is a call: count it and, the first time, visit
     // its body so an unreachable function doesn't keep its property reads alive.
     if let Some((function, map)) = ctx.function_info(pr) {
-        let c = function.use_count.get();
-        function.use_count.set(c + 1);
+        let c = function.use_count.load(Ordering::Relaxed);
+        function.use_count.store(c + 1, Ordering::Relaxed);
         if c == 0 {
             let ctx2 = map.map_context(ctx);
-            function.code.borrow().visit_property_references(&ctx2, &mut visit_property);
+            function.code.read().visit_property_references(&ctx2, &mut visit_property);
         }
     }
 }
 
 fn visit_binding_expression(binding: &BindingExpression, ctx: &EvaluationContext) {
-    binding.expression.borrow().visit_property_references(ctx, &mut visit_property);
+    binding.expression.read().visit_property_references(ctx, &mut visit_property);
     match &binding.animation {
         Some(Animation::Static(e) | Animation::Transition(e)) => {
             e.visit_property_references(ctx, &mut visit_property);
@@ -229,14 +249,14 @@ fn visit_binding_expression(binding: &BindingExpression, ctx: &EvaluationContext
 fn clean_unused_bindings(root: &CompilationUnit) {
     root.for_each_sub_components(&mut |_, sc, _| {
         for (_, e) in &sc.property_init {
-            if e.use_count.get() == 0 {
+            if e.use_count.load(Ordering::Relaxed) == 0 {
                 e.expression.replace(Expression::CodeBlock(Vec::new()));
             }
         }
     });
     for g in &root.globals {
         for e in g.init_values.values() {
-            if e.use_count.get() == 0 {
+            if e.use_count.load(Ordering::Relaxed) == 0 {
                 e.expression.replace(Expression::CodeBlock(Vec::new()));
             }
         }

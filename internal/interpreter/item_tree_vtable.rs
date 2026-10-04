@@ -234,8 +234,8 @@ impl i_slint_core::item_tree::ItemTree for Instance {
         let cu = &this.root_sub_component.compilation_unit;
         let sc = &cu.sub_components[sc_idx];
         let expr = match orientation {
-            Orientation::Horizontal => sc.layout_info_h.borrow(),
-            Orientation::Vertical => sc.layout_info_v.borrow(),
+            Orientation::Horizontal => sc.layout_info_h.read(),
+            Orientation::Vertical => sc.layout_info_v.read(),
         };
         let mut ctx = crate::eval::EvalContext::new(this.root_sub_component.clone());
         crate::eval::eval_expression(&mut ctx, &expr).try_into().unwrap_or_default()
@@ -295,7 +295,7 @@ impl i_slint_core::item_tree::ItemTree for Instance {
                 _ => return LogicalRect::default(),
             }
         };
-        let expr = expr_cell.borrow();
+        let expr = expr_cell.read();
         let mut ctx = crate::eval::EvalContext::new(ctx_owner);
         let crate::Value::Struct(s) = crate::eval::eval_expression(&mut ctx, &expr) else {
             return LogicalRect::default();
@@ -322,7 +322,7 @@ impl i_slint_core::item_tree::ItemTree for Instance {
             return AccessibleRole::default();
         };
         let mut ctx = crate::eval::EvalContext::new(owner);
-        crate::eval::eval_expression(&mut ctx, &expr.borrow()).try_into().unwrap_or_default()
+        crate::eval::eval_expression(&mut ctx, &expr.read()).try_into().unwrap_or_default()
     }
 
     fn accessible_string_property(
@@ -338,7 +338,7 @@ impl i_slint_core::item_tree::ItemTree for Instance {
             if let Some(expr) = sc.accessible_prop.get(&(local_idx, what_str.clone())) {
                 let mut ctx = crate::eval::EvalContext::new(owner);
                 if let crate::Value::String(s) =
-                    crate::eval::eval_expression(&mut ctx, &expr.borrow())
+                    crate::eval::eval_expression(&mut ctx, &expr.read())
                 {
                     *result = s;
                     return true;
@@ -356,7 +356,7 @@ impl i_slint_core::item_tree::ItemTree for Instance {
             if let Some(expr) = sc.accessible_prop.get(&(local_idx, what.clone())) {
                 let args = accessibility_action_args(action);
                 let mut ctx = crate::eval::EvalContext::with_arguments(owner, args);
-                crate::eval::eval_expression(&mut ctx, &expr.borrow());
+                crate::eval::eval_expression(&mut ctx, &expr.read());
                 return;
             }
         }

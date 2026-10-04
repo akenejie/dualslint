@@ -117,6 +117,28 @@ pub fn create_window_adapter()
     i_slint_backend_selector::with_platform(|b| b.create_window_adapter())
 }
 
+/// Leave behind how to make another instance of the component `window` shows.
+///
+/// A component's generated code calls this once its tree exists, which is what
+/// lets a backend draw one of its own without the application having to offer.
+/// See `WindowInner::set_render_factory` for why such a backend needs one.
+///
+/// A `no_std` build has nowhere to keep the factory, and generated code cannot
+/// know which build it landed in, so there it does nothing.
+pub fn register_render_factory<T>(
+    window: &crate::Window,
+    factory: impl Fn() -> T + Send + Sync + 'static,
+) where
+    T: core::any::Any + 'static,
+{
+    #[cfg(feature = "std")]
+    i_slint_core::window::WindowInner::from_pub(window).set_render_factory(alloc::sync::Arc::new(
+        move || alloc::boxed::Box::new(factory()) as alloc::boxed::Box<dyn core::any::Any>,
+    ));
+    #[cfg(not(feature = "std"))]
+    let _ = (window, factory);
+}
+
 /// Wrapper around i_slint_core::translations::translate for the generated code
 pub fn translate(
     origin: SharedString,

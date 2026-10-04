@@ -3418,8 +3418,12 @@ dependencies = [
 name = "i-slint-backend-scene"
 version = "1.18.0"
 dependencies = [
+ "i-slint-backend-testing",
+ "i-slint-compiler",
  "i-slint-core",
  "lyon_path",
+ "slint-interpreter",
+ "spin_on",
 ]
 
 [[package]]

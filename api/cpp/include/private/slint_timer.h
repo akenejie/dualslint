@@ -16,6 +16,28 @@
 namespace slint {
 
 namespace private_api {
+/// Whether this thread is building the tree that the render thread draws.
+///
+/// The render thread is a peer of the main thread, not a stray one: its tree has
+/// its own window adapter and its own items, so the API that a single-threaded
+/// application must not touch from a worker is correct there. Generated code
+/// raises the flag for the duration of the component it builds.
+inline bool &render_thread_tree_scope() noexcept
+{
+    static thread_local bool in_scope = false;
+    return in_scope;
+}
+
+/// Raises [`render_thread_tree_scope`] for as long as it is alive.
+class RenderThreadTreeScope
+{
+public:
+    RenderThreadTreeScope() { render_thread_tree_scope() = true; }
+    ~RenderThreadTreeScope() { render_thread_tree_scope() = false; }
+    RenderThreadTreeScope(const RenderThreadTreeScope &) = delete;
+    RenderThreadTreeScope &operator=(const RenderThreadTreeScope &) = delete;
+};
+
 /// Internal function that checks that the API that must be called from the main
 /// thread is indeed called from the main thread, or abort the program otherwise
 ///
@@ -25,6 +47,8 @@ inline void assert_main_thread()
 {
 #ifndef SLINT_FEATURE_FREESTANDING
 #    ifndef NDEBUG
+    if (render_thread_tree_scope())
+        return;
     static auto main_thread_id = std::this_thread::get_id();
     if (main_thread_id != std::this_thread::get_id()) {
         std::cerr << "A function that should be only called from the main thread was called from a "

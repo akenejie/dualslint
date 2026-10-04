@@ -409,6 +409,12 @@ pub struct WinitWindowAdapter {
     /// Indicate whether we've ever received a resize event from winit after showing the window.
     pending_resize_event_after_show: Cell<bool>,
 
+    /// Set once this window's renderer has given up its graphics context to the
+    /// render thread, which is what makes the render thread the thread that
+    /// draws.  Drawing from here on would race it for the window, so this
+    /// window stops presenting on its own.
+    graphics_handed_over: Cell<bool>,
+
     #[cfg(target_arch = "wasm32")]
     virtual_keyboard_helper: RefCell<Option<super::wasm_input_helper::WasmInputHelper>>,
 
@@ -485,6 +491,7 @@ impl WinitWindowAdapter {
             physical_size_before_scale_factor: Cell::new(None),
             has_explicit_size: Default::default(),
             pending_resize_event_after_show: Default::default(),
+            graphics_handed_over: Default::default(),
             renderer,
             #[cfg(target_arch = "wasm32")]
             virtual_keyboard_helper: Default::default(),
@@ -747,6 +754,25 @@ impl WinitWindowAdapter {
         self.shared_backend_data
             .register_window(winit_window.id(), (self.self_weak.upgrade().unwrap()) as _);
 
+        // The render thread presents into this window if a component is ever
+        // attached to it.  It only needs to know the window exists, and this is
+        // the one place every renderer agrees on: whoever created the native
+        // window, this window now exists.
+        if let Some(host) = crate::render_thread::host() {
+            let size = self.size.get();
+            let scale_factor = self.window().scale_factor() as f64;
+            // The adapter goes along because it is what tells this window apart
+            // from another one: the render thread identifies windows by the native
+            // handle, which a hidden-and-shown window does not keep.
+            host.submit_configure(
+                winit_window.clone(),
+                size.width,
+                size.height,
+                scale_factor,
+                self.self_weak.clone(),
+            );
+        }
+
         for waker in self.window_existence_wakers.take().into_iter() {
             waker.wake();
         }
@@ -769,7 +795,27 @@ impl WinitWindowAdapter {
         let mut winit_window_or_none = self.winit_window_or_none.borrow_mut();
         match *winit_window_or_none {
             WinitWindowOrNone::HasWindow { ref window, .. } => {
-                self.renderer().suspend()?;
+                // A handover already took this renderer's context away, and
+                // asking a renderer without one to suspend is an error upstream
+                // ("ensure current called on suspended renderer").  What a
+                // suspended window still needs is the part below: the render
+                // thread has to let go of the window too.
+                if !self.graphics_handed_over.get() {
+                    self.renderer().suspend()?;
+                }
+
+                // The window is about to go away, so the render thread has to
+                // let go of it as well.
+                if let Some(host) = crate::render_thread::host() {
+                    host.submit_suspend(window.id());
+                }
+
+                // The handover was a property of the window that just went
+                // away, not of this adapter.  Showing the window again makes a
+                // new native window with a fresh context on whichever side gets
+                // there first, so the flag starts over rather than leaving a
+                // window nobody will ever draw.
+                self.graphics_handed_over.set(false);
 
                 let last_window_rc = window.clone();
 
@@ -836,6 +882,20 @@ impl WinitWindowAdapter {
 
         self.pending_redraw.set(false);
 
+        // The render thread has this window's graphics context and is drawing
+        // it. Presenting here as well would be two threads fighting over one
+        // window, so the tree on this side waits to be drawn by whoever is left
+        // when the window is shown again.
+        if self.graphics_handed_over.get() {
+            return Ok(());
+        }
+
+        // About to draw on this thread, which is the one thing this thread must
+        // not do, so give the render thread this window before doing it.
+        // The handover takes a round trip through the event loop, so this frame
+        // is still drawn here and the next ones are not.
+        crate::render_thread::take_over_drawing_of(self.window());
+
         if let Some(winit_window) = self.winit_window_or_none.borrow().as_window() {
             // on macOS we sometimes don't get a resize event after calling
             // request_inner_size(), it returning None (promising a resize event), and then delivering RedrawRequested. To work around this,
@@ -859,6 +919,19 @@ impl WinitWindowAdapter {
 
     pub fn winit_window(&self) -> Option<Arc<winit::window::Window>> {
         self.winit_window_or_none.borrow().as_window()
+    }
+
+    /// Give up this window's graphics context so the render thread can take
+    /// the window over.
+    ///
+    /// A window has one OpenGL context, not one per thread, so a renderer that
+    /// holds a context for the window and the render thread both trying to
+    /// present is not a contention problem but a driver refusal. The renderer
+    /// releases what it holds, and this window stops drawing: from here the
+    /// render thread is the thread that draws it.
+    pub(crate) fn hand_over_graphics(&self) {
+        self.renderer.hand_over_graphics();
+        self.graphics_handed_over.set(true);
     }
 
     #[cfg(target_os = "ios")]
@@ -991,6 +1064,17 @@ impl WinitWindowAdapter {
             self.size.set(physical_size);
             self.pending_requested_size.set(None);
             let scale_factor = WindowInner::from_pub(self.window()).scale_factor();
+
+            // The window has one geometry and, once a render-owned component
+            // is attached, two item trees; the render thread's tree is the one
+            // on screen.  It lays that tree out for the size it is told here,
+            // and it says which window the size belongs to, because it draws one
+            // window and another window's size is not its business.
+            if let Some(host) = crate::render_thread::host()
+                && let Some(window_id) = self.winit_window().map(|window| window.id())
+            {
+                host.submit_resize(window_id, physical_size.width, physical_size.height);
+            }
 
             let size = physical_size.to_logical(scale_factor);
             self.window().dispatch_event_with_result(WindowEvent::Resized { size })?;
@@ -1257,10 +1341,40 @@ impl WinitWindowAdapter {
             _ => host.control_at(position.x, position.y),
         };
         let mut state = self.pointer_state.get();
+        let clicked = state.clicked(phase, target);
         for update in state.apply(phase, target) {
             host.apply_control_state(update.id, update.hovered, update.pressed);
         }
         self.pointer_state.set(state);
+        if let Some(id) = clicked {
+            // The click itself goes to the tree on the render thread, which is
+            // the only place that can say what it means.
+            host.activate_control(id);
+        }
+    }
+
+    /// Hand a key to the tree on the render thread, when it owns the controls.
+    ///
+    /// The UI thread's part in a key ends at naming it: the OS key becomes a
+    /// Slint one, and from there the item that has the focus decides what it
+    /// means. That item is on the render thread, so the key goes there rather
+    /// than into a tree that is not on screen. A key the tree did not use still
+    /// falls through to the UI thread's own window, which is where the
+    /// window-level shortcuts and callbacks are answered.
+    /// Offer a key or IME event to the render-owned item tree, and dispatch it
+    /// here only if the tree left it unconsumed.
+    ///
+    /// Composition updates belong in the same place as plain key presses: they
+    /// are text *into* the focused `TextInput`, and the render thread owns that
+    /// item. Falling back here would feed a second, UI-side tree that has no
+    /// focus to put it in.
+    fn dispatch_key_event_to_render_controls(&self, event: &InternalKeyEvent) {
+        if Self::render_owns_controls()
+            && crate::render_thread::host().is_some_and(|host| host.send_key_to_control(event))
+        {
+            return;
+        }
+        self.dispatch_internal_event(event.clone());
     }
 
     /// Handles a winit window event for this window: applies the window event filter, feeds
@@ -1435,7 +1549,7 @@ impl WinitWindowAdapter {
                     ..Default::default()
                 };
 
-                self.dispatch_internal_event(event);
+                self.dispatch_key_event_to_render_controls(&event);
             }
             WinitWindowEvent::Ime(winit::event::Ime::Preedit(string, preedit_selection)) => {
                 let event = InternalKeyEvent {
@@ -1444,7 +1558,7 @@ impl WinitWindowAdapter {
                     preedit_selection: preedit_selection.map(|e| e.0 as i32..e.1 as i32),
                     ..Default::default()
                 };
-                self.dispatch_internal_event(event);
+                self.dispatch_key_event_to_render_controls(&event);
             }
             WinitWindowEvent::Ime(winit::event::Ime::Commit(string)) => {
                 let mut key_event = KeyEvent::default();
@@ -1454,7 +1568,7 @@ impl WinitWindowAdapter {
                     key_event,
                     ..Default::default()
                 };
-                self.dispatch_internal_event(event);
+                self.dispatch_key_event_to_render_controls(&event);
             }
             WinitWindowEvent::CursorMoved { position, .. } => {
                 self.current_resize_direction.set(handle_cursor_move_for_resize(
@@ -1870,6 +1984,14 @@ impl WindowAdapter for WinitWindowAdapter {
         // We instead forward every request straight to winit and let the native
         // surface present/coalesce. This guarantees each `request_redraw()` ends
         // up as a `RedrawRequested` -> `window.draw()` in the same event cycle.
+        //
+        // Unless the render thread owns the graphics: that window is drawn from
+        // the other thread, and asking this one to present would be two threads
+        // drawing one window.  A repaint request for it belongs to the render
+        // thread, which decides for itself whether it owes the screen a frame.
+        if self.graphics_handed_over.get() {
+            return;
+        }
         if let WinitWindowOrNone::HasWindow { window, .. } = &*self.winit_window_or_none.borrow() {
             window.request_redraw();
         }
@@ -2312,9 +2434,21 @@ impl WindowAdapterInternal for WinitWindowAdapter {
 
 impl Drop for WinitWindowAdapter {
     fn drop(&mut self) {
-        self.shared_backend_data.unregister_window(
-            self.winit_window_or_none.borrow().as_window().map(|winit_window| winit_window.id()),
-        );
+        let window_id =
+            self.winit_window_or_none.borrow().as_window().map(|winit_window| winit_window.id());
+
+        // A window that goes away without being hidden takes its surface with
+        // it.  This thread's own `Arc` to the native window is what keeps it
+        // alive, so without this the render thread would keep presenting into a
+        // window the application closed, and would hold on to that surface for
+        // the rest of the process.
+        if let Some(window_id) = window_id
+            && let Some(host) = crate::render_thread::host()
+        {
+            host.submit_suspend(window_id);
+        }
+
+        self.shared_backend_data.unregister_window(window_id);
 
         #[cfg(target_os = "macos")]
         if let Some(observer) = self.macos_color_observer.get() {

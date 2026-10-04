@@ -13,6 +13,7 @@ use super::{
     Animation, CompilationUnit, EvaluationContext, Expression, LocalMemberIndex,
     LocalMemberReference, MemberReference, ParentScope, SubComponentIdx,
 };
+use std::sync::atomic::Ordering;
 
 pub fn pretty_print(root: &CompilationUnit, writer: &mut dyn Write) -> Result {
     PrettyPrinter { writer, indentation: 0 }.print_root(root)
@@ -79,7 +80,7 @@ impl PrettyPrinter<'_> {
                 "property <{}> {}; //use={}",
                 DisplayType(&p.ty),
                 p.name,
-                p.use_count.get()
+                p.use_count.load(Ordering::Relaxed)
             )?;
         }
         for c in &sc.callbacks {
@@ -100,7 +101,7 @@ impl PrettyPrinter<'_> {
                 f.name,
                 f.args.iter().map(|t| DisplayType(t).to_string()).join(", "),
                 DisplayType(&f.ret_ty),
-                DisplayExpression(&f.code.borrow(), &ctx)
+                DisplayExpression(&f.code.read(), &ctx)
             )?;
         }
         for twb in &sc.two_way_bindings {
@@ -120,7 +121,7 @@ impl PrettyPrinter<'_> {
                 self.writer,
                 "{}: {}",
                 DisplayPropertyRef(p, &ctx),
-                DisplayExpression(&init.expression.borrow(), &ctx)
+                DisplayExpression(&init.expression.read(), &ctx)
             )?;
             match &init.animation {
                 Some(Animation::Static(a)) => {
@@ -152,29 +153,29 @@ impl PrettyPrinter<'_> {
                 self.writer,
                 "changed {} => {};",
                 DisplayPropertyRef(p, &ctx),
-                DisplayExpression(&e.borrow(), &ctx),
+                DisplayExpression(&e.read(), &ctx),
             )?
         }
         for e in &sc.pre_init_code {
             self.indent()?;
-            writeln!(self.writer, "pre-init => {};", DisplayExpression(&e.borrow(), &ctx))?
+            writeln!(self.writer, "pre-init => {};", DisplayExpression(&e.read(), &ctx))?
         }
         for e in &sc.init_code {
             self.indent()?;
-            writeln!(self.writer, "init => {};", DisplayExpression(&e.borrow(), &ctx))?
+            writeln!(self.writer, "init => {};", DisplayExpression(&e.read(), &ctx))?
         }
         for (name, e) in
             [("layout-info-h", &sc.layout_info_h), ("layout-info-v", &sc.layout_info_v)]
         {
             self.indent()?;
-            writeln!(self.writer, "{}: {};", name, DisplayExpression(&e.borrow(), &ctx))?
+            writeln!(self.writer, "{}: {};", name, DisplayExpression(&e.read(), &ctx))?
         }
         if let Some(e) = &sc.grid_layout_input_for_repeated {
             self.indent()?;
             writeln!(
                 self.writer,
                 "grid-layout-input-for-repeated: {};",
-                DisplayExpression(&e.borrow(), &ctx)
+                DisplayExpression(&e.read(), &ctx)
             )?
         }
         if let Some(e) = &sc.flexbox_layout_item_info_for_repeated {
@@ -182,7 +183,7 @@ impl PrettyPrinter<'_> {
             writeln!(
                 self.writer,
                 "flexbox-layout-item-info-for-repeated: {};",
-                DisplayExpression(&e.borrow(), &ctx)
+                DisplayExpression(&e.read(), &ctx)
             )?
         }
         if let Some((cross_o, e)) = &sc.cross_axis_self_alignment_for_repeated {
@@ -190,7 +191,7 @@ impl PrettyPrinter<'_> {
             writeln!(
                 self.writer,
                 "cross-axis-self-alignment-for-repeated ({cross_o:?}): {};",
-                DisplayExpression(&e.borrow(), &ctx)
+                DisplayExpression(&e.read(), &ctx)
             )?
         }
         if let Some((main_o, e)) = &sc.layout_order_for_repeated {
@@ -198,7 +199,7 @@ impl PrettyPrinter<'_> {
             writeln!(
                 self.writer,
                 "layout-order-for-repeated ({main_o:?}): {};",
-                DisplayExpression(&e.borrow(), &ctx)
+                DisplayExpression(&e.read(), &ctx)
             )?
         }
         for (i, c) in sc.grid_layout_children.iter_enumerated() {
@@ -207,8 +208,8 @@ impl PrettyPrinter<'_> {
                 self.writer,
                 "grid-layout-child[{}] {{ h: {}; v: {} }};",
                 usize::from(i),
-                DisplayExpression(&c.layout_info_h.borrow(), &ctx),
-                DisplayExpression(&c.layout_info_v.borrow(), &ctx)
+                DisplayExpression(&c.layout_info_h.read(), &ctx),
+                DisplayExpression(&c.layout_info_v.read(), &ctx)
             )?
         }
         for t in &sc.timers {
@@ -216,9 +217,9 @@ impl PrettyPrinter<'_> {
             writeln!(
                 self.writer,
                 "timer {{ interval: {}; running: {}; triggered => {} }};",
-                DisplayExpression(&t.interval.borrow(), &ctx),
-                DisplayExpression(&t.running.borrow(), &ctx),
-                DisplayExpression(&t.triggered.borrow(), &ctx)
+                DisplayExpression(&t.interval.read(), &ctx),
+                DisplayExpression(&t.running.read(), &ctx),
+                DisplayExpression(&t.triggered.read(), &ctx)
             )?
         }
         for ssc in &sc.sub_components {
@@ -228,7 +229,7 @@ impl PrettyPrinter<'_> {
         for (item, geom) in std::iter::zip(&sc.items, &sc.geometries) {
             self.indent()?;
             let geometry = geom.as_ref().map_or(String::new(), |geom| {
-                format!("geometry: {}", DisplayExpression(&geom.borrow(), &ctx))
+                format!("geometry: {}", DisplayExpression(&geom.read(), &ctx))
             });
             writeln!(self.writer, "{} := {} {{ {geometry} }};", item.name, item.ty.class_name)?;
         }
@@ -240,7 +241,7 @@ impl PrettyPrinter<'_> {
                 item_name_in_tree(root, sc, *item_index)
                     .unwrap_or_else(|| format!("@{item_index}")),
                 crate::generator::to_kebab_case(prop),
-                DisplayExpression(&e.borrow(), &ctx)
+                DisplayExpression(&e.read(), &ctx)
             )?
         }
         for (idx, r) in sc.repeated.iter_enumerated() {
@@ -249,7 +250,7 @@ impl PrettyPrinter<'_> {
                 self.writer,
                 "{} {} : /*@repeater({})*/ ",
                 if r.index_prop.is_none() && r.data_prop.is_none() { "if" } else { "for in" },
-                DisplayExpression(&r.model.borrow(), &ctx),
+                DisplayExpression(&r.model.read(), &ctx),
                 usize::from(idx)
             )?;
             self.print_component(root, r.sub_tree.root, Some(&ParentScope::new(&ctx, Some(idx))))?
@@ -269,7 +270,7 @@ impl PrettyPrinter<'_> {
                 self.writer,
                 "{} at {} : /*@popup({i})*/ ",
                 if w.is_tooltip { "tooltip" } else { "popup" },
-                DisplayExpression(&w.position.borrow(), &popup_ctx)
+                DisplayExpression(&w.position.read(), &popup_ctx)
             )?;
             self.print_component(root, w.item_tree.root, Some(&parent))?
         }
@@ -306,7 +307,7 @@ impl PrettyPrinter<'_> {
                 "property <{}> {}; //use={}{}",
                 DisplayType(&p.ty),
                 p.name,
-                p.use_count.get(),
+                p.use_count.load(Ordering::Relaxed),
                 if *is_const { "  const" } else { "" }
             )?;
         }
@@ -328,7 +329,7 @@ impl PrettyPrinter<'_> {
                         self.writer,
                         "{}: {}{};",
                         global.properties[*p].name,
-                        DisplayExpression(&init.expression.borrow(), &ctx,),
+                        DisplayExpression(&init.expression.read(), &ctx,),
                         if init.kind == super::BindingKind::Constant { "/*const*/" } else { "" }
                     )?;
                 }
@@ -337,7 +338,7 @@ impl PrettyPrinter<'_> {
                         self.writer,
                         "{} => {};",
                         global.callbacks[*c].name,
-                        DisplayExpression(&init.expression.borrow(), &ctx,),
+                        DisplayExpression(&init.expression.read(), &ctx,),
                     )?;
                 }
                 _ => unreachable!(),
@@ -350,7 +351,7 @@ impl PrettyPrinter<'_> {
                 self.writer,
                 "changed {} => {};",
                 global.properties[*p].name,
-                DisplayExpression(&e.borrow(), &ctx),
+                DisplayExpression(&e.read(), &ctx),
             )?
         }
         for f in &global.functions {
@@ -361,7 +362,7 @@ impl PrettyPrinter<'_> {
                 f.name,
                 f.args.iter().map(ToString::to_string).join(", "),
                 f.ret_ty,
-                DisplayExpression(&f.code.borrow(), &ctx)
+                DisplayExpression(&f.code.read(), &ctx)
             )?;
         }
         self.indentation -= 1;

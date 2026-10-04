@@ -106,9 +106,9 @@ fn install_timers(sub: &Pin<Rc<SubComponentInstance>>, weak_sub: &Weak<SubCompon
             let cu = owner.compilation_unit.clone();
             let sc = &cu.sub_components[owner.sub_component_idx];
             for (idx, t) in sc.timers.iter().enumerate() {
-                let running_expr = t.running.borrow().clone();
-                let interval_expr = t.interval.borrow().clone();
-                let triggered_expr = t.triggered.borrow().clone();
+                let running_expr = t.running.read().clone();
+                let interval_expr = t.interval.read().clone();
+                let triggered_expr = t.triggered.read().clone();
                 let mut ctx = EvalContext::new(owner.clone());
                 let running = matches!(eval_expression(&mut ctx, &running_expr), Value::Bool(true));
                 if !running {
@@ -148,7 +148,7 @@ fn install_timers(sub: &Pin<Rc<SubComponentInstance>>, weak_sub: &Weak<SubCompon
     update();
     for (timer_idx, t) in sc.timers.iter().enumerate() {
         for (expr_idx, expr) in [&t.running, &t.interval].into_iter().enumerate() {
-            let get_expr = expr.borrow().clone();
+            let get_expr = expr.read().clone();
             let weak_get = weak_sub.clone();
             let update = update.clone();
             sub.change_trackers[2 * timer_idx + expr_idx].init(
@@ -745,7 +745,7 @@ fn run_init_code(sub: &Pin<Rc<SubComponentInstance>>) {
 use crate::eval::{walk_parent, walk_sub_path};
 
 fn mut_expression_clone(e: &MutExpression) -> Expression {
-    e.borrow().clone()
+    e.read().clone()
 }
 
 /// A handler that evaluates `expr` with the call's arguments in `weak`'s

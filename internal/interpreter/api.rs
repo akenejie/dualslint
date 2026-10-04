@@ -1537,6 +1537,31 @@ impl ComponentInstance {
         self.inner.set_property(name, value)
     }
 
+    /// Read a public property of the component that `item` belongs to.
+    ///
+    /// [`Self::get_property`] only reaches the properties of the component
+    /// itself. An item also names the component it was created in, and most
+    /// items are not the root of their component, so this is what reaches the
+    /// widget a `.slint` file declares around them. Given any item of a
+    /// `CheckBox`, it answers `checked`, which no item in the tree spells out.
+    pub fn get_item_property(&self, item: &ItemRc, name: &str) -> Option<Value> {
+        crate::public_api::get_for_item_rc(self.inner.vrc(), item, name)
+    }
+
+    /// Set a public property of the component that `item` belongs to, the
+    /// counterpart of [`Self::get_item_property`].
+    ///
+    /// Assigning a property this way drops a binding on it, the same way
+    /// [`Self::set_property`] does.
+    pub fn set_item_property(
+        &self,
+        item: &ItemRc,
+        name: &str,
+        value: Value,
+    ) -> Result<(), SetPropertyError> {
+        crate::public_api::set_for_item_rc(self.inner.vrc(), item, name, value)
+    }
+
     /// Set a handler for the callback with the given name. A callback with that
     /// name must be defined in the document otherwise an error will be returned.
     ///

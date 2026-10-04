@@ -2370,6 +2370,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "i-slint-backend-scene"
+version = "1.18.0"
+dependencies = [
+ "i-slint-core",
+ "lyon_path",
+]
+
+[[package]]
 name = "i-slint-backend-selector"
 version = "1.18.0"
 dependencies = [
@@ -2413,6 +2421,7 @@ dependencies = [
  "glow",
  "glutin",
  "glutin-winit",
+ "i-slint-backend-scene",
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",
@@ -5307,6 +5316,7 @@ dependencies = [
  "i-slint-backend-linuxkms",
  "i-slint-backend-qt",
  "i-slint-backend-selector",
+ "i-slint-backend-winit",
  "i-slint-common",
  "i-slint-core",
  "i-slint-core-macros",

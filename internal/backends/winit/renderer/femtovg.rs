@@ -96,6 +96,12 @@ impl super::WinitCompatibleRenderer for GlutinFemtoVGRenderer {
     fn suspend(&self) -> Result<(), PlatformError> {
         self.renderer.clear_graphics_context()
     }
+
+    fn hand_over_graphics(&self) {
+        // This is the GL context of a window that only has one, and the render
+        // thread is about to create the context it draws with.
+        let _ = self.suspend();
+    }
 }
 
 #[cfg(all(supports_opengl, target_family = "wasm"))]

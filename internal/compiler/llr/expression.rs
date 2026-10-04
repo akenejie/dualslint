@@ -1212,7 +1212,7 @@ pub(crate) struct PropertyInfoResult<'a> {
     pub binding: Option<(&'a super::BindingExpression, ContextMap)>,
     pub animation: Option<(&'a Expression, ContextMap)>,
     pub ty: Type,
-    pub use_count: Option<&'a std::cell::Cell<usize>>,
+    pub use_count: Option<&'a std::sync::atomic::AtomicUsize>,
 }
 
 /// Maps between two evaluation context.

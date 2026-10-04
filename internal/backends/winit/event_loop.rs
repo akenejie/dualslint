@@ -33,11 +33,17 @@ pub enum CustomEvent {
     UserEventWithEventLoop(Box<dyn FnOnce(&ActiveEventLoop) + Send>),
     /// Emitted from quit_event_loop with the current event loop generation
     Exit(usize),
-    /// The render thread has produced a new frame; process it on the UI thread.
-    RenderFrame,
-    /// The render thread wants the next snapshot (frame pacing). Re-arms a
-    /// redraw on every active window.
-    RequestRedraw,
+    /// A window repaint was asked for that does not concern the render thread:
+    /// a window whose graphics the render thread never took has to be repainted
+    /// by the thread that draws it.  Windows the render thread owns are skipped
+    /// there, so this never draws on the wrong side of a handover.
+    RepaintUnownedWindows,
+    /// The render thread needs this window's graphics, because a window has one
+    /// OpenGL context and the render thread is about to be the one that draws.
+    HandOverGraphics {
+        /// The winit window whose renderer has to release its context.
+        window_id: winit::window::WindowId,
+    },
     #[cfg(enable_accesskit)]
     Accesskit(accesskit_winit::Event),
     #[cfg(muda)]
@@ -52,8 +58,8 @@ impl std::fmt::Debug for CustomEvent {
             Self::UserEvent(_) => write!(f, "UserEvent"),
             Self::UserEventWithEventLoop(_) => write!(f, "UserEventWithEventLoop"),
             Self::Exit(_) => write!(f, "Exit"),
-            Self::RenderFrame => write!(f, "RenderFrame"),
-            Self::RequestRedraw => write!(f, "RequestRedraw"),
+            Self::RepaintUnownedWindows => write!(f, "RepaintUnownedWindows"),
+            Self::HandOverGraphics { window_id } => write!(f, "HandOverGraphics({window_id:?})"),
             #[cfg(enable_accesskit)]
             Self::Accesskit(a) => write!(f, "AccessKit({a:?})"),
             #[cfg(muda)]
@@ -173,26 +179,7 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
                 }
                 // else ignore the event, since it's from a previous run of the event loop
             }
-            CustomEvent::RenderFrame => {
-                use crate::render_thread;
-                use i_slint_core::graphics::{Image, Rgba8Pixel, SharedPixelBuffer};
-                if let Some(frame_queue) = render_thread::GLOBAL_FRAME_QUEUE.get() {
-                    while let Some(frame) = frame_queue.lock().unwrap().pop_front() {
-                        let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                            &frame.pixels,
-                            frame.width,
-                            frame.height,
-                        );
-                        let image = Image::from_rgba8(buffer);
-                        if let Ok(guard) = render_thread::GLOBAL_IMAGE_SINK.lock() {
-                            if let Some(ref cb) = *guard {
-                                cb(image);
-                            }
-                        }
-                    }
-                }
-            }
-            CustomEvent::RequestRedraw => {
+            CustomEvent::RepaintUnownedWindows => {
                 let windows = self
                     .shared_backend_data
                     .active_windows
@@ -202,6 +189,25 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
                     .collect::<Vec<_>>();
                 for window in windows {
                     window.request_redraw();
+                }
+            }
+            CustomEvent::HandOverGraphics { window_id } => {
+                // The render thread is about to draw this window, and a window
+                // has one OpenGL context.  Releasing it is this thread's half
+                // of the handover; answering lets the render thread create the
+                // context that takes over.
+                let adapter = self
+                    .shared_backend_data
+                    .active_windows
+                    .borrow()
+                    .values()
+                    .filter_map(|w| w.upgrade())
+                    .find(|w| w.winit_window().is_some_and(|n| n.id() == window_id));
+                if let Some(adapter) = adapter {
+                    adapter.hand_over_graphics();
+                }
+                if let Some(host) = crate::render_thread::host() {
+                    host.notify_graphics_released(window_id);
                 }
             }
             #[cfg(enable_accesskit)]

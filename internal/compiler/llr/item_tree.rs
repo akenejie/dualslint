@@ -5,9 +5,9 @@ use super::{EvaluationContext, EvaluationScope, Expression, ParentScope};
 use crate::langtype::{NativeClass, Type};
 use derive_more::{From, Into};
 use smol_str::SmolStr;
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use typed_index_collections::TiVec;
 
 #[derive(Debug, Clone, Copy, Into, From, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -99,18 +99,46 @@ pub struct GridLayoutChildLayoutInfo {
     pub layout_info_v: MutExpression,
 }
 
-#[derive(Debug, Clone, derive_more::Deref, derive_more::DerefMut)]
-pub struct MutExpression(RefCell<Expression>);
+#[derive(Debug)]
+pub struct MutExpression(RwLock<Expression>);
 
 impl From<Expression> for MutExpression {
     fn from(e: Expression) -> Self {
-        Self(e.into())
+        Self(RwLock::new(e))
+    }
+}
+
+impl Clone for MutExpression {
+    fn clone(&self) -> Self {
+        Self(RwLock::new(self.read().clone()))
     }
 }
 
 impl MutExpression {
+    /// Read the expression. The lock can only be held while code generation runs
+    /// on a single thread, so poisoning is not a state worth reporting.
+    pub fn read(&self) -> RwLockReadGuard<'_, Expression> {
+        self.0.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Write the expression, for the same reason as [`MutExpression::read`].
+    pub fn write(&self) -> RwLockWriteGuard<'_, Expression> {
+        self.0.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Mutable access without locking, for the passes that rewrite expressions in
+    /// place.
+    pub fn get_mut(&mut self) -> &mut Expression {
+        self.0.get_mut().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Swap the expression and return the previous one.
+    pub fn replace(&self, expression: Expression) -> Expression {
+        std::mem::replace(&mut self.write(), expression)
+    }
+
     pub fn ty(&self, ctx: &dyn super::TypeResolutionContext) -> Type {
-        self.0.borrow().ty(ctx)
+        self.read().ty(ctx)
     }
 }
 
@@ -134,7 +162,7 @@ pub enum BindingKind {
     State,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BindingExpression {
     pub expression: MutExpression,
     pub animation: Option<Animation>,
@@ -142,7 +170,18 @@ pub struct BindingExpression {
 
     /// The amount of time this binding is used.
     /// Only valid after the [`count_property_use`](super::optim_passes::count_property_use) pass.
-    pub use_count: Cell<usize>,
+    pub use_count: AtomicUsize,
+}
+
+impl Clone for BindingExpression {
+    fn clone(&self) -> Self {
+        Self {
+            expression: self.expression.clone(),
+            animation: self.animation.clone(),
+            kind: self.kind,
+            use_count: AtomicUsize::new(self.use_count.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -176,8 +215,8 @@ impl GlobalComponent {
         !self.from_library
             && (self.exported
                 || !self.functions.is_empty()
-                || self.properties.iter().any(|p| p.use_count.get() > 0)
-                || self.callbacks.iter().any(|c| c.use_count.get() > 0))
+                || self.properties.iter().any(|p| p.use_count.load(Ordering::Relaxed) > 0)
+                || self.callbacks.iter().any(|c| c.use_count.load(Ordering::Relaxed) > 0))
     }
 }
 
@@ -353,7 +392,7 @@ pub struct Property {
     pub ty: Type,
     /// The amount of time this property is used of another property
     /// This property is only valid after the [`count_property_use`](super::optim_passes::count_property_use) pass
-    pub use_count: Cell<usize>,
+    pub use_count: AtomicUsize,
 }
 
 #[derive(Debug, Default)]
@@ -367,7 +406,7 @@ pub struct Callback {
     pub ty: Type,
 
     /// Same as for Property::use_count
-    pub use_count: Cell<usize>,
+    pub use_count: AtomicUsize,
 
     /// Whether this callback needs a change tracker `Property<()>` so that
     /// setting a new handler from native code triggers re-evaluation of
@@ -383,7 +422,7 @@ pub struct Function {
     pub code: MutExpression,
     /// The number of times this function is called.
     /// Only valid after the [`count_property_use`](super::optim_passes::count_property_use) pass.
-    pub use_count: Cell<usize>,
+    pub use_count: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -529,6 +568,16 @@ impl TreeNode {
 #[derive(Debug)]
 pub struct SubComponent {
     pub name: SmolStr,
+    /// The properties this component exposes to whoever instantiates it, keyed
+    /// by declared name.
+    ///
+    /// Empty unless the component is exported. A component that is instantiated
+    /// from another `.slint` file is inlined into the importing file's
+    /// compilation unit, so its `PublicComponent` entry lives in a different
+    /// unit than the sub-component that holds its state. Recording the names
+    /// here keeps the public API of such a component reachable from the
+    /// sub-component alone.
+    pub public_properties: BTreeMap<SmolStr, SubComponentPublicProperty>,
     pub properties: TiVec<PropertyIdx, Property>,
     pub callbacks: TiVec<CallbackIdx, Callback>,
     pub functions: TiVec<FunctionIdx, Function>,
@@ -765,10 +814,12 @@ pub struct CompilationUnit {
     pub translations: Option<crate::translations::Translations>,
 }
 
-// The code generators may run on another thread, so the LLR must not reference the object tree.
+// The code generators may run on another thread, so the LLR must not reference the object
+// tree. The interpreter hands the same unit to the render thread, which evaluates it there
+// while the UI thread evaluates its own instance, so it must be shareable as well.
 const _: () = {
-    const fn assert_send<T: Send>() {}
-    assert_send::<CompilationUnit>();
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CompilationUnit>();
 };
 
 impl CompilationUnit {
@@ -962,7 +1013,7 @@ fn visit_function_bodies<'a>(
     visitor: &mut dyn FnMut(&'a super::MutExpression, &EvaluationContext<'_>),
 ) {
     for f in functions {
-        if f.use_count.get() > 0 {
+        if f.use_count.load(Ordering::Relaxed) > 0 {
             let mut fn_ctx = ctx.clone();
             fn_ctx.argument_types = &f.args;
             visitor(&f.code, &fn_ctx);
@@ -992,3 +1043,24 @@ impl PublicProperty {
 /// identifier (underscores). Iteration order is by sorted key.
 pub type PublicProperties = BTreeMap<SmolStr, PublicProperty>;
 pub type PrivateProperties = Vec<(SmolStr, Type)>;
+
+/// The public properties of a component that the compilation unit holds as a
+/// sub-component rather than as a [`PublicComponent`].
+///
+/// A [`MemberReference`] would be the natural way to point at the value, but
+/// the passes that drop unused members and renumber the ones that survive would
+/// have to keep this list in step, and a property that is only reachable from
+/// here is not a use that keeps it alive. Naming the property instead leaves
+/// the index to be looked up in the sub-component's own `properties`, which is
+/// always in range.
+#[derive(Debug, Clone)]
+pub struct SubComponentPublicProperty {
+    /// The identifier as written in the `.slint` source, preserving any hyphens
+    /// and the original casing.
+    pub display_name: SmolStr,
+    /// The identifier the property is stored under in `properties`, which has
+    /// hyphens turned into underscores.
+    pub property_name: SmolStr,
+    pub ty: Type,
+    pub visibility: crate::object_tree::PropertyVisibility,
+}

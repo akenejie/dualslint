@@ -59,6 +59,56 @@ struct SlintControlPropertyValue {
 extern "C" bool slint_render_thread_set_control_property(
         uint64_t id, const char *property, SlintControlPropertyValue value);
 
+/// Read one of a borrowed control's properties, blocking until the render
+/// thread answers. Returns whether the id and the property name resolved.
+///
+/// When the value is a string, `out.text` borrows a buffer owned by the caller
+/// of this function; it stays valid until the next read on the same thread.
+extern "C" bool slint_render_thread_get_control_property(
+        uint64_t id, const char *property, SlintControlPropertyValue *out);
+struct SlintControlPropertyValue;
+
+/// Read one property of a component handed to the render thread.
+///
+/// `component` is the pointer the factory returned, `item` is the item that
+/// carried the query, and `property` the name the render thread could not
+/// resolve against its own items. The value goes into `out`; returning `false`
+/// says the component declares no such property, which is not an error but the
+/// answer "look elsewhere".
+///
+/// When the tag written into `out` is `SLINT_CONTROL_PROPERTY_TEXT`, `out.text`
+/// must point to a NUL-terminated string that stays valid until the next read or
+/// write on the same thread: the value is copied after this call returns, so a
+/// buffer this call owns and destroys on its way out is gone by then. Holding
+/// the text in whatever the component keeps it in satisfies this, which is where
+/// the answer comes from anyway.
+using SlintRenderThreadPropertyRead = bool (*)(const void *component, const void *item,
+                                               const char *property,
+                                               SlintControlPropertyValue *out);
+
+/// Assign one property of a component handed to the render thread; the
+/// counterpart of `SlintRenderThreadPropertyRead`, with the same contract plus
+/// `value`, which the callee only reads.
+using SlintRenderThreadPropertyWrite = bool (*)(const void *component, const void *item,
+                                                 const char *property,
+                                                 const SlintControlPropertyValue *value);
+
+/// The pair of calls that answer for a component the render thread draws.
+///
+/// A `.slint` widget's property belongs to the component around its items rather
+/// than to any item, so only the application that created the component can say
+/// what it is. Both calls run on the render thread. A null `read` leaves every
+/// query to the render thread's own items, and a null `write` refuses every
+/// assignment.
+struct SlintRenderThreadPropertyAccess {
+    SlintRenderThreadPropertyRead read;
+    SlintRenderThreadPropertyWrite write;
+};
+
+extern "C" bool
+slint_render_thread_attach_component_with_property_access(SlintRenderThreadFactory factory,
+                                                          SlintRenderThreadPropertyAccess access);
+
 /// The `slint` namespace is the primary entry point into the Slint C++ API.
 /// All available types are in this namespace.
 ///
@@ -1043,6 +1093,39 @@ inline namespace render_thread {
                                             value.text });
     }
 
+    /// Read one property of a borrowed control, blocking until the render
+    /// thread answers. Returns whether the id and the property name resolved.
+    ///
+    /// This is how a caller learns what a control looks like without keeping
+    /// a second copy of the component: the `.slint` side of the tree belongs
+    /// to the render thread, so the answer comes from there.
+    ///
+    /// The text case borrows a buffer that is valid until the next read on
+    /// the same thread; copy the string before reading again.
+    inline std::optional<PropertyValue> get_control_property(ControlId id,
+                                                             const char *property)
+    {
+        if (!id.has_value() || property == nullptr) {
+            return std::nullopt;
+        }
+        SlintControlPropertyValue value {};
+        if (!slint_render_thread_get_control_property(id.value, property, &value)) {
+            return std::nullopt;
+        }
+        PropertyValue result {};
+        result.kind = static_cast<PropertyValue::Kind>(value.tag);
+        result.number = value.number;
+        result.boolean = value.bool_;
+        result.color[0] = value.color[0];
+        result.color[1] = value.color[1];
+        result.color[2] = value.color[2];
+        result.color[3] = value.color[3];
+        if (value.text != nullptr) {
+            result.text = value.text;
+        }
+        return result;
+    }
+
     /// Report a control as hovered and/or pressed on the render thread.
     ///
     /// This is how a pointer state that the program resolved itself is handed
@@ -1071,6 +1154,46 @@ inline namespace render_thread {
     inline bool attach_component(SlintRenderThreadFactory factory)
     {
         return factory != nullptr && slint_render_thread_attach_component(factory);
+    }
+
+    /// How the application answers for the properties that belong to the
+    /// component the render thread draws.
+    ///
+    /// The render thread resolves a property name against its own items first
+    /// (`enabled` on a `TouchArea`, `text` on a `TextInput`) and asks here for
+    /// what is left. Everything a `.slint` file declares around its items -- a
+    /// `CheckBox`'s `checked` -- is that.
+    ///
+    /// Both calls run on the render thread and are given the pointer the
+    /// factory returned, so they are expected to answer from the component the
+    /// factory created there rather than reaching across threads for it.
+    struct PropertyAccess {
+        /// Reads a property of `component`. Return false, or leave `out`
+        /// alone, when the component declares no such property.
+        SlintRenderThreadPropertyRead read = nullptr;
+        /// Assigns a property of `component`. Return false when the component
+        /// declares no such property or the value does not fit it.
+        SlintRenderThreadPropertyWrite write = nullptr;
+    };
+
+    /// `attach_component`, with a way for the application to answer for the
+    /// properties that belong to the component rather than to any item in it.
+    ///
+    /// A widget from a `.slint` file is a group of items plus the bindings
+    /// between them, so what a caller usually wants to know -- whether a
+    /// `CheckBox` is `checked` -- is a property of that group and of no item in
+    /// it. The render thread is a windowing backend and does not know what a
+    /// `.slint` component is, so `access` is how the application, which does,
+    /// lends it that knowledge for the component it just handed over.
+    ///
+    /// A null `read` leaves every query to the render thread's own items, and a
+    /// null `write` refuses every assignment; both are how an application says
+    /// "nothing of mine answers this".
+    inline bool attach_component(SlintRenderThreadFactory factory, PropertyAccess access)
+    {
+        return factory != nullptr
+                && slint_render_thread_attach_component_with_property_access(
+                        factory, SlintRenderThreadPropertyAccess { access.read, access.write });
     }
 } // namespace render_thread
 

@@ -1,14 +1,14 @@
 // Copyright © akenejie
 // SPDX-License-Identifier: AGPL-3.0-only
 
-//! What the scene encoder publishes as a control region.  A control region is a
+//! What the control walk publishes as a control region.  A control region is a
 //! hit-test target, so it has to be the things a user can point at: painting
 //! something and being able to interact with it are separate questions.
 
 mod common;
 
 use i_slint_backend_scene::ControlRegion;
-use i_slint_backend_scene::snapshot::encode_window_scene_full;
+use i_slint_backend_scene::controls::encode_window_controls;
 use slint::ComponentHandle;
 use slint::platform::WindowAdapter;
 use slint::platform::software_renderer::SoftwareRenderer;
@@ -16,8 +16,8 @@ use slint::platform::software_renderer::SoftwareRenderer;
 const WIDTH: u32 = 200;
 const HEIGHT: u32 = 200;
 
-/// Show `f`'s component on the shared window, lay it out, and encode it.
-/// Returns the published control regions in paint order (back to front).
+/// Show `f`'s component on the shared window, lay it out, and walk it.
+/// Returns the published control regions in tree order (back to front).
 ///
 /// The platform has to be installed before the component creates its window,
 /// which is why the component is created inside the closure.
@@ -31,9 +31,9 @@ fn controls(f: impl FnOnce()) -> Vec<ControlRegion> {
         let mut buffer = vec![common::TestPixel(false); width * height];
         renderer.render(buffer.as_mut_slice(), width);
     });
-    let (frame, _) = encode_window_scene_full(WindowAdapter::window(window.as_ref()))
-        .expect("encoding a laid-out window");
-    frame.controls
+    encode_window_controls(WindowAdapter::window(window.as_ref()))
+        .expect("walking a laid-out window")
+        .controls
 }
 
 macro_rules! component {

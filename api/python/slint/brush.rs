@@ -65,6 +65,17 @@ pub struct PyColor {
     pub color: slint_interpreter::Color,
 }
 
+/// Build a `Color` straight from its channels, for a value that was computed
+/// rather than parsed from text, such as one read back from the render thread.
+///
+/// Not part of the Python class: it is for the Rust side of the binding, which
+/// already knows the channels.
+impl PyColor {
+    pub fn from_argb_u8(a: u8, r: u8, g: u8, b: u8) -> Self {
+        Self { color: slint_interpreter::Color::from_argb_u8(a, r, g, b) }
+    }
+}
+
 #[pymethods]
 impl PyColor {
     #[new]

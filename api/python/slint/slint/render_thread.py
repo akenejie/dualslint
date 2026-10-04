@@ -9,8 +9,10 @@ thread and worker threads are equal peers of it: both reach it through this
 module instead of going through a window adapter.
 
 The render thread owns the controls, so a program that wants to touch one
-borrows it: identify the control, then assign a property. Neither the UI thread
-nor a worker is more privileged here.
+borrows it: identify the control, then read or assign a property. Neither the UI
+thread nor a worker is more privileged here, and neither keeps its own copy of
+the ``.slint`` tree: a question about a control is answered by the render thread,
+which is the side that has the component.
 """
 
 from typing import Literal, Optional
@@ -47,6 +49,20 @@ def hit_test(x: float, y: float) -> Optional[int]:
     is what makes it right for a click and wrong for a pointer move.
     """
     return native.hit_test(x, y)
+
+
+def get_control_property(id: int, property: str):
+    """Reads one property of a borrowed control, blocking until the render thread answers.
+
+    Returns the value in the shape :func:`set_control_property` takes, so a value
+    read can be handed straight back to the setter, or ``None`` when the id or
+    the property name does not resolve.
+
+    The ``.slint`` side of the tree belongs to the render thread, so a program
+    that needs to know what a control looks like asks here instead of keeping a
+    second copy of the component.
+    """
+    return native.get_control_property(id, property)
 
 
 def set_control_property(

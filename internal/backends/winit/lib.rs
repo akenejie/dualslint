@@ -36,8 +36,11 @@ use winitwindowadapter::*;
 pub(crate) mod event_loop;
 #[cfg(target_os = "ios")]
 mod ios;
+/// The thread that draws a component the UI thread has handed over.
+///
+/// See `render_thread::RenderHost` for what it takes over and what it leaves
+/// behind.
 pub mod render_thread;
-pub(crate) mod snapshot;
 
 use i_slint_backend_scene::PointerPhase;
 
@@ -87,6 +90,11 @@ mod renderer {
 
         fn suspend(&self) -> Result<(), PlatformError>;
 
+        // The render thread is about to draw this window, and a window has one
+        // OpenGL context. A renderer that holds one releases it here; one that
+        // holds nothing has nothing to do.
+        fn hand_over_graphics(&self) {}
+
         // Got winit::Event::Resumed
         fn resume(
             &self,
@@ -96,8 +104,6 @@ mod renderer {
         ) -> Result<Arc<winit::window::Window>, PlatformError>;
     }
 
-    #[cfg(any(feature = "renderer-femtovg", feature = "renderer-skia"))]
-    pub(crate) mod dual;
     #[cfg(enable_femtovg_renderer)]
     pub(crate) mod femtovg;
     #[cfg(enable_skia_renderer)]
@@ -142,7 +148,7 @@ fn default_renderer_factory(
         } else if #[cfg(feature = "renderer-femtovg-wgpu")] {
             renderer::femtovg::WGPUFemtoVGRenderer::new_suspended(shared_backend_data)
         } else if #[cfg(all(feature = "renderer-femtovg", supports_opengl))] {
-            renderer::dual::DualThreadRenderer::new_suspended(shared_backend_data)
+            renderer::femtovg::GlutinFemtoVGRenderer::new_suspended(shared_backend_data)
         } else if #[cfg(feature = "renderer-software")] {
             renderer::sw::WinitSoftwareRenderer::new_suspended(shared_backend_data)
         } else if #[cfg(feature = "renderer-vello")] {
@@ -175,7 +181,7 @@ fn try_create_window_with_fallback_renderer(
             supports_opengl,
             not(feature = "renderer-femtovg-wgpu")
         ))]
-        renderer::dual::DualThreadRenderer::new_suspended,
+        renderer::femtovg::GlutinFemtoVGRenderer::new_suspended,
         #[cfg(feature = "renderer-software")]
         renderer::sw::WinitSoftwareRenderer::new_suspended,
         #[cfg(feature = "renderer-vello")]
@@ -478,9 +484,6 @@ impl SharedBackendData {
         requested_graphics_api: Option<RequestedGraphicsAPI>,
         allow_fallback: bool,
     ) -> Result<Self, PlatformError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        use raw_window_handle::HasDisplayHandle;
-
         #[cfg(all(unix, not(target_vendor = "apple")))]
         {
             #[cfg(feature = "wayland")]
@@ -534,11 +537,7 @@ impl SharedBackendData {
 
         let event_loop_proxy = event_loop.create_proxy();
         #[cfg(not(target_arch = "wasm32"))]
-        let clipboard = crate::clipboard::create_clipboard(
-            &event_loop
-                .display_handle()
-                .map_err(|display_err| PlatformError::OtherError(display_err.into()))?,
-        );
+        let clipboard = crate::clipboard::create_clipboard();
         Ok(Self {
             context: Default::default(),
             allow_fallback,
@@ -837,8 +836,7 @@ impl Drop for Backend {
 pub(crate) fn ensure_render_thread(proxy: &winit::event_loop::EventLoopProxy<SlintEvent>) {
     use crate::render_thread;
     if render_thread::GLOBAL_RENDER_HOST.get().is_none() {
-        let (host, mut core, frame_queue) = render_thread::channel(proxy.clone());
-        let _ = render_thread::GLOBAL_FRAME_QUEUE.set(frame_queue);
+        let (host, mut core) = render_thread::channel(proxy.clone());
         let _ = render_thread::GLOBAL_RENDER_HOST.set(host);
         let _ = render_thread::GLOBAL_COORDINATE_MAP
             .set(Arc::new(std::sync::Mutex::new(PublishedControls::default())));
@@ -886,6 +884,13 @@ impl i_slint_core::platform::Platform for Backend {
     }
 
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
+        // The render thread is a property of the backend, not of a renderer, so
+        // it starts with the first window rather than with whichever renderer
+        // this build selected.  An application attaches a render-owned
+        // component right after showing its first window, and asks the host
+        // for the render thread there.
+        ensure_render_thread(&self.shared_data.event_loop_proxy.clone());
+
         let mut attrs = WinitWindowAdapter::window_attributes()?;
 
         if let Some(hook) = &self.window_attributes_hook {
@@ -1231,7 +1236,7 @@ fn create_renderer(
             if let Some(api) = maybe_graphics_api {
                 i_slint_core::graphics::RequestedOpenGLVersion::try_from(api)?;
             }
-            renderer::dual::DualThreadRenderer::new_suspended(shared_data)
+            renderer::femtovg::GlutinFemtoVGRenderer::new_suspended(shared_data)
         }
         #[cfg(feature = "renderer-femtovg-wgpu")]
         (Some("femtovg-wgpu"), maybe_graphics_api) => {
@@ -1339,7 +1344,7 @@ fn create_renderer(
                 } else if #[cfg(all(feature = "renderer-femtovg", supports_opengl))] {
                     // If a graphics API was requested, double check that it's GL. FemtoVG doesn't support Metal, etc.
                     i_slint_core::graphics::RequestedOpenGLVersion::try_from(_requested_graphics_api)?;
-                    renderer::dual::DualThreadRenderer::new_suspended(shared_data)
+                    renderer::femtovg::GlutinFemtoVGRenderer::new_suspended(shared_data)
                 } else {
                     return Err(format!("Graphics API use requested by the compile-time enabled renderers don't support that").into())
                 }

@@ -411,6 +411,14 @@ fn generate_public_component(
             Some(quote!(
                 let window = inner.globals.get().unwrap().window_adapter_ref()?;
                 sp::WindowInner::from_pub(window.window()).ensure_tree_instantiated();
+                // Only this code knows how to build another instance of this
+                // component, so leave that behind for a backend that needs one.
+                slint::private_unstable_api::register_render_factory(
+                    window.window(),
+                    || #public_component_id::new().expect(
+                        "the render thread could not create another instance of the component"
+                    ),
+                );
             )),
         ),
         llr::TopLevelComponentType::SystemTrayIcon => {
@@ -967,7 +975,7 @@ fn handle_property_init(
         let mut ctx2 = ctx.clone();
         ctx2.argument_types = &callback.args;
         let tokens_for_expression =
-            compile_expression(&binding_expression.expression.borrow(), &ctx2);
+            compile_expression(&binding_expression.expression.read(), &ctx2);
         let as_ = if matches!(callback.return_type, Type::Void) { quote!(;) } else { quote!(as _) };
         let set_callback_handler = helper("set_callback_handler");
         let handler = self_closure(quote!(, args), quote!({ (#tokens_for_expression) #as_ }));
@@ -976,14 +984,13 @@ fn handle_property_init(
             #set_callback_handler(#rust_property, &self_rc, { #handler });
         }));
     } else {
-        let tokens_for_expression =
-            compile_expression(&binding_expression.expression.borrow(), ctx);
+        let tokens_for_expression = compile_expression(&binding_expression.expression.read(), ctx);
 
         let tokens_for_expression = set_primitive_property_value(prop_type, tokens_for_expression);
 
         // Cast to the property type unless the Rust code is the never type, as with return
         // statements inside a block the type of the return expression is `()` instead of `!`.
-        let maybe_cast = if binding_expression.expression.borrow().ty(ctx) == Type::Invalid {
+        let maybe_cast = if binding_expression.expression.read().ty(ctx) == Type::Invalid {
             None
         } else {
             Some(quote!(as _))
@@ -1440,7 +1447,7 @@ fn generate_sub_component(
             let rep_inner_component_id =
                 self::inner_component_id(&root.sub_components[repeated.sub_tree.root]);
 
-            let model = compile_expression(&repeated.model.borrow(), &ctx);
+            let model = compile_expression(&repeated.model.read(), &ctx);
             init.push(quote! {
                 _self.#repeater_id.set_model_binding({
                     let self_weak = sp::VRcMapped::downgrade(&self_rc);
@@ -1522,7 +1529,7 @@ fn generate_sub_component(
     let mut accessibility_action_branch = Vec::new();
     let mut supported_accessibility_actions = BTreeMap::<u32, BTreeSet<_>>::new();
     for ((index, what), expr) in &component.accessible_prop {
-        let e = compile_expression(&expr.borrow(), &ctx);
+        let e = compile_expression(&expr.read(), &ctx);
         if what == "Role" {
             accessible_role_branch.push(quote!(#index => #e,));
         } else if let Some(what) = what.strip_prefix("Action") {
@@ -1552,7 +1559,7 @@ fn generate_sub_component(
         .enumerate()
         .filter_map(|(i, x)| x.as_ref().map(|x| (i, x)))
         .map(|(index, expr)| {
-            let expr = compile_expression(&expr.borrow(), &ctx);
+            let expr = compile_expression(&expr.read(), &ctx);
             let index = index as u32;
             quote!(#index => #expr,)
         })
@@ -1695,7 +1702,7 @@ fn generate_sub_component(
         .pre_init_code
         .iter()
         .map(|e| {
-            let code = compile_expression(&e.borrow(), &ctx);
+            let code = compile_expression(&e.read(), &ctx);
             quote!(#code;)
         })
         .collect();
@@ -1718,12 +1725,12 @@ fn generate_sub_component(
     });
 
     user_init_code.extend(component.init_code.iter().map(|e| {
-        let code = compile_expression(&e.borrow(), &ctx);
+        let code = compile_expression(&e.read(), &ctx);
         quote!(#code;)
     }));
 
     user_init_code.extend(component.change_callbacks.iter().enumerate().map(|(idx, (p, e))| {
-        let code = compile_expression(&e.borrow(), &ctx);
+        let code = compile_expression(&e.read(), &ctx);
         let prop = compile_expression(&Expression::PropertyReference(p.clone()), &ctx);
         let change_tracker = format_ident!("change_tracker{idx}");
         quote! {
@@ -1737,11 +1744,11 @@ fn generate_sub_component(
         }
     }));
 
-    let layout_info_h = compile_expression_no_parenthesis(&component.layout_info_h.borrow(), &ctx);
-    let layout_info_v = compile_expression_no_parenthesis(&component.layout_info_v.borrow(), &ctx);
+    let layout_info_h = compile_expression_no_parenthesis(&component.layout_info_h.read(), &ctx);
+    let layout_info_v = compile_expression_no_parenthesis(&component.layout_info_v.read(), &ctx);
     let grid_layout_input_for_repeated_fn =
         component.grid_layout_input_for_repeated.as_ref().map(|expr| {
-            let expr = compile_expression_no_parenthesis(&expr.borrow(), &ctx);
+            let expr = compile_expression_no_parenthesis(&expr.read(), &ctx);
             quote! {
                 fn grid_layout_input_for_repeated(
                     self: ::core::pin::Pin<&Self>,
@@ -1757,7 +1764,7 @@ fn generate_sub_component(
 
     let flexbox_layout_item_info_for_repeated_fn =
         component.flexbox_layout_item_info_for_repeated.as_ref().map(|expr| {
-            let expr = compile_expression(&expr.borrow(), &ctx);
+            let expr = compile_expression(&expr.read(), &ctx);
             quote! {
                 fn flexbox_layout_item_info_for_repeated(
                     self: ::core::pin::Pin<&Self>,
@@ -1771,7 +1778,7 @@ fn generate_sub_component(
 
     let cross_axis_self_alignment_for_repeated_fn =
         component.cross_axis_self_alignment_for_repeated.as_ref().map(|(_, expr)| {
-            let expr = compile_expression(&expr.borrow(), &ctx);
+            let expr = compile_expression(&expr.read(), &ctx);
             quote! {
                 fn cross_axis_self_alignment_for_repeated(
                     self: ::core::pin::Pin<&Self>,
@@ -1785,7 +1792,7 @@ fn generate_sub_component(
 
     let layout_order_for_repeated_fn =
         component.layout_order_for_repeated.as_ref().map(|(_, expr)| {
-            let expr = compile_expression(&expr.borrow(), &ctx);
+            let expr = compile_expression(&expr.read(), &ctx);
             quote! {
                 fn layout_order_for_repeated(self: ::core::pin::Pin<&Self>) -> i32 {
                     #![allow(unused)]
@@ -1810,9 +1817,9 @@ fn generate_sub_component(
     let update_timers = (!component.timers.is_empty()).then(|| {
         let updt = component.timers.iter().enumerate().map(|(idx, tmr)| {
             let ident = format_ident!("timer{idx}");
-            let interval = compile_expression(&tmr.interval.borrow(), &ctx);
-            let running = compile_expression(&tmr.running.borrow(), &ctx);
-            let callback = compile_expression(&tmr.triggered.borrow(), &ctx);
+            let interval = compile_expression(&tmr.interval.read(), &ctx);
+            let running = compile_expression(&tmr.running.read(), &ctx);
+            let callback = compile_expression(&tmr.triggered.read(), &ctx);
             quote!(
                 let millis = if #running { (#interval) as i64 } else { -1 };
                 if millis >= 0 {
@@ -2061,10 +2068,10 @@ fn generate_functions(functions: &[llr::Function], ctx: &EvaluationContext) -> V
         .map(|f| {
             let mut ctx2 = ctx.clone();
             ctx2.argument_types = &f.args;
-            let tokens_for_expression = compile_expression(&f.code.borrow(), &ctx2);
+            let tokens_for_expression = compile_expression(&f.code.read(), &ctx2);
             let as_ = if f.ret_ty == Type::Void {
                 Some(quote!(;))
-            } else if f.code.borrow().ty(&ctx2) == Type::Invalid {
+            } else if f.code.read().ty(&ctx2) == Type::Invalid {
                 // Don't cast if the Rust code is the never type, as with return statements inside a block, the
                 // type of the return expression is `()` instead of `!`.
                 None
@@ -2160,7 +2167,7 @@ fn generate_global(
         .keys()
         .map(|idx| format_ident!("change_tracker{}", usize::from(*idx)));
     init.extend(global.change_callbacks.iter().map(|(p, e)| {
-        let code = compile_expression(&e.borrow(), &ctx);
+        let code = compile_expression(&e.read(), &ctx);
         let prop = access_local_member(&(*p).into(), &ctx);
         let change_tracker = format_ident!("change_tracker{}", usize::from(*p));
         quote! {
@@ -2533,7 +2540,7 @@ fn generate_item_tree(
                 let k = k as u32;
                 match source {
                     llr::ZSource::Expression(e) => {
-                        let e = compile_expression(&e.borrow(), &ctx);
+                        let e = compile_expression(&e.read(), &ctx);
                         quote!(push(#k, sp::None, #e as f32);)
                     }
                     llr::ZSource::RepeaterInstances => {
@@ -2883,7 +2890,7 @@ fn generate_repeated_component(
                         return quote!(inner.as_pin_ref().layout_info(o));
                     };
                     let idx = ident(GRID_MEASURE_CHILD_INDEX_LOCAL);
-                    let w = compile_expression(&e.borrow(), &ctx);
+                    let w = compile_expression(&e.read(), &ctx);
                     quote!(match o {
                         sp::Orientation::Vertical => inner
                             .as_pin_ref()
@@ -2906,9 +2913,9 @@ fn generate_repeated_component(
                             llr::RowChildTemplateInfo::Static { child_index } => {
                                 let child = &root_sc.grid_layout_children[*child_index];
                                 let layout_info_h_code =
-                                    compile_expression(&child.layout_info_h.borrow(), &ctx);
+                                    compile_expression(&child.layout_info_h.read(), &ctx);
                                 let layout_info_v_code =
-                                    compile_expression(&child.layout_info_v.borrow(), &ctx);
+                                    compile_expression(&child.layout_info_v.read(), &ctx);
                                 let advance = (!is_last).then(|| quote! { count += 1; });
                                 quote! {
                                     if count == index {
@@ -2997,7 +3004,7 @@ fn generate_repeated_component(
                 // own preferred width via layoutinfo-v-with-constraint) instead.
                 let v_constrained =
                     root_sc.layout_info_v_constrained_for_repeated.as_ref().map(|e| {
-                        let v_info = compile_expression(&e.borrow(), &ctx);
+                        let v_info = compile_expression(&e.read(), &ctx);
                         quote! {
                             if matches!(o, sp::Orientation::Vertical) && child_index.is_none() {
                                 info.constraint = #v_info;
@@ -3014,7 +3021,7 @@ fn generate_repeated_component(
                     .layout_info_v_at_cross_width_for_repeated
                     .as_ref()
                     .map(|e| {
-                        let v_info = compile_expression(&e.borrow(), &ctx);
+                        let v_info = compile_expression(&e.read(), &ctx);
                         quote! { info.constraint = #v_info; }
                     })
                     .unwrap_or_else(|| {
@@ -3064,7 +3071,7 @@ fn generate_repeated_component(
             .as_ref()
             .filter(|_| root_sc.flexbox_layout_item_info_for_repeated.is_none())
             .map(|e| {
-                let info = compile_expression(&e.borrow(), &ctx);
+                let info = compile_expression(&e.read(), &ctx);
                 let param = ident(CROSS_WIDTH_LOCAL);
                 quote! {
                     fn layout_item_info_at_cross_width(
@@ -4593,7 +4600,7 @@ fn compile_builtin_function_call(
                     RustGeneratorContext { global_access: quote!(_self.globals()) },
                     Some(&parent_ctx),
                 );
-                let position = compile_expression(&popup.position.borrow(), &popup_ctx);
+                let position = compile_expression(&popup.position.read(), &popup_ctx);
                 let close_policy = compile_expression(close_policy, ctx);
                 let popup_id_name = internal_popup_id(*popup_index as usize);
                 let window_kind = if popup.is_tooltip {

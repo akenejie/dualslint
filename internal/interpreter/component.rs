@@ -11,12 +11,14 @@ use crate::public_api;
 use crate::{AnimationMode, Value};
 use i_slint_compiler::expression_tree::BuiltinFunction;
 use i_slint_compiler::langtype::Type as LangType;
-use i_slint_compiler::llr::{CompilationUnit, Expression, GlobalComponent};
+use i_slint_compiler::llr::{CompilationUnit, Expression, GlobalComponent, TopLevelComponentType};
 use i_slint_compiler::object_tree::PropertyVisibility;
 use i_slint_compiler::parser::normalize_identifier;
 use i_slint_core::item_tree::ItemTreeVTable;
+use i_slint_core::window::WindowInner;
 use smol_str::SmolStr;
-use std::rc::Rc;
+use std::any::Any;
+use std::sync::Arc;
 use vtable::VRc;
 
 /// Pair of `TypeLoader`s retained alongside a compiled component for
@@ -47,7 +49,7 @@ pub struct TypeLoaders {
 /// [`crate::api::ComponentDefinition`].
 #[derive(Clone)]
 pub struct ComponentDefinitionInner {
-    pub compilation_unit: Rc<CompilationUnit>,
+    pub compilation_unit: Arc<CompilationUnit>,
     pub public_index: usize,
     /// `None` on both sides when the definition comes from a running
     /// instance without `TypeLoader` references.
@@ -67,7 +69,29 @@ impl ComponentDefinitionInner {
             None,
             self.type_loaders.clone(),
         );
+        self.leave_render_factory(&vrc);
         ComponentInstanceInner(vrc)
+    }
+
+    /// Leave behind how to make another instance of this component.
+    ///
+    /// A tree cannot cross a thread boundary, so a backend that owns the
+    /// drawing cannot borrow this one: it has to build its own, and only the
+    /// component knows how. What it needs for that is the compiled unit and the
+    /// index of the public component in it, which is why a definition can offer
+    /// it across a thread boundary at all: the unit is `Sync` and holds nothing
+    /// that belongs to an instance.
+    fn leave_render_factory(&self, instance: &VRc<ItemTreeVTable, Instance>) {
+        // A tray or a menu has no window of its own for a renderer to take over.
+        if self.top_level_type() != TopLevelComponentType::Window {
+            return;
+        }
+        let Some(window_adapter) = instance.window_adapter_or_default() else { return };
+        let compilation_unit = self.compilation_unit.clone();
+        let public_index = self.public_index;
+        WindowInner::from_pub(window_adapter.window()).set_render_factory(Arc::new(move || {
+            Box::new(Instance::new(compilation_unit.clone(), public_index)) as Box<dyn Any>
+        }));
     }
 
     /// Instantiate the component, reusing the given `WindowAdapter` instead
@@ -327,7 +351,7 @@ pub fn build_from_document(
     if matches!(animation_mode, AnimationMode::Static) {
         make_static(&mut unit);
     }
-    let unit = Rc::new(unit);
+    let unit = Arc::new(unit);
     // `lower_to_item_tree` builds `public_components` from `exported_roots()`
     // in iteration order, so the indices line up.
     type_loaders.originals = document.exported_roots().collect();
@@ -358,11 +382,11 @@ fn make_static(compilation_unit: &mut CompilationUnit) {
     }
 
     compilation_unit.for_each_expression(&mut |expression, _| {
-        expression.borrow_mut().visit_recursive_mut(&mut make_expression_static);
+        expression.write().visit_recursive_mut(&mut make_expression_static);
     });
     for sub_component in &compilation_unit.sub_components {
         for popup in &sub_component.popup_windows {
-            popup.position.borrow_mut().visit_recursive_mut(&mut make_expression_static);
+            popup.position.write().visit_recursive_mut(&mut make_expression_static);
         }
     }
     for sub_component in &mut compilation_unit.sub_components {

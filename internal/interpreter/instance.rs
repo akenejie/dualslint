@@ -19,6 +19,7 @@ use i_slint_core::{Callback, Property};
 use std::cell::{OnceCell, RefCell};
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use typed_index_collections::TiVec;
 use vtable::{VRc, VWeak};
 
@@ -157,7 +158,7 @@ impl RepeaterOrConditional {
 ///
 /// Each field is indexed by its corresponding LLR index, so lookups are O(1).
 pub struct SubComponentInstance {
-    pub compilation_unit: Rc<CompilationUnit>,
+    pub compilation_unit: Arc<CompilationUnit>,
     pub sub_component_idx: SubComponentIdx,
     pub properties: TiVec<llr::PropertyIdx, SubComponentProperty>,
     pub callbacks: TiVec<llr::CallbackIdx, SubComponentCallback>,
@@ -611,9 +612,8 @@ impl Instance {
             let child_offset = k as u32;
             match source {
                 llr::ZSource::Expression(e) => {
-                    let z: f64 = crate::eval::eval_expression(&mut ctx, &e.borrow())
-                        .try_into()
-                        .unwrap_or(0.0);
+                    let z: f64 =
+                        crate::eval::eval_expression(&mut ctx, &e.read()).try_into().unwrap_or(0.0);
                     push(child_offset, None, z as f32);
                 }
                 llr::ZSource::RepeaterInstances => {
@@ -635,7 +635,7 @@ impl Instance {
     /// Properties are default-valued, then `bindings::install_bindings` wires
     /// up `property_init`, `two_way_bindings` and `init_code`.
     pub fn new(
-        compilation_unit: Rc<CompilationUnit>,
+        compilation_unit: Arc<CompilationUnit>,
         public_component_index: usize,
     ) -> VRc<ItemTreeVTable, Instance> {
         Self::new_with_window(compilation_unit, public_component_index, None, Default::default())
@@ -645,7 +645,7 @@ impl Instance {
     /// existing [`WindowAdapterRc`]. Live preview passes in the window from
     /// the old instance so reloaded components keep the same window frame.
     pub fn new_with_window(
-        compilation_unit: Rc<CompilationUnit>,
+        compilation_unit: Arc<CompilationUnit>,
         public_component_index: usize,
         window_adapter: Option<i_slint_core::window::WindowAdapterRc>,
         type_loaders: crate::component::TypeLoaders,
@@ -664,7 +664,7 @@ impl Instance {
     /// `ComponentContainer` slot index it substitutes into so that
     /// `parent_node` can walk back into the host tree.
     pub fn new_embedded(
-        compilation_unit: Rc<CompilationUnit>,
+        compilation_unit: Arc<CompilationUnit>,
         public_component_index: usize,
         type_loaders: crate::component::TypeLoaders,
         parent: vtable::VWeak<ItemTreeVTable>,
@@ -680,7 +680,7 @@ impl Instance {
     }
 
     fn new_with_options(
-        compilation_unit: Rc<CompilationUnit>,
+        compilation_unit: Arc<CompilationUnit>,
         public_component_index: usize,
         window_adapter: Option<i_slint_core::window::WindowAdapterRc>,
         type_loaders: crate::component::TypeLoaders,
@@ -715,7 +715,7 @@ impl Instance {
     /// `repeater_idx` lets `ModelDataAssignment` find the owning repeater
     /// when an event in the repeated sub-tree wants to write back.
     pub fn new_repeated(
-        compilation_unit: Rc<CompilationUnit>,
+        compilation_unit: Arc<CompilationUnit>,
         item_tree: &llr::ItemTree,
         parent: Weak<SubComponentInstance>,
         repeater_idx: RepeatedElementIdx,
@@ -737,7 +737,7 @@ impl Instance {
     /// parented on the sub-component that owns the popup so that parent-
     /// relative property references resolve through `parent.upgrade()`.
     pub fn new_popup(
-        compilation_unit: Rc<CompilationUnit>,
+        compilation_unit: Arc<CompilationUnit>,
         item_tree: &llr::ItemTree,
         parent: Weak<SubComponentInstance>,
         globals: Rc<GlobalStorage>,
@@ -754,7 +754,7 @@ impl Instance {
 /// borrow. This avoids re-entrant repeater access when an `init` callback
 /// reads a layout property that walks back through the same repeater.
 fn build_instance(
-    compilation_unit: &Rc<CompilationUnit>,
+    compilation_unit: &Arc<CompilationUnit>,
     item_tree: &llr::ItemTree,
     parent: Weak<SubComponentInstance>,
     globals: Rc<GlobalStorage>,
@@ -857,7 +857,7 @@ fn propagate_root(sub: &Pin<Rc<SubComponentInstance>>, weak: &VWeak<ItemTreeVTab
 
 /// Recursively allocate a [`SubComponentInstance`].
 fn build_sub_component_instance(
-    cu: &Rc<CompilationUnit>,
+    cu: &Arc<CompilationUnit>,
     sub_idx: SubComponentIdx,
     parent: Weak<SubComponentInstance>,
 ) -> Pin<Rc<SubComponentInstance>> {
@@ -1074,7 +1074,7 @@ fn repeated_align_self(
 ) -> i_slint_core::items::CrossAxisAlignment {
     match &sc.cross_axis_self_alignment_for_repeated {
         Some((cross_o, expr)) if crate::eval::llr_to_core_orientation(*cross_o) == orientation => {
-            crate::eval::eval_expression(ctx, &expr.borrow()).try_into().unwrap_or_default()
+            crate::eval::eval_expression(ctx, &expr.read()).try_into().unwrap_or_default()
         }
         _ => Default::default(),
     }
@@ -1089,7 +1089,7 @@ fn repeated_layout_order(
 ) -> i32 {
     match &sc.layout_order_for_repeated {
         Some((main_o, expr)) if crate::eval::llr_to_core_orientation(*main_o) == orientation => {
-            match crate::eval::eval_expression(ctx, &expr.borrow()) {
+            match crate::eval::eval_expression(ctx, &expr.read()) {
                 crate::Value::Number(n) => n as i32,
                 _ => 0,
             }
@@ -1208,8 +1208,8 @@ impl i_slint_core::model::RepeatedItemTree for Instance {
         }
 
         let expr = match orientation {
-            i_slint_core::items::Orientation::Horizontal => sc.layout_info_h.borrow(),
-            i_slint_core::items::Orientation::Vertical => sc.layout_info_v.borrow(),
+            i_slint_core::items::Orientation::Horizontal => sc.layout_info_h.read(),
+            i_slint_core::items::Orientation::Vertical => sc.layout_info_v.read(),
         };
         let mut ctx = crate::eval::EvalContext::new(this.root_sub_component.clone());
         let constraint =
@@ -1244,7 +1244,7 @@ impl i_slint_core::model::RepeatedItemTree for Instance {
         let mut ctx = crate::eval::EvalContext::new(self.root_sub_component.clone());
         ctx.locals.insert(CROSS_WIDTH_LOCAL.into(), crate::Value::Number(cross_width as f64));
         let constraint =
-            crate::eval::eval_expression(&mut ctx, &expr.borrow()).try_into().unwrap_or_default();
+            crate::eval::eval_expression(&mut ctx, &expr.read()).try_into().unwrap_or_default();
         // The per-item fields are the same as in `layout_item_info`, which is
         // not called here: it measures the constraint through `layout_info`,
         // which is what this accessor exists to avoid.
@@ -1267,7 +1267,7 @@ impl i_slint_core::model::RepeatedItemTree for Instance {
         let sc_idx = self.root_sub_component.sub_component_idx;
         let sc = &cu.sub_components[sc_idx];
         if let Some(expr) = &sc.flexbox_layout_item_info_for_repeated {
-            let expr = expr.borrow();
+            let expr = expr.read();
             let mut ctx = crate::eval::EvalContext::new(self.root_sub_component.clone());
             let value = crate::eval::eval_expression(&mut ctx, &expr);
             let mut info = value_to_flexbox_layout_item_info(value, orientation, self);
@@ -1281,7 +1281,7 @@ impl i_slint_core::model::RepeatedItemTree for Instance {
                 && let Some(v_expr) = &sc.layout_info_v_constrained_for_repeated
             {
                 let mut ctx = crate::eval::EvalContext::new(self.root_sub_component.clone());
-                info.constraint = crate::eval::eval_expression(&mut ctx, &v_expr.borrow())
+                info.constraint = crate::eval::eval_expression(&mut ctx, &v_expr.read())
                     .try_into()
                     .unwrap_or_default();
                 return info;
@@ -1316,7 +1316,7 @@ impl Instance {
                 i_slint_compiler::llr::lower_layout_expression::CROSS_WIDTH_LOCAL.into(),
                 crate::Value::Number(cross_width as f64),
             );
-            info.constraint = crate::eval::eval_expression(&mut ctx, &v_expr.borrow())
+            info.constraint = crate::eval::eval_expression(&mut ctx, &v_expr.read())
                 .try_into()
                 .unwrap_or_default();
         }
@@ -1345,10 +1345,8 @@ fn row_child_layout_item_info(
                 if index == 0 {
                     let child = &sc.grid_layout_children[*child_index];
                     let expr = match orientation {
-                        i_slint_core::items::Orientation::Horizontal => {
-                            child.layout_info_h.borrow()
-                        }
-                        i_slint_core::items::Orientation::Vertical => child.layout_info_v.borrow(),
+                        i_slint_core::items::Orientation::Horizontal => child.layout_info_h.read(),
+                        i_slint_core::items::Orientation::Vertical => child.layout_info_v.read(),
                     };
                     let mut ctx = crate::eval::EvalContext::new(this.root_sub_component.clone());
                     let constraint = crate::eval::eval_expression(&mut ctx, &expr)
@@ -1408,7 +1406,7 @@ fn row_child_cross_width(
     let mut ctx = crate::eval::EvalContext::new(this.root_sub_component.clone());
     ctx.locals
         .insert(GRID_MEASURE_CHILD_INDEX_LOCAL.into(), crate::Value::Number(flat_index as f64));
-    crate::eval::eval_expression(&mut ctx, &expr.borrow()).try_into().ok()
+    crate::eval::eval_expression(&mut ctx, &expr.read()).try_into().ok()
 }
 
 fn value_to_flexbox_layout_item_info(

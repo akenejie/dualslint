@@ -365,6 +365,7 @@ fn lower_sub_component(
 ) -> LoweredSubComponent {
     let mut sub_component = SubComponent {
         name: component_id(component),
+        public_properties: Default::default(),
         properties: Default::default(),
         callbacks: Default::default(),
         functions: Default::default(),
@@ -975,6 +976,9 @@ fn lower_sub_component(
         sub_component.geometries[item_index] = Some(lower_geometry(geom, &ctx).into());
     });
 
+    sub_component.public_properties =
+        exported_public_properties(&component.root_element, &sub_component);
+
     LoweredSubComponent { sub_component, mapping }
 }
 
@@ -1438,6 +1442,7 @@ fn make_tree(
     }
 }
 
+/// The properties the component exposes in its `PublicComponent` entry.
 fn public_properties(
     component: &Component,
     mapping: &LoweredSubComponentMapping,
@@ -1477,6 +1482,92 @@ fn public_properties(
                     visibility: c.visibility,
                 },
             )
+        })
+        .collect()
+}
+
+/// The public properties of a sub-component, named rather than pointed at.
+///
+/// Two things stand between a declaration on a component's root element and a
+/// property in the sub-component that holds the component's state.
+///
+/// The `expose_in_public_api` flag, which is what says a declaration is part
+/// of the component's public API, is filled in by `check_public_api`. The
+/// filter below therefore does not read it: it applies the same rule from the
+/// declaration itself, so that it holds for a component from another file
+/// whichever document the pass happened to run on. The "is exported" half of
+/// that rule is left out, because a component that is not exported cannot be
+/// named from the outside in the first place.
+///
+/// A declaration that `remove_aliases` turned into an alias is not a property
+/// of the sub-component at all, and the check against the sub-component's own
+/// properties is what tells the two apart. A property that only forwards to
+/// another element has no property here and is dropped; one that is two-way
+/// bound to a native item, such as the `text` of a `LineEdit` on the
+/// `TextInput` under it, does have one -- it is the property that holds the
+/// binding -- and it is the property a write has to go through, because the
+/// binding is what carries the value back to the application.
+fn exported_public_properties(
+    root_element: &crate::object_tree::ElementRc,
+    sub_component: &SubComponent,
+) -> BTreeMap<SmolStr, SubComponentPublicProperty> {
+    let root = root_element.borrow();
+    root.property_declarations
+        .iter()
+        .filter(|(_, c)| {
+            c.visibility != crate::object_tree::PropertyVisibility::Private
+                && c.property_type.ok_for_public_api()
+        })
+        .filter_map(|(p, c)| {
+            // Follow the alias chain to the declaration that holds the value.
+            // The bound keeps a cycle from looping forever, and a cycle is not
+            // something the passes produce anyway. An alias that points at
+            // another element ends the walk: it is a property that only
+            // forwards, and whether one is left to say so is the job of the
+            // check below rather than of the direction the alias points in.
+            let mut target_name = p.clone();
+            for _ in 0..16 {
+                let alias = root
+                    .property_declarations
+                    .get(&target_name)
+                    .and_then(|d| d.is_alias.clone())
+                    .filter(|alias| Rc::ptr_eq(&alias.element(), root_element));
+                match alias {
+                    Some(alias) => target_name = alias.name().clone(),
+                    None => break,
+                }
+            }
+            // The internal name a root-element declaration is stored under:
+            // `lower_sub_component` names it after the element it is declared
+            // on. The check keeps the two in step instead of trusting that
+            // they match.
+            let property_name = format_smolstr!("{}_{}", root.id, target_name);
+            if !sub_component.properties.iter().any(|x| x.name == property_name) {
+                return None;
+            }
+            // Recover the source-form identifier from the declaration node
+            // (preserves dashes and the original casing). Fall back to the
+            // normalized key if no node is attached.
+            let display_name = c
+                .node
+                .as_ref()
+                .and_then(|n| {
+                    n.child_node(crate::parser::SyntaxKind::DeclaredIdentifier)
+                        .and_then(|n| n.child_token(crate::parser::SyntaxKind::Identifier))
+                })
+                .map(|tok| SmolStr::new(tok.text()))
+                .unwrap_or_else(|| c.declared_name(p).clone());
+            Some((
+                // A shadowing declaration is exposed under the name it was
+                // written with, not the internal name it is stored under
+                c.declared_name(p).clone(),
+                SubComponentPublicProperty {
+                    display_name,
+                    property_name,
+                    ty: c.property_type.clone(),
+                    visibility: c.visibility,
+                },
+            ))
         })
         .collect()
 }

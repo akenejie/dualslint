@@ -97,7 +97,7 @@ pub(crate) fn show_popup_window(ctx: &mut EvalContext, arguments: &[Expression])
     // The position expression is evaluated lazily so the window can
     // re-query it after measuring the popup.
     let access_position: Box<dyn Fn() -> i_slint_core::api::LogicalPosition> = {
-        let pos_expr = popup.position.borrow().clone();
+        let pos_expr = popup.position.read().clone();
         let popup_root = popup_vrc.root_sub_component.clone();
         Box::new(move || {
             let mut popup_ctx = EvalContext::new(popup_root.clone());

@@ -92,9 +92,7 @@ impl ClipboardProvider for SelectableClipboard {
     }
 }
 
-pub fn create_clipboard(
-    _display_handle: &winit::raw_window_handle::DisplayHandle<'_>,
-) -> ClipboardPair {
+pub fn create_clipboard() -> ClipboardPair {
     cfg_if::cfg_if! {
         if #[cfg(all(
             unix,

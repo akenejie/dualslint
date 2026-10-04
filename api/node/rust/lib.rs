@@ -219,6 +219,96 @@ impl ControlPropertyValue {
     }
 }
 
+impl From<slint_interpreter::render_thread::ControlPropertyValue> for ReadControlPropertyValue {
+    fn from(value: slint_interpreter::render_thread::ControlPropertyValue) -> Self {
+        use slint_interpreter::render_thread::ControlPropertyValue as Value;
+        match value {
+            Value::Bool(v) => Self {
+                kind: "bool".into(),
+                boolean: v,
+                number: 0.,
+                text: String::new(),
+                color: String::new(),
+            },
+            Value::Number(v) => Self {
+                kind: "number".into(),
+                boolean: false,
+                number: v as f64,
+                text: String::new(),
+                color: String::new(),
+            },
+            Value::Text(v) => Self {
+                kind: "text".into(),
+                boolean: false,
+                number: 0.,
+                text: v,
+                color: String::new(),
+            },
+            Value::Color { r, g, b, a } => Self {
+                kind: "color".into(),
+                boolean: false,
+                number: 0.,
+                text: String::new(),
+                // The same hex spelling the setter reads, so a read can be
+                // handed straight back to `setControlProperty`.
+                color: format!("#{r:02x}{g:02x}{b:02x}{a:02x}"),
+            },
+        }
+    }
+}
+
+/// A control property read back from the render thread.
+///
+/// The fields are all filled in, and `kind` names the one that carries the
+/// value, which is how it crosses the native boundary as one flat object. The
+/// TypeScript side turns that back into the same discriminated union
+/// `setControlProperty` takes, so a read value can be written straight back.
+#[napi(object)]
+pub struct ReadControlPropertyValue {
+    /// One of `bool`, `number`, `text` or `color`.
+    pub kind: String,
+    /// The value for a `bool` property.
+    pub boolean: bool,
+    /// The value for a `number` property.
+    pub number: f64,
+    /// The value for a `text` property.
+    pub text: String,
+    /// The value for a `color` property, as `#rrggbbaa`.
+    pub color: String,
+}
+
+/// Read one property of a borrowed control, blocking until the render thread
+/// answers. Returns `null` when the id or the property name does not resolve.
+///
+/// The `.slint` side of the tree belongs to the render thread, so a caller that
+/// needs to know what a control looks like asks here instead of keeping a second
+/// copy of the component.
+#[napi]
+pub fn get_control_property(id: i64, property: String) -> Option<ReadControlPropertyValue> {
+    #[cfg(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    ))]
+    {
+        if id <= 0 {
+            return None;
+        }
+        return slint_interpreter::render_thread::host()
+            .and_then(|host| host.get_control_property(id as u64, &property))
+            .map(Into::into);
+    }
+    #[cfg(not(any(
+        feature = "backend-winit",
+        feature = "backend-winit-x11",
+        feature = "backend-winit-wayland"
+    )))]
+    {
+        let _ = (id, property);
+        None
+    }
+}
+
 /// Parse `#rgb`, `#rgba`, `#rrggbb` and `#rrggbbaa`, with or without the `#`.
 ///
 /// Returns `None` for anything else, including a color name: the Python binding

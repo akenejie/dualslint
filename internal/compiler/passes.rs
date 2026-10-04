@@ -387,4 +387,9 @@ pub fn run_import_passes(
     check_expressions::check_expressions(doc, diag);
     windows::warn_about_child_windows(doc, diag);
     unique_id::check_unique_id(doc, diag);
+    // A component from an imported file is inlined into the importing file's
+    // compilation unit, so its public properties have to be marked here: the
+    // pass that does it for the document being compiled only sees that
+    // document's own exports.
+    check_public_api::mark_exported_properties(doc);
 }

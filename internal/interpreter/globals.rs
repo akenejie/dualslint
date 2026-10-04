@@ -14,6 +14,7 @@ use i_slint_core::rtti;
 use i_slint_core::{Callback, Property};
 use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::Arc;
 use typed_index_collections::TiVec;
 
 /// Name-based access to a native (builtin) global like `NativeStyleMetrics`,
@@ -96,7 +97,7 @@ fn instantiate_native_global(class_name: &str) -> Option<Pin<Rc<dyn NativeGlobal
 }
 
 pub struct GlobalInstance {
-    pub compilation_unit: Rc<CompilationUnit>,
+    pub compilation_unit: Arc<CompilationUnit>,
     pub global_idx: GlobalIdx,
     pub properties: TiVec<i_slint_compiler::llr::PropertyIdx, SubComponentProperty>,
     pub callbacks: TiVec<i_slint_compiler::llr::CallbackIdx, SubComponentCallback>,
@@ -128,7 +129,7 @@ pub struct GlobalStorage {
 impl GlobalStorage {
     /// Allocate one `GlobalInstance` per declared global.
     /// Bindings are installed separately by [`install_global_bindings`].
-    pub fn new(compilation_unit: &Rc<CompilationUnit>) -> Self {
+    pub fn new(compilation_unit: &Arc<CompilationUnit>) -> Self {
         let globals = compilation_unit
             .globals
             .iter_enumerated()
@@ -232,7 +233,7 @@ fn install_global_change_trackers(g: &Rc<GlobalInstance>, storage: &Rc<GlobalSto
         let weak_storage_set = Rc::downgrade(storage);
         let global_idx = g.global_idx;
         let prop_idx = *prop_idx;
-        let notify_expr = expr.borrow().clone();
+        let notify_expr = expr.read().clone();
         g.change_trackers[idx].init(
             (),
             move |()| -> Value {
@@ -261,7 +262,7 @@ fn install_for_global(g: &Rc<GlobalInstance>, storage: &Rc<GlobalStorage>) {
     let cu = g.compilation_unit.clone();
     let global = &cu.globals[g.global_idx];
     for (member, binding) in &global.init_values {
-        let expr = binding.expression.borrow().clone();
+        let expr = binding.expression.read().clone();
         let weak_storage = Rc::downgrade(storage);
 
         match member {

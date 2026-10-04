@@ -1,25 +1,21 @@
 // Copyright © akenejie
 // SPDX-License-Identifier: AGPL-3.0-only
 //
-// SceneFrame / DrawCommand types shared by every 2-thread backend.
+// The data a 2-thread backend's render side and the UI side agree on.
 //
-// A `SceneFrame` is a plain, `Send` descriptor of one rendered frame: a list
-// of `DrawCommand`s (physical-pixel drawing primitives), the font payloads
-// its glyph runs reference, and the control regions for hit-testing.  The
-// UI thread serialises its item tree into one via the snapshot encoder
-// (`snapshot`); the render thread replays the commands against whatever
-// renderer owns the window surface.  The winit backend replays them onto
-// FemtoVG/GL; a platform whose renderer can draw into the window buffer
-// directly can present from its own render thread without this protocol.
+// The render thread draws the item tree itself, so nothing here describes a
+// frame: what crosses the thread boundary is the control table (where each
+// interactive item is on screen) and the property values the UI tree and the
+// render tree exchange.  `controls` walks the tree to produce that table; the
+// `ControlPropertyValue` and `CSlintControlPropertyValue` shapes below are the
+// C ABI's spelling of one property value.
 
-use i_slint_core::graphics::Color;
 use i_slint_core::graphics::euclid;
-use i_slint_core::lengths::{LogicalRect, PhysicalBorderRadius, PhysicalPx};
+use i_slint_core::lengths::{LogicalRect, PhysicalPx};
 
-pub mod snapshot;
+pub mod controls;
 
-/// Physical-pixel geometry aliases (documents that all command payloads are
-/// in physical pixels, matching femtovg's coordinate space).
+/// Physical-pixel geometry, the space a rendering backend draws in.
 pub type PhysicalLength = euclid::Length<f32, PhysicalPx>;
 pub type PhysicalPoint = euclid::Point2D<f32, PhysicalPx>;
 pub type PhysicalRect = euclid::Rect<f32, PhysicalPx>;
@@ -27,7 +23,7 @@ pub type PhysicalRect = euclid::Rect<f32, PhysicalPx>;
 /// A value to assign to a borrowed (lent-out) control property.  The render
 /// thread converts it to the concrete Slint property type (upstream
 /// semantics, including detaching a previous binding) on the mirror tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ControlPropertyValue {
     /// For `Text.text`, `TextInput.text`, ...
     Text(String),
@@ -100,71 +96,84 @@ impl CSlintControlPropertyValue {
             _ => return None,
         })
     }
+
+    /// Build the C shape from a [`ControlPropertyValue`], for handing a value
+    /// back out to a C caller.
+    ///
+    /// `text` is only read for the text case and is stored as given rather than
+    /// copied, because a `CString` has no address to hand out that stays put.
+    /// The caller therefore owns the buffer and keeps it alive for as long as
+    /// the returned struct can be read.
+    pub fn from_value(value: &ControlPropertyValue, text: *const std::os::raw::c_char) -> Self {
+        let (tag, number, bool_, color) = match value {
+            ControlPropertyValue::Bool(b) => (SLINT_CONTROL_PROPERTY_BOOL, 0., *b, [0; 4]),
+            ControlPropertyValue::Number(n) => (SLINT_CONTROL_PROPERTY_NUMBER, *n, false, [0; 4]),
+            ControlPropertyValue::Color { r, g, b, a } => {
+                (SLINT_CONTROL_PROPERTY_COLOR, 0., false, [*r, *g, *b, *a])
+            }
+            // The caller passes the pointer to the live buffer it already made
+            // for the string; an empty text still needs a non-null pointer,
+            // which is what an empty CString gives.
+            ControlPropertyValue::Text(_) => (SLINT_CONTROL_PROPERTY_TEXT, 0., false, [0; 4]),
+        };
+        let text =
+            if matches!(value, ControlPropertyValue::Text(_)) { text } else { std::ptr::null() };
+        Self { tag, number, bool_, color, text }
+    }
 }
 
-/// A serialisable paint description, equivalent to femtovg::Paint.
-#[derive(Clone, Debug)]
-pub enum PaintDesc {
-    /// Solid color fill.
-    Solid { r: u8, g: u8, b: u8, a: u8 },
-    /// Linear gradient.
-    LinearGradient { start_x: f32, start_y: f32, end_x: f32, end_y: f32, stops: Vec<GradientStop> },
-    /// Radial gradient.
-    RadialGradient { cx: f32, cy: f32, radius: f32, stops: Vec<GradientStop> },
-    /// Texture-mapped paint (image blit).
-    ImagePaint {
-        texture_key: u64,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        tex_x: f32,
-        tex_y: f32,
-        tex_w: f32,
-        tex_h: f32,
-        flags: u32,
-    },
-}
+/// Read one property of a component that was handed to the render thread.
+///
+/// `component` is the same pointer the component factory returned, `item` is
+/// the address of the item that carried the query, and `property` is the
+/// name the render thread could not resolve against its own items. The value
+/// goes into `out`; returning `false` says the component declares no such
+/// property, which is not an error but the answer "look elsewhere".
+///
+/// # Safety
+///
+/// `component` and `item` must be the pointers the render thread passed in, and
+/// `property` must be a NUL-terminated string. When the tag written into `out`
+/// is [`SLINT_CONTROL_PROPERTY_TEXT`], `out.text` must be a NUL-terminated
+/// string that stays valid until this call returns.
+pub type SlintRenderThreadPropertyRead = unsafe extern "C" fn(
+    component: *const std::os::raw::c_void,
+    item: *const std::os::raw::c_void,
+    property: *const std::os::raw::c_char,
+    out: *mut CSlintControlPropertyValue,
+) -> bool;
 
-/// A single gradient colour stop.
-#[derive(Clone, Debug)]
-pub struct GradientStop {
-    pub offset: f32,
-    pub color: [u8; 4], // RGBA
-}
+/// Assign one property of a component that was handed to the render thread; the
+/// counterpart of [`SlintRenderThreadPropertyRead`], with the same contract
+/// plus `value`, which the callee only reads.
+///
+/// # Safety
+///
+/// The pointers must be the ones the render thread passed in, `property` and,
+/// when `value->tag` is [`SLINT_CONTROL_PROPERTY_TEXT`], `value->text` must be
+/// NUL-terminated strings.
+pub type SlintRenderThreadPropertyWrite = unsafe extern "C" fn(
+    component: *const std::os::raw::c_void,
+    item: *const std::os::raw::c_void,
+    property: *const std::os::raw::c_char,
+    value: *const CSlintControlPropertyValue,
+) -> bool;
 
-/// One segment of a vector path.
-#[derive(Clone, Debug)]
-pub enum PathEvent {
-    MoveTo(f32, f32),
-    LineTo(f32, f32),
-    QuadTo(f32, f32, f32, f32),
-    CubicTo(f32, f32, f32, f32, f32, f32),
-    Close,
-}
-
-/// A positioned glyph for cross-thread text rendering.
-#[derive(Clone, Debug)]
-pub struct PositionedGlyph {
-    pub x: f32,
-    pub y: f32,
-    pub id: u16,
-}
-
-/// Line cap style for strokes.
-#[derive(Clone, Copy, Debug)]
-pub enum LineCapDesc {
-    Butt,
-    Round,
-    Square,
-}
-
-/// Line join style for strokes.
-#[derive(Clone, Copy, Debug)]
-pub enum LineJoinDesc {
-    Miter,
-    Round,
-    Bevel,
+/// The pair of calls that answer for a component the render thread draws, in
+/// the shape a C caller passes them.
+///
+/// It is the counterpart of the Rust `ComponentPropertyAccess`: a `.slint`
+/// widget's property belongs to the component around its items rather than to
+/// any item, so only the application that created the component can say what
+/// it is. Both calls run on the render thread.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CSlintRenderThreadPropertyAccess {
+    /// Reads a property; a null one is read as "this component declares
+    /// nothing", leaving every query to the render thread's own items.
+    pub read: Option<SlintRenderThreadPropertyRead>,
+    /// Assigns a property; a null one refuses every assignment.
+    pub write: Option<SlintRenderThreadPropertyWrite>,
 }
 
 /// Mirrors a control's screen region for the render thread's coordinate table.
@@ -326,188 +335,22 @@ impl PointerState {
         }
         updates
     }
-}
 
-/// Complete serialisable scene for one frame.
-#[derive(Clone, Debug)]
-pub struct SceneFrame {
-    pub width: u32,
-    pub height: u32,
-    pub scale_factor: f32,
-    /// Window background as RGBA bytes; cleared before the commands replay.
-    /// `None` means the UI thread did not see a solid brush and the commands
-    /// carry the full background instead.
-    pub background: Option<[u8; 4]>,
-    /// Deduplicated font payloads referenced by the glyph runs below. The
-    /// `blob_id` is `Blob::id()` of the parley font data, stable across
-    /// frames, so the render thread can cache font ids without re-hashing the
-    /// font bytes.
-    pub fonts: Vec<SceneFont>,
-    pub commands: Vec<DrawCommand>,
-    pub controls: Vec<ControlRegion>,
-}
-
-/// One unique font payload serialised for a frame.
-#[derive(Clone, Debug)]
-pub struct SceneFont {
-    /// Stable `Blob::id()` of the parley font data.
-    pub blob_id: u64,
-    /// Index of the font in a collection, or 0 for a single font.
-    pub font_index: u32,
-    pub data: Vec<u8>,
-}
-
-/// A compositing layer drawn on top of the UI scene, submitted from any
-/// thread without going through the UI thread.
-///
-/// Commands use the same physical-pixel coordinate space as
-/// [`SceneFrame::commands`].  Submitting a new frame replaces the previous
-/// overlay; an empty command list removes it.  Whenever such an overlay is
-/// submitted (or the window is resized) while the UI thread is busy, the
-/// render thread re-composites the last retained UI scene with the overlay
-/// and presents it, so drawing does not stall behind the UI thread.
-#[derive(Clone, Debug, Default)]
-pub struct OverlayFrame {
-    /// Font payloads referenced by the glyph runs in `commands`.
-    pub fonts: Vec<SceneFont>,
-    pub commands: Vec<DrawCommand>,
-}
-
-/// A single draw command in the serialised scene.
-#[derive(Clone, Debug)]
-pub enum DrawCommand {
-    // -- Canvas state --
-    Save,
-    Restore,
-    Translate(f32, f32),
-    Rotate(f32),
-    Scale(f32, f32),
-    /// Directly set the global alpha (used after accumulation).
-    SetGlobalAlpha(f32),
-    /// Intersection clip rect (physical coordinates).
-    CombineClip(PhysicalRect),
-
-    // -- Primitives --
-    /// Fill a rectangle with a solid or gradient paint (no border radius).
-    FillRect {
-        rect: PhysicalRect,
-        paint: PaintDesc,
-        anti_alias: bool,
-    },
-    /// Fill a rounded rectangle (background).
-    FillRoundedRect {
-        rect: PhysicalRect,
-        paint: PaintDesc,
-        radius: PhysicalBorderRadius,
-        anti_alias: bool,
-    },
-    /// Stroke a rounded rectangle (border stroke for buttons / text boxes).
-    StrokeRoundedRect {
-        rect: PhysicalRect,
-        paint: PaintDesc,
-        radius: PhysicalBorderRadius,
-        line_width: f32,
-        anti_alias: bool,
-    },
-    /// Stroke a path (border rectangle).
-    StrokePath {
-        path: Vec<PathEvent>,
-        paint: PaintDesc,
-        line_width: f32,
-        line_cap: LineCapDesc,
-        line_join: LineJoinDesc,
-        miter_limit: f32,
-        anti_alias: bool,
-    },
-    /// Fill a path (rounded rect background or explicit path).
-    FillPath {
-        path: Vec<PathEvent>,
-        paint: PaintDesc,
-        fill_rule: u8,
-        anti_alias: bool,
-    },
-
-    // -- Text (glyph-based) --
-    /// Draw a glyph run produced by sharedparley on the UI thread. The font
-    /// payload is carried once per frame in `SceneFrame::fonts`, referenced
-    /// here by its stable `Blob::id()`.
-    DrawGlyphRun {
-        font_blob_id: u64,
-        font_index: u32,
-        font_size: f32,
-        normalized_coords: Vec<i16>,
-        paint: PaintDesc,
-        y_offset: f32,
-        glyphs: Vec<PositionedGlyph>,
-        is_stroke: bool,
-    },
-    /// Fill a rectangle (underline/strikethrough/cursor) during text drawing.
-    FillTextRect {
-        rect: PhysicalRect,
-        paint: PaintDesc,
-        radius: f32,
-        border: Option<(PaintDesc, f32)>,
-    },
-    /// Draw a text string that the render thread shapes itself with its own
-    /// parley context (system fonts, no UI-thread involvement).  `x`/`y` is
-    /// the baseline origin in physical pixels; `font_size` is in physical
-    /// pixels; `max_width` wraps the line at the given physical-pixel width
-    /// (`None` = single line).  Meant for overlay drawing driven by any app
-    /// thread: only the string and geometry travel over the wire.
-    DrawText {
-        x: f32,
-        y: f32,
-        text: String,
-        font_size: f32,
-        paint: PaintDesc,
-        max_width: Option<f32>,
-    },
-
-    // -- Images / pixmaps --
-    /// Upload a raw RGBA8 pixel buffer to the render thread's texture cache.
-    UploadPixmap {
-        key: u64,
-        pixels: Vec<u8>,
-        width: u32,
-        height: u32,
-    },
-    /// Draw a previously-uploaded pixmap at the current canvas position.
-    BlitPixmap {
-        key: u64,
-        /// f32 x, y, w, h, tex_x, tex_y, tex_w, tex_h, flags
-        params: [f32; 9],
-    },
-
-    // -- Layer (offscreen compositing for opacity / clip-with-radius / layer hint) --
-    Layer {
-        width: u32,
-        height: u32,
-        /// Blit origin in physical pixels.
-        origin: PhysicalPoint,
-        alpha_tint: f32,
-        commands: Vec<DrawCommand>,
-    },
-
-    // -- Box shadow --
-    /// Render a drop-shadow: the render thread creates a small texture, fills
-    /// a rounded rect, blurs, and composites.  All params in physical pixels.
-    DrawBoxShadow {
-        color: Color,
-        blur: f32,
-        offset_x: f32,
-        offset_y: f32,
-        width: f32,
-        height: f32,
-        radius: PhysicalBorderRadius,
-    },
-
-    // -- Cached pixmap (from custom widget painting) --
-    CachedPixmap {
-        key: u64,
-        width: u32,
-        height: u32,
-        pixels: Vec<u8>,
-    },
+    /// The control a completed click belongs to, or `None`.
+    ///
+    /// A click is a press and a release over the same control, so this reads
+    /// the state as it is *before* the event is folded in: after [`Self::apply`]
+    /// the press is gone either way, and a release that never had a press is
+    /// not a click. Dragging off a control and releasing over nothing is a
+    /// cancelled click, not a click on whatever happened to be underneath.
+    ///
+    /// Ask this before calling `apply`, so the press is still there.
+    pub fn clicked(&self, phase: PointerPhase, target: Option<u64>) -> Option<u64> {
+        if phase != PointerPhase::Released {
+            return None;
+        }
+        target.filter(|id| self.press == Some(*id) && self.hover == Some(*id))
+    }
 }
 
 #[cfg(test)]
@@ -665,6 +508,33 @@ mod tests {
         assert_eq!(published.control_at(5., 5.), Some(1));
         assert_eq!(published.control_at(15., 15.), Some(2), "the later control is on top");
         assert_eq!(published.control_at(500., 500.), None);
+    }
+
+    #[test]
+    fn a_release_over_the_pressed_control_is_a_click() {
+        let mut state = PointerState::default();
+        let press = state.clicked(PointerPhase::Pressed, Some(1));
+        state.apply(PointerPhase::Pressed, Some(1));
+        assert_eq!(press, None, "a press is not a click");
+        assert_eq!(state.clicked(PointerPhase::Moved, Some(1)), None, "nor is a move");
+        assert_eq!(state.clicked(PointerPhase::Released, Some(1)), Some(1));
+    }
+
+    #[test]
+    fn a_release_away_from_the_pressed_control_is_not_a_click() {
+        let mut state = PointerState::default();
+        state.apply(PointerPhase::Pressed, Some(1));
+        // Dragged off the control before letting go.
+        state.apply(PointerPhase::Moved, Some(2));
+        assert_eq!(state.clicked(PointerPhase::Released, Some(2)), None, "dragged off");
+        assert_eq!(state.clicked(PointerPhase::Released, None), None, "released outside");
+    }
+
+    #[test]
+    fn a_release_without_a_press_is_not_a_click() {
+        let mut state = PointerState::default();
+        state.apply(PointerPhase::Moved, Some(1));
+        assert_eq!(state.clicked(PointerPhase::Released, Some(1)), None);
     }
 }
 

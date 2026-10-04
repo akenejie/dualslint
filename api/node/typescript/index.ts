@@ -927,6 +927,38 @@ export namespace renderThread {
     }
 
     /**
+     * Reads one property of a borrowed control, blocking until the render thread
+     * answers.
+     *
+     * Returns `null` when the id or the property name does not resolve. The
+     * `.slint` side of the tree belongs to the render thread, so a caller that
+     * needs to know what a control looks like asks here instead of keeping a
+     * second copy of the component.
+     *
+     * The result is the same union {@link setControlProperty} takes, so a value
+     * read can be handed straight back to it.
+     */
+    export function getControlProperty(
+        id: number,
+        property: string,
+    ): ControlPropertyValue | null {
+        const value = napi.getControlProperty(id, property);
+        if (value === null) {
+            return null;
+        }
+        switch (value.kind) {
+            case "bool":
+                return { type: "bool", value: value.boolean };
+            case "number":
+                return { type: "number", value: value.number };
+            case "text":
+                return { type: "text", value: value.text };
+            case "color":
+                return { type: "color", value: value.color };
+        }
+    }
+
+    /**
      * Reports a borrowed control as hovered and/or pressed on the render thread.
      *
      * This is how a pointer state the program resolved itself is handed over: the

@@ -28,3 +28,12 @@ svg = ["i-slint-core/svg"]
 [dependencies]
 i-slint-core = { workspace = true, features = ["default", "box-shadow-cache"] }
 lyon_path = { workspace = true }
+
+[dev-dependencies]
+# A headless window to encode, and a way to build a component with real widgets
+# in it. Both only exist to check that the geometry-only encode agrees with the
+# full one.
+i-slint-backend-testing = { path = "../testing" }
+i-slint-compiler = { path = "../../compiler" }
+slint-interpreter = { path = "../../interpreter", features = ["internal"] }
+spin_on = { workspace = true }
