@@ -42,8 +42,6 @@ mod ios;
 /// behind.
 pub mod render_thread;
 
-use i_slint_backend_scene::PointerPhase;
-
 use i_slint_backend_scene::PublishedControls;
 
 /// Re-export of the winit crate.
@@ -424,16 +422,12 @@ impl BackendBuilder {
 
 fn dispatch_mouse_move(window: &Weak<WinitWindowAdapter>, position: LogicalPoint) {
     if let Some(window) = window.upgrade() {
-        let event = i_slint_core::platform::WindowEvent::internal(
-            i_slint_core::input::BackendMouseEvent::Moved { position, touch_finger_id: 0 },
-        );
-        // The render thread owns the controls: resolve the move against the
-        // geometry it published and report the hover that follows from it.
-        if WinitWindowAdapter::render_owns_controls() {
-            window.drive_render_control_state(PointerPhase::Moved, position);
-        } else {
-            window.window().dispatch_event(event);
-        }
+        // A move decides hover and drag, and both are the tree's business, so
+        // the event goes to the tree that owns the controls.
+        window.dispatch_pointer_event(i_slint_core::input::BackendMouseEvent::Moved {
+            position,
+            touch_finger_id: 0,
+        });
     }
 }
 

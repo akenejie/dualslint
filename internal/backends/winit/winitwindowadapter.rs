@@ -45,7 +45,6 @@ use corelib::items::{ItemRc, ItemRef};
 #[cfg(any(enable_accesskit, muda))]
 use crate::SlintEvent;
 use crate::{EventResult, SharedBackendData};
-use i_slint_backend_scene::{PointerPhase, PointerState};
 
 use corelib::api::PhysicalSize;
 use corelib::layout::Orientation;
@@ -455,9 +454,6 @@ pub struct WinitWindowAdapter {
     /// Whether a *mouse* button is currently pressed. Touch input is handled
     /// separately via `process_touch_input` and does not affect this flag.
     pressed: Cell<bool>,
-    /// What the UI thread believes the render-owned controls' pointer state is.
-    /// Only meaningful once the render thread has taken over the controls.
-    pointer_state: Cell<PointerState>,
     current_resize_direction: Cell<Option<ResizeDirection>>,
     /// Allocates small i32 finger ids for iOS's pointer-valued touch ids.
     #[cfg(target_os = "ios")]
@@ -510,7 +506,6 @@ impl WinitWindowAdapter {
             custom_cursor_source: Cell::new(None),
             cursor_pos: Default::default(),
             pressed: Default::default(),
-            pointer_state: Default::default(),
             current_resize_direction: Default::default(),
             #[cfg(target_os = "ios")]
             touch_finger_ids: Default::default(),
@@ -1317,40 +1312,38 @@ impl WinitWindowAdapter {
     }
 
     /// Whether the render thread has taken over the controls, in which case the
-    /// UI thread interprets the pointer events instead of dispatching them into
-    /// its own tree.
+    /// UI thread hands the pointer events to that tree instead of dispatching
+    /// them into its own.
     pub(crate) fn render_owns_controls() -> bool {
         crate::render_thread::host().is_some_and(|host| host.has_attached_component())
     }
 
-    /// Process one OS pointer event on behalf of the render-owned controls.
+    /// Hand one pointer event to the tree that owns the controls.
     ///
-    /// The pointer position only exists on the thread that received the OS
-    /// event, and the control geometry only exists on the render thread, so the
-    /// join between the two is made here: the UI thread resolves the pointer
-    /// against the geometry the render thread last composited, and sends the
-    /// state that follows from it.  What leaves this function is a state
-    /// change, never an event -- the render thread applies it and redraws, so no
-    /// separate redraw request is needed.
-    pub(crate) fn drive_render_control_state(&self, phase: PointerPhase, position: LogicalPoint) {
-        let Some(host) = crate::render_thread::host() else { return };
-        // Which control the pointer is over, according to the geometry the
-        // render thread last composited.
-        let target = match phase {
-            PointerPhase::Exited => None,
-            _ => host.control_at(position.x, position.y),
-        };
-        let mut state = self.pointer_state.get();
-        let clicked = state.clicked(phase, target);
-        for update in state.apply(phase, target) {
-            host.apply_control_state(update.id, update.hovered, update.pressed);
+    /// This thread is the one that hears the pointer, so turning the OS
+    /// coordinates into logical ones is its work; deciding what the event means
+    /// is not. A press, a move, a wheel notch and the button that was not the
+    /// left one all reach the items this way, on the thread the items live on,
+    /// which is what lets a `ContextMenu` open its menu, a `Flickable` scroll
+    /// and a slider follow a drag -- all of which are more than a property the
+    /// UI thread could have set on the item's behalf.
+    ///
+    /// Returns `true` when the render thread took the event. With nothing
+    /// attached the event goes to this window's own tree, which is then the one
+    /// on screen.
+    pub(crate) fn dispatch_pointer_event(
+        &self,
+        event: impl Into<corelib::platform::InternalEvent>,
+    ) -> bool {
+        let event = event.into();
+        if Self::render_owns_controls()
+            && crate::render_thread::host()
+                .is_some_and(|host| host.send_pointer_event_to_control(event.clone()))
+        {
+            return true;
         }
-        self.pointer_state.set(state);
-        if let Some(id) = clicked {
-            // The click itself goes to the tree on the render thread, which is
-            // the only place that can say what it means.
-            host.activate_control(id);
-        }
+        self.dispatch_internal_event(event);
+        false
     }
 
     /// Hand a key to the tree on the render thread, when it owns the controls.
@@ -1589,14 +1582,7 @@ impl WinitWindowAdapter {
                 // On the html canvas, we don't get the mouse move or release event when outside the canvas. So we have no choice but canceling the event
                 if cfg!(target_arch = "wasm32") || !self.pressed.get() {
                     self.pressed.set(false);
-                    if Self::render_owns_controls() {
-                        self.drive_render_control_state(
-                            PointerPhase::Exited,
-                            self.cursor_pos.get(),
-                        );
-                    } else {
-                        self.dispatch_internal_event(BackendMouseEvent::Exit);
-                    }
+                    self.dispatch_pointer_event(BackendMouseEvent::Exit);
                 }
             }
             WinitWindowEvent::MouseWheel { delta, phase, .. } => {
@@ -1608,7 +1594,7 @@ impl WinitWindowAdapter {
                     }
                 };
                 let phase = winit_touch_phase(phase);
-                self.dispatch_internal_event(BackendMouseEvent::Wheel {
+                self.dispatch_pointer_event(BackendMouseEvent::Wheel {
                     position: self.cursor_pos.get(),
                     delta_x,
                     delta_y,
@@ -1651,19 +1637,10 @@ impl WinitWindowAdapter {
                         }
                     }
                 };
-                // The render thread owns the controls: the UI thread resolves
-                // the press against them and reports the state, instead of
-                // replaying the event into a tree that is not on screen.
-                if Self::render_owns_controls() {
-                    let phase = if state == winit::event::ElementState::Pressed {
-                        PointerPhase::Pressed
-                    } else {
-                        PointerPhase::Released
-                    };
-                    self.drive_render_control_state(phase, self.cursor_pos.get());
-                    return Ok(());
-                }
-                self.dispatch_internal_event(ev);
+                // The render thread owns the controls, so the press goes there
+                // whole: which button it was and how many clicks in a row are
+                // both things only the tree can act on.
+                self.dispatch_pointer_event(ev);
             }
             WinitWindowEvent::Touch(touch) => {
                 let location = touch.location.to_logical(runtime_window.scale_factor() as f64);
@@ -1685,7 +1662,7 @@ impl WinitWindowAdapter {
                     }
                 };
                 if let Some(finger_id) = finger_id {
-                    self.dispatch_internal_event(corelib::platform::InternalEvent::Touch {
+                    self.dispatch_pointer_event(corelib::platform::InternalEvent::Touch {
                         id: finger_id,
                         position,
                         phase: winit_touch_phase(touch.phase),
@@ -1722,7 +1699,7 @@ impl WinitWindowAdapter {
             // known cursor position as the best available approximation. On macOS
             // trackpads, CursorMoved events typically precede gesture events.
             WinitWindowEvent::PinchGesture { delta, phase, .. } => {
-                self.dispatch_internal_event(BackendMouseEvent::PinchGesture {
+                self.dispatch_pointer_event(BackendMouseEvent::PinchGesture {
                     position: self.cursor_pos.get(),
                     delta: delta as f32,
                     phase: winit_touch_phase(phase),
@@ -1731,7 +1708,7 @@ impl WinitWindowAdapter {
             WinitWindowEvent::RotationGesture { delta, phase, .. } => {
                 // macOS/winit: positive = counterclockwise. Negate to match
                 // Slint convention (positive = clockwise).
-                self.dispatch_internal_event(BackendMouseEvent::RotationGesture {
+                self.dispatch_pointer_event(BackendMouseEvent::RotationGesture {
                     position: self.cursor_pos.get(),
                     delta: -delta,
                     phase: winit_touch_phase(phase),

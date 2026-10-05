@@ -32,9 +32,9 @@ use i_slint_core::graphics::Color;
 use i_slint_core::input::{BackendMouseEvent, InternalKeyEvent, PointerEventButton};
 use i_slint_core::item_tree::ItemRc;
 use i_slint_core::lengths::LogicalPoint;
-use i_slint_core::platform::WindowEvent;
 #[cfg(feature = "renderer-femtovg")]
 use i_slint_core::platform::{Clipboard, Platform, PlatformError};
+use i_slint_core::platform::{WindowEvent, WindowEventDispatchResult};
 use i_slint_core::window::{WindowAdapter, WindowInner};
 
 // Brings the extension traits that give `PossiblyCurrentContext` and
@@ -335,6 +335,20 @@ pub enum RenderMessage {
         /// Reply channel: `true` when an item consumed the key.
         response: std::sync::mpsc::SyncSender<bool>,
     },
+    /// Hand one pointer event to the tree that owns the controls.
+    ///
+    /// The pointer belongs to the thread that talks to the OS, so the UI
+    /// thread is the one that hears the press, the move, the wheel, the finger
+    /// on the screen and the button that was not the left one. What any of that *means* -- a click, a
+    /// drag, a scroll, a context menu -- is decided by items, and the items are
+    /// on this thread. So the event travels whole instead of as a guess about
+    /// which property to poke: the tree hit-tests, tracks the grab and answers
+    /// it exactly as it would for a window it drew itself.
+    PointerToRenderControl {
+        /// The event in the runtime's own representation, with the position the
+        /// UI thread resolved from the OS coordinates.
+        event: i_slint_core::platform::InternalEvent,
+    },
     /// Re-encode the render thread's mirror component and re-present it.  An
     /// explicit redraw command; also used implicitly after every property
     /// assignment and control-state change.
@@ -577,6 +591,22 @@ impl RenderHost {
             .sender
             .send(RenderMessage::KeyToRenderControl { event: event.clone(), response: tx });
         rx.recv().unwrap_or(false)
+    }
+
+    /// Offer a pointer event to the tree on the render thread.
+    ///
+    /// Returns `false` when no component is attached, so the caller can hand
+    /// the event to its own tree instead. Nothing blocks here: a pointer moves
+    /// at the rate the device reports, and the tree answers a move by
+    /// repainting rather than by returning a value.
+    pub fn send_pointer_event_to_control(
+        &self,
+        event: i_slint_core::platform::InternalEvent,
+    ) -> bool {
+        if !self.attached.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        self.sender.send(RenderMessage::PointerToRenderControl { event }).is_ok()
     }
 
     /// Borrow the render-owned control identified by `id` and assign one of
@@ -1257,6 +1287,23 @@ impl RenderCore {
                         // A key that a `TextInput` took changed its text, and the
                         // `accepted` handler that goes with it may have changed the
                         // rest of the application.
+                        present |= used;
+                    }
+                    RenderMessage::PointerToRenderControl { event } => {
+                        // The tree on this thread hit-tests the point, keeps the
+                        // grab and decides what the event means, so the dispatch
+                        // goes through the window like any other input. A press
+                        // the tree took changes what it draws (pressed, hovered,
+                        // scrolled, a menu that just opened), which is why an
+                        // accepted event is followed by a frame.
+                        let used = render_window_adapter.as_ref().is_some_and(|adapter| {
+                            matches!(
+                                adapter
+                                    .window()
+                                    .dispatch_event_with_result(WindowEvent::internal(event)),
+                                Ok(WindowEventDispatchResult::Accepted)
+                            )
+                        });
                         present |= used;
                     }
                     RenderMessage::HitTest { x, y, response } => {
