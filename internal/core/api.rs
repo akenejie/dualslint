@@ -500,6 +500,34 @@ impl Window {
         Self(WindowInner::new(window_adapter_weak))
     }
 
+    /// Run `task` against the tree this window shows, on the thread that tree
+    /// lives on, and return what it returned.
+    ///
+    /// Generated code calls this for a window-rooted component's callbacks. A
+    /// backend can draw a tree of its own, in which case the component the
+    /// caller holds is not the one on screen, and the call belongs to the tree
+    /// that is: that is where the bindings and callbacks that decide what the
+    /// call looks like live.
+    #[doc(hidden)]
+    pub fn call_on_screen_tree<Ret: Send + Default + 'static>(
+        &self,
+        local_tree: crate::item_tree::ItemTreeRc,
+        task: impl FnOnce(&crate::item_tree::ItemTreeRc) -> Ret + Send + 'static,
+    ) -> Ret {
+        // The value travels back over a channel because the task may run on
+        // another thread. A callback that panics there takes the sender with it,
+        // which is what `unwrap_or_default` reports: a callback that did not
+        // return has no value to hand back.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        WindowInner::from_pub(self).window_adapter().run_on_screen_tree(
+            local_tree,
+            Box::new(move |tree| {
+                let _ = sender.send(task(tree));
+            }),
+        );
+        receiver.recv().unwrap_or_default()
+    }
+
     /// Shows the window on the screen. An additional strong reference on the
     /// associated component is maintained while the window is visible.
     ///

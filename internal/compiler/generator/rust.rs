@@ -373,10 +373,22 @@ fn generate_public_component(
         argument_types: &[],
     };
 
+    // A component rooted in a window can ask that window which tree it shows, so
+    // its calls follow the tree that is drawn. A tray icon is not a window, and
+    // a component without a window has nothing to ask.
+    let call_target = match llr.top_level_type {
+        llr::TopLevelComponentType::Window => CallTarget::ScreenTree {
+            window: quote!(<#public_component_id as slint::ComponentHandle>::window(self)),
+            inner_component: quote!(#inner_component_id),
+        },
+        llr::TopLevelComponentType::SystemTrayIcon => CallTarget::OwnTree,
+    };
+
     let property_and_callback_accessors = public_api(
         &llr.public_properties,
         &llr.private_properties,
         quote!(sp::VRc::as_pin_ref(&self.0)),
+        &call_target,
         &ctx,
     );
 
@@ -1131,11 +1143,86 @@ fn access_callback_tracker(
     }
 }
 
+/// Whether a value of this type can travel to another thread and back.
+///
+/// A call that reaches the tree another thread draws carries its arguments with
+/// it and brings a value back, so what it moves has to be `Send`, and what
+/// comes back has to be able to say "nothing came back" with a `Default`. These
+/// are the basic types, which are; a model is not, because it is a shared `Rc`
+/// that belongs to the tree it was made for.
+fn is_thread_portable_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Void
+            | Type::Int32
+            | Type::Float32
+            | Type::Bool
+            | Type::String
+            | Type::Color
+            | Type::Keys
+            | Type::Percent
+            | Type::Angle
+            | Type::Duration
+            | Type::PhysicalLength
+            | Type::LogicalLength
+            | Type::Rem
+    )
+}
+
+/// Which tree an exported component's calls run against.
+enum CallTarget {
+    /// The call runs against the tree the caller holds, which is the tree that
+    /// is drawn.
+    OwnTree,
+    /// The call runs against the tree the window shows, on the thread that tree
+    /// lives on. A backend can draw a tree of its own, and then the component
+    /// the caller holds is not the one on screen, so a call that opens a window
+    /// or changes a property has to be carried there to reach the bindings and
+    /// callbacks that decide what it looks like.
+    ///
+    /// Only a component rooted in a window has a window to ask, and only a
+    /// component whose call carries nothing a thread cannot share can make the
+    /// trip: the arguments cross with it and the return value comes back.
+    ScreenTree { window: TokenStream, inner_component: TokenStream },
+}
+
+impl CallTarget {
+    /// The statements a call runs, given the code that reaches the component.
+    fn wrap(&self, call: TokenStream) -> TokenStream {
+        match self {
+            CallTarget::OwnTree => call,
+            CallTarget::ScreenTree { window, inner_component } => quote! {
+                #window.call_on_screen_tree(
+                    sp::VRc::into_dyn(self.0.clone()),
+                    move |tree| {
+                        // The tree on screen is this component, and the caller's
+                        // is not, so the access goes to whichever one ran it.
+                        let component = sp::VRc::map_dyn(tree.clone(), |tree| {
+                            sp::VRef::downcast_pin::<#inner_component>(tree)
+                                .expect("the tree on screen is not the component the call belongs to")
+                        });
+                        let _self = component.as_pin_ref();
+                        #call
+                    },
+                )
+            },
+        }
+    }
+
+    /// Whether a call of these types can be moved to the tree on screen.
+    fn takes(&self, args: &[Type], ret: &Type) -> bool {
+        matches!(self, CallTarget::ScreenTree { .. })
+            && is_thread_portable_type(ret)
+            && args.iter().all(is_thread_portable_type)
+    }
+}
+
 /// Public API for Global and root component
 fn public_api(
     public_properties: &llr::PublicProperties,
     private_properties: &llr::PrivateProperties,
     self_init: TokenStream,
+    call_target: &CallTarget,
     ctx: &EvaluationContext,
 ) -> TokenStream {
     let mut property_and_callback_accessors: Vec<TokenStream> = Vec::new();
@@ -1149,11 +1236,19 @@ fn public_api(
             let args_name =
                 (0..callback.args.len()).map(|i| format_ident!("arg_{}", i)).collect::<Vec<_>>();
             let caller_ident = accessor_names::rust_accessor_ident(name, AccessorKind::Invoker);
+            let call = quote!(#prop.call(&(#(#args_name,)*)));
+            let call = if call_target.takes(&callback.args, &callback.return_type) {
+                call_target.wrap(call)
+            } else {
+                quote!(
+                    let _self = #self_init;
+                    #call
+                )
+            };
             property_and_callback_accessors.push(quote!(
                 #[allow(dead_code)]
                 pub fn #caller_ident(&self, #(#args_name : #callback_args,)*) -> #return_type {
-                    let _self = #self_init;
-                    #prop.call(&(#(#args_name,)*))
+                    #call
                 }
             ));
             let on_ident = accessor_names::rust_accessor_ident(name, AccessorKind::Handler);
@@ -1179,11 +1274,19 @@ fn public_api(
             let args_name =
                 (0..function.args.len()).map(|i| format_ident!("arg_{}", i)).collect::<Vec<_>>();
             let caller_ident = accessor_names::rust_accessor_ident(name, AccessorKind::Invoker);
+            let call = quote!(#prop(#(#args_name,)*));
+            let call = if call_target.takes(&function.args, &function.return_type) {
+                call_target.wrap(call)
+            } else {
+                quote!(
+                    let _self = #self_init;
+                    #call
+                )
+            };
             property_and_callback_accessors.push(quote!(
                 #[allow(dead_code)]
                 pub fn #caller_ident(&self, #(#args_name : #callback_args,)*) -> #return_type {
-                    let _self = #self_init;
-                    #prop(#(#args_name,)*)
+                    #call
                 }
             ));
         } else {
@@ -2211,6 +2314,7 @@ fn generate_global(
             &global.public_properties,
             &global.private_properties,
             quote!(self.0.as_ref()),
+            &CallTarget::OwnTree,
             &ctx,
         );
         let aliases = global.aliases.iter().map(|name| ident(name));

@@ -143,6 +143,32 @@ pub trait WindowAdapter {
     /// In your implementation you should return a reference to an instance of one of the renderers provided by Slint.
     fn renderer(&self) -> &dyn Renderer;
 
+    /// Run `task` against the tree this window shows, on the thread that tree
+    /// lives on, and wait until it has finished.
+    ///
+    /// A backend that draws a tree of its own runs the task there, with that
+    /// tree. The caller only holds the tree it built, and after a handover that
+    /// is not the tree on screen, so a call that changes a property or opens a
+    /// window has to reach the one that is: it is the tree whose bindings and
+    /// callbacks decide what the change looks like.
+    ///
+    /// `local_tree` is the caller's own tree, and the default implementation
+    /// runs the task right here with it, which is what a backend whose tree
+    /// belongs to this thread wants. The task must run exactly once either way,
+    /// so an adapter that cannot post it runs it locally.
+    ///
+    /// The task gets the tree rather than a window, because the tree is what
+    /// generated code has to reach a property of the component it belongs to,
+    /// and it is the tree that says which component that is.
+    #[doc(hidden)]
+    fn run_on_screen_tree(
+        &self,
+        local_tree: ItemTreeRc,
+        task: Box<dyn FnOnce(&ItemTreeRc) + Send + 'static>,
+    ) {
+        task(&local_tree);
+    }
+
     /// Re-implement this function to update the properties such as window title or layout constraints.
     ///
     /// This function is called before `set_visible(true)`, and will be called again when the properties
