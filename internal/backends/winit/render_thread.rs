@@ -2523,7 +2523,7 @@ pub extern "C" fn slint_render_thread_request_redraw() {
 // fixed; it is defined next to the enum it mirrors, in the scene crate.
 // ---------------------------------------------------------------------------
 
-/// Borrow the control under the logical point `(x, y)`.
+/// Borrow the control under the logical point `(x, y)`, using the active host.
 ///
 /// Returns the control id, or `0` when the point is over no control or nothing
 /// has been composited yet.  Control ids are never `0`, so `0` is unambiguous
@@ -2534,7 +2534,7 @@ pub extern "C" fn slint_render_thread_control_at(x: f32, y: f32) -> u64 {
     active_host().and_then(|host| host.control_at(x, y)).unwrap_or(0)
 }
 
-/// Like [`slint_render_thread_control_at`], but waits for the render thread to
+/// Like [`slint_render_thread_control_at`] but uses the active host and waits
 /// answer from the control tree as it stands now rather than from the last
 /// composited frame.  Use this when the answer has to be current, such as
 /// resolving a click.
@@ -2543,7 +2543,7 @@ pub extern "C" fn slint_render_thread_hit_test(x: f32, y: f32) -> u64 {
     active_host().and_then(|host| host.hit_test(x, y)).unwrap_or(0)
 }
 
-/// Assign one property of a borrowed control, blocking until the render thread
+/// Assign one property on the active host's tree, blocking until
 /// confirms it.  Returns whether the property name resolved and the value was
 /// applied.
 ///
@@ -2585,7 +2585,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Read one of a borrowed control's properties, blocking until the render
+/// Read one property on the active host's tree, blocking until
 /// thread answers.  Writes the value into `out` and returns whether the id and
 /// the property name resolved.
 ///

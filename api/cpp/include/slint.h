@@ -26,11 +26,17 @@
 #    include <memory>
 #endif
 
-/// Request a window repaint through the render thread; see
-/// `slint::render_thread::request_redraw()`.
+/// Request a repaint through the render thread; see `slint::render_thread::request_redraw()`.
 extern "C" void slint_render_thread_request_redraw();
 
+/// Get control under point (x,y) in logical coordinates, using the *active host*
+/// (the focused window's render host). When no window is focused, falls back to
+/// the single host if only one exists. Coordinates are in window space.
+/// Reads last composited geometry (non-blocking).
 extern "C" uint64_t slint_render_thread_control_at(float x, float y);
+
+/// Like control_at but resolves against current tree on the render thread (blocking).
+/// Uses the *active host* as above.
 extern "C" uint64_t slint_render_thread_hit_test(float x, float y);
 extern "C" void slint_render_thread_apply_control_state(uint64_t id, bool hovered, bool pressed);
 /// Creates a component on the calling (render) thread and returns the address
