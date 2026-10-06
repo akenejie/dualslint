@@ -20,7 +20,6 @@ use i_slint_core::cursor::{MouseCursorInner, scaled_hotspot};
 use i_slint_core::lengths::{PhysicalPx, ScaleFactor};
 #[cfg(muda)]
 use i_slint_core::menus::MenuVTable;
-use i_slint_core::renderer::DrawOutcome;
 use winit::event_loop::ActiveEventLoop;
 #[cfg(target_arch = "wasm32")]
 use winit::platform::web::WindowExtWebSys;
@@ -454,10 +453,30 @@ pub struct WinitWindowAdapter {
     /// Whether a *mouse* button is currently pressed. Touch input is handled
     /// separately via `process_touch_input` and does not affect this flag.
     pressed: Cell<bool>,
+    /// The render-thread control the pointer is over, and the one with the press.
+    ///
+    /// These are the UI thread's own answers, kept because it is the thread that
+    /// resolves a pointer against the published geometry: it knows what is
+    /// hovered and what is pressed so that a release can tell a click from a
+    /// drag away.  Neither is a copy of anything the render thread holds -- the
+    /// render thread is told the result as two property assignments.
+    render_hovered: Cell<Option<u64>>,
+    render_pressed: Cell<Option<u64>>,
     current_resize_direction: Cell<Option<ResizeDirection>>,
     /// Allocates small i32 finger ids for iOS's pointer-valued touch ids.
     #[cfg(target_os = "ios")]
     touch_finger_ids: RefCell<crate::ios::TouchFingerIdAllocator>,
+}
+
+/// What the UI thread resolved a pointer event to be.
+///
+/// The button is carried along because the release has to end the press it
+/// began, and naming it on both is cheaper than remembering it separately.
+#[derive(Clone, Copy)]
+enum PointerAction {
+    Moved,
+    Pressed(PointerEventButton),
+    Released(PointerEventButton),
 }
 
 impl WinitWindowAdapter {
@@ -506,6 +525,8 @@ impl WinitWindowAdapter {
             custom_cursor_source: Cell::new(None),
             cursor_pos: Default::default(),
             pressed: Default::default(),
+            render_hovered: Default::default(),
+            render_pressed: Default::default(),
             current_resize_direction: Default::default(),
             #[cfg(target_os = "ios")]
             touch_finger_ids: Default::default(),
@@ -870,6 +891,18 @@ impl WinitWindowAdapter {
     }
 
     /// Draw the items of the specified `component` in the given window.
+    /// This thread does not draw.  It is the UI thread: it talks to the OS, and
+    /// the screen belongs to the render thread.
+    ///
+    /// So there is no frame here to encode.  What there is instead is the
+    /// handover, which this thread owes the render thread and must not postpone
+    /// by painting in the meantime: the request goes out, the answer is waited
+    /// for, the window's graphics are released, and the render thread puts the
+    /// first frame on the screen.
+    ///
+    /// A window the render thread will not take stays blank and says why.  That
+    /// is the deliberate trade: the alternative is a frame drawn here, which is
+    /// the one thing this fork does not do.
     pub fn draw(&self) -> Result<(), PlatformError> {
         if matches!(self.shown.get(), WindowVisibility::Hidden) {
             return Ok(()); // caller bug, doesn't make sense to call draw() when not shown
@@ -878,18 +911,28 @@ impl WinitWindowAdapter {
         self.pending_redraw.set(false);
 
         // The render thread has this window's graphics context and is drawing
-        // it. Presenting here as well would be two threads fighting over one
+        // it.  Presenting here as well would be two threads fighting over one
         // window, so the tree on this side waits to be drawn by whoever is left
         // when the window is shown again.
         if self.graphics_handed_over.get() {
             return Ok(());
         }
 
-        // About to draw on this thread, which is the one thing this thread must
-        // not do, so give the render thread this window before doing it.
-        // The handover takes a round trip through the event loop, so this frame
-        // is still drawn here and the next ones are not.
-        crate::render_thread::take_over_drawing_of(self.window());
+        if !crate::render_thread::take_over_drawing_of(self.window()) {
+            return Ok(());
+        }
+
+        // A window that is not on screen yet cannot be asked about, because it
+        // has no native window to name.  Its handover waits for the window to
+        // exist, which the render thread does on its own: it keeps the request
+        // until it can name a window to draw into.
+        if let Some(window_id) = self.winit_window().map(|window| window.id())
+            && let Some(host) = crate::render_thread::host()
+            && host.await_graphics(window_id)
+        {
+            self.hand_over_graphics();
+            host.notify_graphics_released(window_id);
+        }
 
         if let Some(winit_window) = self.winit_window_or_none.borrow().as_window() {
             // on macOS we sometimes don't get a resize event after calling
@@ -900,13 +943,6 @@ impl WinitWindowAdapter {
             if self.pending_resize_event_after_show.take() {
                 self.resize_event(winit_window.surface_size())?;
             }
-        }
-
-        let renderer = self.renderer();
-        if !matches!(renderer.render(self.window())?, DrawOutcome::Success) {
-            // Frame was skipped (e.g. surface occluded). pending_redraw was already
-            // cleared above, so re-arm it so we try again.
-            self.request_redraw();
         }
 
         Ok(())
@@ -925,6 +961,12 @@ impl WinitWindowAdapter {
     /// releases what it holds, and this window stops drawing: from here the
     /// render thread is the thread that draws it.
     pub(crate) fn hand_over_graphics(&self) {
+        // Asked twice is asked once: the release drops a graphics context, and
+        // the handover completes through more than one path, so this has to be
+        // safe to arrive at again.
+        if self.graphics_handed_over.get() {
+            return;
+        }
         self.renderer.hand_over_graphics();
         self.graphics_handed_over.set(true);
     }
@@ -1328,22 +1370,194 @@ impl WinitWindowAdapter {
     /// and a slider follow a drag -- all of which are more than a property the
     /// UI thread could have set on the item's behalf.
     ///
-    /// Returns `true` when the render thread took the event. With nothing
-    /// attached the event goes to this window's own tree, which is then the one
-    /// on screen.
+    /// Turn an OS pointer event into property changes on the render thread's
+    /// tree, and report whether the render thread is the one that has them.
+    ///
+    /// This is the whole of the UI thread's part in a pointer, and it stops at
+    /// naming a control.
+    ///
+    /// The event arrives as a position and a button.  The geometry the render
+    /// thread published says which control owns that position, and from there
+    /// the UI thread knows three things and no more: which control is hovered,
+    /// which one is pressed, and whether the release landed on the control that
+    /// was pressed.  The first two are assignments to the `has-hover` and
+    /// `pressed` properties the controls already have; the third is a statement
+    /// that this control was pressed and then released.
+    ///
+    /// What that means stays on the render thread, because it is the
+    /// application's: which handler answers, what a `checked` property becomes,
+    /// what a popup opens.  That is why nothing here has to know what a widget
+    /// is, and why a component written after this was written still works.
+    ///
+    /// Returns `false` when no render thread owns this window, so the caller can
+    /// fall back to its own tree.
     pub(crate) fn dispatch_pointer_event(
         &self,
         event: impl Into<corelib::platform::InternalEvent>,
     ) -> bool {
         let event = event.into();
-        if Self::render_owns_controls()
-            && crate::render_thread::host()
-                .is_some_and(|host| host.send_pointer_event_to_control(event.clone()))
+        if !Self::render_owns_controls()
+            || !crate::render_thread::host()
+                .is_some_and(|host| self.apply_pointer_to_render_controls(&host, &event))
         {
-            return true;
+            self.dispatch_internal_event(event);
+            return false;
         }
-        self.dispatch_internal_event(event);
-        false
+        true
+    }
+
+    /// The pointer, resolved against the published geometry.
+    fn apply_pointer_to_render_controls(
+        &self,
+        host: &crate::render_thread::RenderHost,
+        event: &corelib::platform::InternalEvent,
+    ) -> bool {
+        use corelib::platform::InternalEvent as Ev;
+        // A finger and a mouse are the same question written twice: where is it
+        // pointing, and is it down, moving or up.  The phases are the two
+        // spellings of that, so they are named here once and the rest of the
+        // function never has to know which device it came from.
+        let (position, action) = match event {
+            Ev::Mouse(BackendMouseEvent::Moved { position, .. }) => {
+                (*position, PointerAction::Moved)
+            }
+            Ev::Mouse(BackendMouseEvent::Pressed { position, button, .. }) => {
+                (*position, PointerAction::Pressed(*button))
+            }
+            Ev::Mouse(BackendMouseEvent::Released { position, button, .. }) => {
+                (*position, PointerAction::Released(*button))
+            }
+            Ev::Mouse(BackendMouseEvent::Wheel { position, delta_x, delta_y, .. }) => {
+                return self.scroll_render_control(host, *position, *delta_x, *delta_y);
+            }
+            Ev::Mouse(BackendMouseEvent::PinchGesture { position, delta, .. }) => {
+                return self.pinch_render_control(host, *position, *delta);
+            }
+            Ev::Mouse(BackendMouseEvent::RotationGesture { position, delta, .. }) => {
+                return self.rotate_render_control(host, *position, *delta);
+            }
+            Ev::Mouse(BackendMouseEvent::Exit) => {
+                // The pointer left the window, so nothing under it is hovered and
+                // nothing is held.
+                self.set_render_hover(host, None);
+                self.set_render_pressed(host, None);
+                return true;
+            }
+            Ev::Touch { position, phase, .. } => match phase {
+                corelib::input::TouchPhase::Started => {
+                    (*position, PointerAction::Pressed(PointerEventButton::Left))
+                }
+                corelib::input::TouchPhase::Moved => (*position, PointerAction::Moved),
+                corelib::input::TouchPhase::Ended => {
+                    (*position, PointerAction::Released(PointerEventButton::Left))
+                }
+                corelib::input::TouchPhase::Cancelled => {
+                    // A cancelled gesture never had a click in it.
+                    self.set_render_pressed(host, None);
+                    return true;
+                }
+            },
+            _ => return false,
+        };
+        let target = host.control_at(position.x, position.y);
+        match action {
+            // A press brings the hover with it, because the control that is held
+            // is also the one the pointer is on.
+            PointerAction::Pressed(button) => {
+                self.set_render_hover(host, target);
+                self.set_render_pressed(host, target);
+                // The press is the grab and the focus, and nothing else: whether
+                // the release that follows lands here is what makes a click.
+                if let Some(id) = target {
+                    host.press_control(id, button);
+                }
+            }
+            PointerAction::Moved => {
+                self.set_render_hover(host, target);
+            }
+            PointerAction::Released(button) => {
+                // The release ends the hold on whichever control held it.  A
+                // release that ends it on the same control is a click, and what
+                // the click is worth is the tree's to decide, because that is
+                // the application's own code.
+                if let Some(pressed) = self.render_pressed.replace(None) {
+                    host.release_control(pressed, button);
+                    host.apply_control_state(
+                        pressed,
+                        self.render_hovered.get() == Some(pressed),
+                        false,
+                    );
+                }
+                self.set_render_hover(host, target);
+            }
+        }
+        true
+    }
+
+    /// Move the hover, which is a property on the control that had it and on the
+    /// one that has it now.
+    fn set_render_hover(&self, host: &crate::render_thread::RenderHost, target: Option<u64>) {
+        if self.render_hovered.get() == target {
+            return;
+        }
+        if let Some(previous) = self.render_hovered.replace(target) {
+            host.apply_control_state(previous, false, self.render_pressed.get() == Some(previous));
+        }
+        if let Some(target) = target {
+            host.apply_control_state(target, true, self.render_pressed.get() == Some(target));
+        }
+    }
+
+    /// Move the press, which is a property too.
+    fn set_render_pressed(&self, host: &crate::render_thread::RenderHost, target: Option<u64>) {
+        if self.render_pressed.get() == target {
+            return;
+        }
+        if let Some(previous) = self.render_pressed.replace(target) {
+            host.apply_control_state(previous, self.render_hovered.get() == Some(previous), false);
+        }
+        if let Some(target) = target {
+            host.apply_control_state(target, self.render_hovered.get() == Some(target), true);
+        }
+    }
+
+    /// A wheel belongs to the control under the pointer, and scrolling it is
+    /// something the tree answers: which of its areas moves, and by how much.
+    fn scroll_render_control(
+        &self,
+        host: &crate::render_thread::RenderHost,
+        position: LogicalPoint,
+        delta_x: f32,
+        delta_y: f32,
+    ) -> bool {
+        match host.control_at(position.x, position.y) {
+            Some(id) => host.scroll_control(id, delta_x, delta_y),
+            None => true,
+        }
+    }
+
+    fn pinch_render_control(
+        &self,
+        host: &crate::render_thread::RenderHost,
+        position: LogicalPoint,
+        delta: f32,
+    ) -> bool {
+        match host.control_at(position.x, position.y) {
+            Some(id) => host.pinch_control(id, delta),
+            None => true,
+        }
+    }
+
+    fn rotate_render_control(
+        &self,
+        host: &crate::render_thread::RenderHost,
+        position: LogicalPoint,
+        delta: f32,
+    ) -> bool {
+        match host.control_at(position.x, position.y) {
+            Some(id) => host.rotate_control(id, delta),
+            None => true,
+        }
     }
 
     /// Hand a key to the tree on the render thread, when it owns the controls.
@@ -1885,6 +2099,39 @@ impl WinitWindowAdapter {
 impl WindowAdapter for WinitWindowAdapter {
     fn window(&self) -> &corelib::api::Window {
         &self.window
+    }
+
+    /// Hand an application's call to the tree this thread draws.
+    ///
+    /// A call comes from application code, which runs where the application put
+    /// it -- here, on the UI thread, or on whatever thread it owns. What decides
+    /// where the call *lands* is which tree is on screen, and after a handover
+    /// that is the one on the render thread: a callback that opens a popup or
+    /// sets a property has to run against the bindings and callbacks the user
+    /// is looking at, not against a tree nothing draws. So the call is posted
+    /// there and waited for, and the tree this adapter holds is what runs it
+    /// when there is no handover and this tree is the one on screen.
+    fn run_on_screen_tree(
+        &self,
+        local_tree: i_slint_core::item_tree::ItemTreeRc,
+        task: Box<dyn FnOnce(&i_slint_core::item_tree::ItemTreeRc) + Send + 'static>,
+    ) {
+        // A call that comes from the render thread itself -- a callback of the
+        // tree it draws, calling into another component -- is already where it
+        // belongs. Posting it would wait for an event loop that this thread is,
+        // and it is the one making the call.
+        if Self::render_owns_controls()
+            && !crate::render_thread::on_render_thread()
+            && let Some(host) = crate::render_thread::host()
+        {
+            match host.run_on_screen_tree(task) {
+                Ok(()) => return,
+                // The render thread did not take the call, so it is still ours
+                // to run against the tree this window holds.
+                Err(task) => return task(&local_tree),
+            }
+        }
+        task(&local_tree);
     }
 
     fn renderer(&self) -> &dyn i_slint_core::renderer::Renderer {

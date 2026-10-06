@@ -76,12 +76,16 @@ mod renderer {
     use std::sync::Arc;
 
     use i_slint_core::platform::PlatformError;
-    use i_slint_core::renderer::DrawOutcome;
     use winit::event_loop::ActiveEventLoop;
 
+    /// The renderers the UI thread creates, one per window, to hold what a
+    /// window needs while the render thread is not holding it.
+    ///
+    /// There is no way to draw one of these.  The method that would draw it is
+    /// not part of this trait, so the UI thread cannot put a frame on the screen
+    /// even by accident: the renderer exists to be released to the render
+    /// thread, and a thread that only holds a window is not a thread that draws.
     pub trait WinitCompatibleRenderer: std::any::Any {
-        fn render(&self, window: &i_slint_core::api::Window) -> Result<DrawOutcome, PlatformError>;
-
         fn as_core_renderer(&self) -> &dyn i_slint_core::renderer::Renderer;
         // Got WindowEvent::Occluded
         fn occluded(&self, _: bool) {}

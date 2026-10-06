@@ -154,10 +154,6 @@ impl WinitSkiaRenderer {
 }
 
 impl super::WinitCompatibleRenderer for WinitSkiaRenderer {
-    fn render(&self, _window: &i_slint_core::api::Window) -> Result<DrawOutcome, PlatformError> {
-        self.renderer.render()
-    }
-
     fn as_core_renderer(&self) -> &dyn i_slint_core::renderer::Renderer {
         &self.renderer
     }

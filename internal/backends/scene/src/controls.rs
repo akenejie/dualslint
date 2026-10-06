@@ -26,7 +26,7 @@ use i_slint_core::item_rendering::{
 use i_slint_core::item_tree::ItemRc;
 use i_slint_core::items::{Clip, Layer, Opacity};
 use i_slint_core::lengths::{
-    LogicalBorderRadius, LogicalRect, LogicalSize, LogicalVector, ScaleFactor,
+    LogicalBorderRadius, LogicalPoint, LogicalRect, LogicalSize, LogicalVector, ScaleFactor,
 };
 use i_slint_core::platform::PlatformError;
 use i_slint_core::window::WindowInner;
@@ -72,12 +72,16 @@ impl<'a> ControlEncoder<'a> {
     /// pixels, taken from the laid-out item so that the published rectangle is
     /// the one the user can point at rather than the one that happened to be
     /// drawn.
-    fn push_control(&mut self, item: &ItemRc) {
+    fn push_control(&mut self, item: &ItemRc, origin: LogicalPoint) {
         let geometry = item.geometry();
         if geometry.size.is_empty() {
             return;
         }
-        let window_origin = item.map_to_window(geometry.origin);
+        // A popup is a tree of its own that the window draws at an offset, so
+        // the item's own position is relative to the popup and the published
+        // rectangle carries the offset. Everything downstream hit-tests in the
+        // coordinates of the window the pointer is in.
+        let window_origin = origin + item.map_to_window(geometry.origin).to_vector();
         let id = item_rc_as_id(item);
         self.controls
             .push(ControlRegion { id, geometry: LogicalRect::new(window_origin, geometry.size) });
@@ -93,7 +97,11 @@ impl<'a> ControlEncoder<'a> {
     /// rather than by watching the draw calls, and the walk runs back to front
     /// so that a later entry paints over an earlier one — which lets the
     /// hit-test take the last match as the topmost control.
-    fn collect_interactive_controls(&mut self, component: &i_slint_core::item_tree::ItemTreeRc) {
+    fn collect_interactive_controls(
+        &mut self,
+        component: &i_slint_core::item_tree::ItemTreeRc,
+        origin: LogicalPoint,
+    ) {
         i_slint_core::item_tree::visit_items(
             component,
             i_slint_core::item_tree::TraversalOrder::BackToFront,
@@ -108,7 +116,7 @@ impl<'a> ControlEncoder<'a> {
                     || item_rc.downcast::<i_slint_core::items::FocusScope>().is_some()
                     || item_rc.downcast::<i_slint_core::items::TextInput>().is_some();
                 if interactive {
-                    self.push_control(&item_rc);
+                    self.push_control(&item_rc, origin);
                 }
                 i_slint_core::item_tree::ItemVisitorResult::Continue(())
             },
@@ -316,6 +324,10 @@ pub fn encode_window_controls(
     let mut encoder = ControlEncoder::new(window_inner);
 
     window_inner.draw_contents(|components, post_render| {
+        // Every tree the window draws is walked for controls, not just its own:
+        // a menu is a popup tree of its own, and its items are controls the user
+        // points at like any other. They come after the window's own items, so
+        // the hit-test takes them first and the menu is on top where it is drawn.
         for (component, origin) in components {
             if let Some(component) = i_slint_core::item_tree::ItemTreeWeak::upgrade(component) {
                 i_slint_core::item_rendering::render_component_items(
@@ -324,16 +336,13 @@ pub fn encode_window_controls(
                     *origin,
                     &window_adapter,
                 );
+                // After that tree's draw pass, so that the interactive items are
+                // visited whether or not they contributed a draw command.
+                encoder.collect_interactive_controls(&component, *origin);
             }
         }
         post_render(&mut encoder);
     });
-
-    // After the draw pass, so that the interactive items are visited whether or
-    // not they contributed a draw command.
-    if let Some(window_item_rc) = window_inner.window_item_rc() {
-        encoder.collect_interactive_controls(window_item_rc.item_tree());
-    }
 
     Ok(encoder.finish())
 }

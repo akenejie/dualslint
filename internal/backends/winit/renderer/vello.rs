@@ -38,10 +38,6 @@ impl WinitVelloRenderer {
 }
 
 impl WinitCompatibleRenderer for WinitVelloRenderer {
-    fn render(&self, _window: &i_slint_core::api::Window) -> Result<DrawOutcome, PlatformError> {
-        self.renderer.render()
-    }
-
     fn as_core_renderer(&self) -> &dyn Renderer {
         &self.renderer
     }

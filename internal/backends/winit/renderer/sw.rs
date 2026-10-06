@@ -3,11 +3,7 @@
 
 //! Delegate the rendering to the [`i_slint_renderer_software::SoftwareRenderer`]
 
-use core::num::NonZeroU32;
-use core::ops::DerefMut;
-use i_slint_core::graphics::Rgb8Pixel;
 use i_slint_core::platform::PlatformError;
-use i_slint_core::renderer::DrawOutcome;
 pub use i_slint_renderer_software::SoftwareRenderer;
 use i_slint_renderer_software::{PremultipliedRgbaColor, RepaintBufferType, TargetPixel};
 use std::cell::RefCell;
@@ -25,9 +21,14 @@ pub struct WinitSoftwareRenderer {
     >,
 }
 
+/// One softbuffer pixel: a little-endian 0xAARRGGBB word.
+///
+/// The render thread presents through the same buffer type when a build has no
+/// GPU, so that a CPU-only build is render-owned like any other and the pixel
+/// layout is written down once.
 #[repr(transparent)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct SoftBufferPixel(pub u32);
+pub struct SoftBufferPixel(pub u32);
 
 impl From<SoftBufferPixel> for PremultipliedRgbaColor {
     #[inline]
@@ -83,92 +84,6 @@ impl WinitSoftwareRenderer {
 }
 
 impl super::WinitCompatibleRenderer for WinitSoftwareRenderer {
-    fn render(&self, window: &i_slint_core::api::Window) -> Result<DrawOutcome, PlatformError> {
-        let size = window.size();
-
-        let Some((width, height)) = size.width.try_into().ok().zip(size.height.try_into().ok())
-        else {
-            // Nothing to render
-            return Ok(DrawOutcome::Success);
-        };
-
-        let mut borrowed_surface = self.surface.borrow_mut();
-        let Some(surface) = borrowed_surface.as_mut() else {
-            // Nothing to render
-            return Ok(DrawOutcome::Success);
-        };
-
-        let winit_window = surface.window().clone();
-
-        surface
-            .resize(width, height)
-            .map_err(|e| format!("Error resizing softbuffer surface: {e}"))?;
-
-        let mut target_buffer = surface
-            .buffer_mut()
-            .map_err(|e| format!("Error retrieving softbuffer rendering buffer: {e}"))?;
-
-        let age = target_buffer.age();
-        self.renderer.set_repaint_buffer_type(match age {
-            1 => RepaintBufferType::ReusedBuffer,
-            2 => RepaintBufferType::SwappedBuffers,
-            _ => RepaintBufferType::NewBuffer,
-        });
-
-        let region = if std::env::var_os("SLINT_LINE_BY_LINE").is_none() {
-            let buffer: &mut [SoftBufferPixel] =
-                bytemuck::cast_slice_mut(target_buffer.deref_mut());
-            self.renderer.render(buffer, width.get() as usize)
-        } else {
-            // SLINT_LINE_BY_LINE is set and this is a debug mode where we also render in a Rgb565Pixel
-            struct FrameBuffer<'a> {
-                buffer: &'a mut [u32],
-                line: Vec<i_slint_renderer_software::Rgb565Pixel>,
-            }
-            impl i_slint_renderer_software::LineBufferProvider for FrameBuffer<'_> {
-                type TargetPixel = i_slint_renderer_software::Rgb565Pixel;
-                fn process_line(
-                    &mut self,
-                    line: usize,
-                    range: core::ops::Range<usize>,
-                    render_fn: impl FnOnce(&mut [Self::TargetPixel]),
-                ) {
-                    let line_begin = line * self.line.len();
-                    let sub = &mut self.line[..range.len()];
-                    render_fn(sub);
-                    for (dst, src) in self.buffer[line_begin..][range].iter_mut().zip(sub) {
-                        let p = Rgb8Pixel::from(*src);
-                        *dst =
-                            0xff000000 | ((p.r as u32) << 16) | ((p.g as u32) << 8) | (p.b as u32);
-                    }
-                }
-            }
-            self.renderer.render_by_line(FrameBuffer {
-                buffer: &mut target_buffer,
-                line: vec![Default::default(); width.get() as usize],
-            })
-        };
-
-        let damage = region
-            .iter()
-            .filter_map(|(pos, size)| {
-                Some(softbuffer::Rect {
-                    x: pos.x as u32,
-                    y: pos.y as u32,
-                    width: NonZeroU32::new(size.width)?,
-                    height: NonZeroU32::new(size.height)?,
-                })
-            })
-            .collect::<Vec<_>>();
-        if !damage.is_empty() {
-            winit_window.pre_present_notify();
-            target_buffer
-                .present_with_damage(&damage)
-                .map_err(|e| format!("Error presenting softbuffer buffer: {e}"))?;
-        }
-        Ok(DrawOutcome::Success)
-    }
-
     fn as_core_renderer(&self) -> &dyn i_slint_core::renderer::Renderer {
         &self.renderer
     }

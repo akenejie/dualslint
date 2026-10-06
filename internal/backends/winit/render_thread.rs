@@ -15,24 +15,24 @@
 // coordinate/state table and asks for changes through
 // `RenderHost::apply_control_state`.
 
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::num::NonZeroU32;
 use std::rc::Rc;
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 use std::rc::Weak;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 use i_slint_core::api::PhysicalSize;
 use i_slint_core::api::Window as SlintApiWindow;
 use i_slint_core::graphics::Color;
 use i_slint_core::input::{BackendMouseEvent, InternalKeyEvent, PointerEventButton};
-use i_slint_core::item_tree::ItemRc;
+use i_slint_core::item_tree::{ItemRc, ItemTreeRc};
 use i_slint_core::lengths::LogicalPoint;
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 use i_slint_core::platform::{Clipboard, Platform, PlatformError};
 use i_slint_core::platform::{WindowEvent, WindowEventDispatchResult};
 use i_slint_core::window::{WindowAdapter, WindowInner};
@@ -44,6 +44,7 @@ use i_slint_core::window::{WindowAdapter, WindowInner};
 #[cfg(feature = "renderer-femtovg")]
 use glutin::display::GetGlDisplay;
 
+#[cfg(feature = "renderer-femtovg")]
 use crate::winit_compat::WindowSurfaceSizeExt;
 use crate::winitwindowadapter::WinitWindowAdapter;
 
@@ -74,7 +75,7 @@ pub(crate) static GLOBAL_HWND: OnceLock<isize> = OnceLock::new();
 // Headless window adapter — used when a render-owned component is attached
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 thread_local! {
     /// Stores the adapter created by the headless platform during
     /// `Platform::create_window_adapter` so the caller can retrieve it
@@ -88,12 +89,12 @@ thread_local! {
 /// graphics context, so this one never draws anything itself; it exists because
 /// a window has to answer the question, and because a resize has to reach the
 /// context that presents it.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 struct MirrorRenderer {
     window_adapter: RefCell<Option<Rc<dyn WindowAdapter>>>,
 }
 
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 impl i_slint_core::renderer::RendererSealed for MirrorRenderer {
     fn set_window_adapter(&self, window_adapter: &Rc<dyn WindowAdapter>) {
         *self.window_adapter.borrow_mut() = Some(window_adapter.clone());
@@ -120,7 +121,7 @@ impl i_slint_core::renderer::RendererSealed for MirrorRenderer {
 /// Minimal window adapter for the render-thread component.  The Slint runtime
 /// queries it for the window geometry; the drawing is the render thread's
 /// upstream renderer, which presents into the window the UI thread created.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 struct RenderWindowAdapter {
     window: SlintApiWindow,
     size: Cell<PhysicalSize>,
@@ -130,7 +131,7 @@ struct RenderWindowAdapter {
     renderer: MirrorRenderer,
 }
 
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 impl WindowAdapter for RenderWindowAdapter {
     fn window(&self) -> &SlintApiWindow {
         &self.window
@@ -167,7 +168,7 @@ impl WindowAdapter for RenderWindowAdapter {
 /// window to live in; what else the mirror needs is either a default that works
 /// (`duration_since_start`, which gives its animations a clock) or the render
 /// thread's own business.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 struct RenderMirrorPlatform {
     clipboard: RefCell<crate::clipboard::ClipboardPair>,
     /// Handed to the adapter that hosts the mirror tree, so the tree's redraw
@@ -175,14 +176,14 @@ struct RenderMirrorPlatform {
     frame_request: Rc<Cell<bool>>,
 }
 
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 impl RenderMirrorPlatform {
     fn new(frame_request: Rc<Cell<bool>>) -> Self {
         Self { clipboard: RefCell::new(crate::clipboard::create_clipboard()), frame_request }
     }
 }
 
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 impl Platform for RenderMirrorPlatform {
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
         let adapter: Rc<RenderWindowAdapter> =
@@ -335,19 +336,60 @@ pub enum RenderMessage {
         /// Reply channel: `true` when an item consumed the key.
         response: std::sync::mpsc::SyncSender<bool>,
     },
-    /// Hand one pointer event to the tree that owns the controls.
+    /// The UI thread resolved a press to a control: this control is held, and
+    /// with the press it also has the focus.  A release is what makes it a click.
+    PressControl {
+        /// The control the pointer went down on.
+        id: u64,
+        /// Which button went down, so that a right press stays a right press.
+        button: PointerEventButton,
+    },
+    /// The UI thread resolved a release to a control: the hold is over.
+    ReleaseControl {
+        /// The control the pointer came up on.
+        id: u64,
+        /// Which button came up, to end the press it began.
+        button: PointerEventButton,
+    },
+    /// The UI thread resolved a wheel event to a control: this control is the
+    /// one under the pointer, so it is the one the wheel is for.
+    ScrollControl {
+        /// The control the wheel belongs to.
+        id: u64,
+        /// Horizontal wheel movement, in logical pixels.
+        delta_x: f32,
+        /// Vertical wheel movement, in logical pixels.
+        delta_y: f32,
+    },
+    /// The same for a trackpad pinch, which a zoomable area answers and
+    /// everything else ignores.
+    PinchControl {
+        /// The control under the pointer.
+        id: u64,
+        /// How far the fingers moved apart.
+        delta: f32,
+    },
+    /// The same for a trackpad rotation.
+    RotateControl {
+        /// The control under the pointer.
+        id: u64,
+        /// How far the fingers rotated, in radians.
+        delta: f32,
+    },
+    /// Run a call against the tree this thread draws.
     ///
-    /// The pointer belongs to the thread that talks to the OS, so the UI
-    /// thread is the one that hears the press, the move, the wheel, the finger
-    /// on the screen and the button that was not the left one. What any of that *means* -- a click, a
-    /// drag, a scroll, a context menu -- is decided by items, and the items are
-    /// on this thread. So the event travels whole instead of as a guess about
-    /// which property to poke: the tree hit-tests, tracks the grab and answers
-    /// it exactly as it would for a window it drew itself.
-    PointerToRenderControl {
-        /// The event in the runtime's own representation, with the position the
-        /// UI thread resolved from the OS coordinates.
-        event: i_slint_core::platform::InternalEvent,
+    /// The pointer event above arrives from the thread that talks to the OS,
+    /// and so does this: the application calls a callback from wherever it
+    /// lives, and a backend that took the tree over answers that call on the
+    /// tree the user is looking at. The tree is the argument rather than a
+    /// window or a property name, because the call is the application's own and
+    /// only the tree it wrote can carry it out.
+    RunOnScreenTree {
+        /// The call, to run once against the tree being drawn.
+        task: Box<dyn FnOnce(&ItemTreeRc) + Send + 'static>,
+        /// Reply channel, closed once the call has returned: the value it
+        /// produced travels back on the caller's own channel.
+        done: std::sync::mpsc::SyncSender<()>,
     },
     /// Re-encode the render thread's mirror component and re-present it.  An
     /// explicit redraw command; also used implicitly after every property
@@ -371,6 +413,17 @@ pub enum RenderMessage {
         y: f32,
         /// Reply channel carrying the control id, or `None`.
         response: std::sync::mpsc::SyncSender<Option<u64>>,
+    },
+    /// The UI thread is about to be asked to draw, and asks first whether this
+    /// thread is the one that will draw that window.
+    ///
+    /// The answer is what keeps the UI thread from drawing: it waits for it
+    /// instead of painting the frames that would otherwise race the handover.
+    AwaitGraphics {
+        /// The winit window the UI thread is about to be asked about.
+        window_id: winit::window::WindowId,
+        /// Reply channel carrying whether this thread draws that window.
+        response: std::sync::mpsc::SyncSender<bool>,
     },
     /// The UI thread has released the window's graphics context, so the render
     /// thread may create the one context a window is allowed to have.
@@ -405,7 +458,17 @@ thread_local! {
     /// `draw()` as the UI thread's, one thread away.  A report about who is
     /// drawing has to tell those two apart, or it would accuse the render thread
     /// of drawing the window it exists to draw.
+    ///
+    /// It also tells a call that is already here: this thread's event loop is the
+    /// one that would run it, so a call made from inside a callback of the tree it
+    /// draws must run right here rather than be posted to a loop that cannot read
+    /// it while it is the one making the call.
     static ON_RENDER_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the calling thread is the render thread.
+pub(crate) fn on_render_thread() -> bool {
+    ON_RENDER_THREAD.with(|on| on.get())
 }
 
 thread_local! {
@@ -593,20 +656,75 @@ impl RenderHost {
         rx.recv().unwrap_or(false)
     }
 
-    /// Offer a pointer event to the tree on the render thread.
+    /// Tell the tree that this control has the press.
     ///
-    /// Returns `false` when no component is attached, so the caller can hand
-    /// the event to its own tree instead. Nothing blocks here: a pointer moves
-    /// at the rate the device reports, and the tree answers a move by
-    /// repainting rather than by returning a value.
-    pub fn send_pointer_event_to_control(
+    /// This is the grab and the focus, and nothing else: whether the release
+    /// that comes next is a click is decided by the tree, because the tree is
+    /// what knows whether the pointer moved away in the meantime.
+    pub fn press_control(&self, id: u64, button: PointerEventButton) -> bool {
+        self.sender.send(RenderMessage::PressControl { id, button }).is_ok()
+    }
+
+    /// Tell the tree that the press on this control is over.
+    pub fn release_control(&self, id: u64, button: PointerEventButton) -> bool {
+        self.sender.send(RenderMessage::ReleaseControl { id, button }).is_ok()
+    }
+
+    /// Tell the tree that the wheel belongs to this control.
+    ///
+    /// Which control it is, the UI thread decided from the published geometry;
+    /// what scrolling it means is the tree's, because that is a property of the
+    /// control rather than of the event.
+    pub fn scroll_control(&self, id: u64, delta_x: f32, delta_y: f32) -> bool {
+        self.sender.send(RenderMessage::ScrollControl { id, delta_x, delta_y }).is_ok()
+    }
+
+    /// Tell the tree that a pinch belongs to this control.
+    pub fn pinch_control(&self, id: u64, delta: f32) -> bool {
+        self.sender.send(RenderMessage::PinchControl { id, delta }).is_ok()
+    }
+
+    /// Tell the tree that a rotation belongs to this control.
+    pub fn rotate_control(&self, id: u64, delta: f32) -> bool {
+        self.sender.send(RenderMessage::RotateControl { id, delta }).is_ok()
+    }
+
+    /// Run a call against the tree this thread draws, and wait for it.
+    ///
+    /// Unlike a pointer event, a callback answers with a value -- a function
+    /// returns one -- so the caller blocks until the tree has had its say. That
+    /// is what an application means when it calls one: it wants the answer of
+    /// the tree on screen, and a render thread that is between frames can give
+    /// it.
+    ///
+    /// `Ok` means the tree ran the call. `Err` hands the call back because it
+    /// was not taken -- there is no tree attached, or this thread is gone -- so
+    /// that the caller can run it against the tree it holds. A call that was
+    /// taken and then lost with the thread reports `Ok`, and the caller's reply
+    /// channel closes, which hands back a default instead of hanging.
+    pub fn run_on_screen_tree(
         &self,
-        event: i_slint_core::platform::InternalEvent,
-    ) -> bool {
+        task: Box<dyn FnOnce(&ItemTreeRc) + Send + 'static>,
+    ) -> Result<(), Box<dyn FnOnce(&ItemTreeRc) + Send + 'static>> {
         if !self.attached.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
+            return Err(task);
         }
-        self.sender.send(RenderMessage::PointerToRenderControl { event }).is_ok()
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        match self.sender.send(RenderMessage::RunOnScreenTree { task, done: tx }) {
+            Ok(()) => {
+                let _ = rx.recv().is_ok();
+                Ok(())
+            }
+            // A send that fails means the render thread is gone, and it takes the
+            // call with it. The call comes back in the error, so the caller can
+            // still run it rather than drop it.
+            Err(std::sync::mpsc::SendError(message)) => {
+                let RenderMessage::RunOnScreenTree { task, .. } = message else {
+                    unreachable!("only one message is ever sent from here")
+                };
+                Err(task)
+            }
+        }
     }
 
     /// Borrow the render-owned control identified by `id` and assign one of
@@ -633,12 +751,9 @@ impl RenderHost {
 
     /// Ask for a window repaint (an explicit redraw command).
     ///
-    /// A window this thread draws is re-encoded and re-presented here.  A window
-    /// whose graphics this thread never took is drawn by the UI thread, so the
-    /// request is handed to that thread instead, which skips the windows this
-    /// thread owns.  Either way the thread that draws decides when to present.
+    /// Every window is this thread's to draw, so the request goes nowhere else:
+    /// the UI thread has no drawing to do and is not told about frames.
     pub fn request_redraw(&self) {
-        self.submit_repaint_unowned_windows();
         let _ = self.sender.send(RenderMessage::RequestRedraw);
     }
 
@@ -743,36 +858,26 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::Suspend { window_id });
     }
 
-    /// Tell the UI thread that the render thread needs the window's graphics.
+    /// Wait until the render thread is ready to take a window's graphics.
     ///
     /// A window has one OpenGL context, not one per thread, so the render
     /// thread cannot have a drawing context while the UI thread's renderer
-    /// holds one. Asking is what keeps that from becoming a driver-level
-    /// failure: the UI thread releases its own context and answers with
-    /// [`RenderMessage::GraphicsReleased`].
-    pub(crate) fn submit_graphics_handover(&self, window_id: winit::window::WindowId) {
-        if let Some(proxy) = &self.event_loop_proxy {
-            let _ = proxy.send_event(crate::SlintEvent(
-                crate::event_loop::CustomEvent::HandOverGraphics { window_id },
-            ));
-        }
-    }
-
-    /// Hand a repaint request to the UI thread for the windows this one does
-    /// not draw.
+    /// holds one.  The UI thread asks this question instead of drawing the
+    /// frames that race the handover: it is about to do the one thing it must
+    /// never do, and waiting for the answer is what keeps it from doing it.
     ///
-    /// A window that never handed its graphics over is painted by the UI thread,
-    /// and only that thread can paint it.  Windows the render thread owns are
-    /// filtered out on arrival, so this cannot make a second thread present a
-    /// render-owned window.
-    pub(crate) fn submit_repaint_unowned_windows(&self) {
-        if let Some(proxy) = &self.event_loop_proxy {
-            let _ = proxy.send_event(crate::SlintEvent(
-                crate::event_loop::CustomEvent::RepaintUnownedWindows,
-            ));
+    /// Returns whether this thread is drawing that window -- or is about to --
+    /// which is what makes releasing the graphics safe.
+    pub(crate) fn await_graphics(&self, window_id: winit::window::WindowId) -> bool {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
+        if self.sender.send(RenderMessage::AwaitGraphics { window_id, response: tx }).is_err() {
+            return false;
         }
+        // No timeout: the render thread is a thread of this process and answers
+        // without needing anything from the UI thread's event loop, so there is
+        // nothing this wait depends on but the render thread itself.
+        rx.recv().unwrap_or(false)
     }
-
     /// Report that the UI thread's renderer has released the window's graphics.
     pub(crate) fn notify_graphics_released(&self, window_id: winit::window::WindowId) {
         let _ = self.sender.send(RenderMessage::GraphicsReleased { window_id });
@@ -786,7 +891,6 @@ impl RenderHost {
 /// The render-thread receive half and event loop driver.
 pub(crate) struct RenderCore {
     rx: mpsc::Receiver<RenderMessage>,
-    host: RenderHost,
 }
 
 /// The window the render thread presents into.
@@ -803,7 +907,7 @@ struct RenderSurface {
     /// The window's scale factor, which a resize message does not repeat: only
     /// the pixel size changed, so the logical size the tree is laid out for is
     /// that size at this factor.
-    #[cfg(feature = "renderer-femtovg")]
+    #[cfg(render_thread_can_draw)]
     scale_factor: f32,
 }
 
@@ -830,7 +934,7 @@ struct SurfaceState {
     /// The window the attached component is drawn into.
     owner: Option<winit::window::WindowId>,
     /// The glutin context and the upstream renderer bound to it.
-    gl: Option<GlRenderState>,
+    draw: Option<DrawTarget>,
     /// Set while the UI thread still owns the owner's graphics, which keeps this
     /// thread from creating a context of its own until it answers.
     handover_pending: bool,
@@ -838,7 +942,7 @@ struct SurfaceState {
 
 impl SurfaceState {
     fn new() -> Self {
-        Self { configured: Vec::new(), owner: None, gl: None, handover_pending: false }
+        Self { configured: Vec::new(), owner: None, draw: None, handover_pending: false }
     }
 
     /// Remember a window and its size, without touching its graphics yet.
@@ -847,14 +951,14 @@ impl SurfaceState {
         window: Arc<winit::window::Window>,
         width: u32,
         height: u32,
-        #[cfg_attr(not(feature = "renderer-femtovg"), allow(unused_variables))] scale_factor: f32,
+        #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))] scale_factor: f32,
     ) {
         let window_id = window.id();
         let surface = RenderSurface {
             window,
             width,
             height,
-            #[cfg(feature = "renderer-femtovg")]
+            #[cfg(render_thread_can_draw)]
             scale_factor,
         };
         match self.configured.iter_mut().find(|(id, _)| *id == window_id) {
@@ -892,44 +996,35 @@ impl SurfaceState {
     }
 
     /// The window's scale factor, or 1 before it has been configured.
-    #[cfg(feature = "renderer-femtovg")]
+    #[cfg(render_thread_can_draw)]
     fn scale_factor(&self) -> f32 {
         self.surface().map_or(1., |surface| surface.scale_factor)
     }
 
     /// Whether the surface's graphics are on their way from the UI thread.  The
     /// loop waits to be spoken to rather than on the clock until they arrive.
-    #[cfg(feature = "renderer-femtovg")]
+    #[cfg(render_thread_can_draw)]
     fn handover_pending(&self) -> bool {
         self.handover_pending
     }
 
-    fn obtain(&mut self, host: &RenderHost) -> Option<&mut GlRenderState> {
-        if self.gl.is_none() && !self.handover_pending {
-            // A component can be attached before the window exists, and a
-            // handover can only name a window, so the request waits for the
-            // window rather than being marked as asked for.
-            if let Some(window_id) = self.surface().map(|surface| surface.window.id()) {
-                self.handover_pending = true;
-                host.submit_graphics_handover(window_id);
-            }
-        }
+    fn obtain(&mut self) -> Option<&mut DrawTarget> {
         // A resize that arrived while the handover was in flight has not been
         // given to the context yet; this is where it takes effect.
         let wanted = self.surface().map(|surface| (surface.width, surface.height));
-        if let (Some(gl), Some((width, height))) = (self.gl.as_mut(), wanted)
-            && (gl.width != width || gl.height != height)
+        if let (Some(draw), Some((width, height))) = (self.draw.as_mut(), wanted)
+            && (draw.width() != width || draw.height() != height)
         {
-            gl.resize(width, height);
+            draw.resize(width, height);
         }
-        self.gl.as_mut()
+        self.draw.as_mut()
     }
 
     /// Record that the UI thread released the window's graphics, and create the
     /// context now that the window has none.  Returns the state to present
     /// with, or `None` if the release names a window this thread does not draw
     /// into, or the context cannot be created.
-    fn released(&mut self, window_id: winit::window::WindowId) -> Option<&mut GlRenderState> {
+    fn released(&mut self, window_id: winit::window::WindowId) -> Option<&mut DrawTarget> {
         if !self.owns(window_id) {
             // Another window's UI renderer let go of its context. That is not an
             // answer to a question this thread asked, so the handover is still
@@ -937,17 +1032,17 @@ impl SurfaceState {
             return None;
         }
         self.handover_pending = false;
-        if self.gl.is_some() {
-            return self.gl.as_mut();
+        if self.draw.is_some() {
+            return self.draw.as_mut();
         }
         let surface = self.surface()?;
-        match GlRenderState::new(surface.window.clone(), surface.width, surface.height) {
+        match DrawTarget::new(surface.window.clone(), surface.width, surface.height) {
             Ok(state) => {
-                self.gl = Some(state);
-                self.gl.as_mut()
+                self.draw = Some(state);
+                self.draw.as_mut()
             }
             Err(e) => {
-                eprintln!("dualslint render thread: GL init failed: {e}");
+                eprintln!("dualslint render thread: no way to present this window: {e}");
                 None
             }
         }
@@ -989,14 +1084,14 @@ impl SurfaceState {
     /// Forget the drawing context and the window it belongs to, keeping the
     /// record of the windows themselves.
     fn drop_context(&mut self) {
-        self.gl = None;
+        self.draw = None;
         self.handover_pending = false;
     }
 }
 
 impl RenderCore {
-    fn new(rx: mpsc::Receiver<RenderMessage>, host: RenderHost) -> Self {
-        Self { rx, host }
+    fn new(rx: mpsc::Receiver<RenderMessage>) -> Self {
+        Self { rx }
     }
 
     /// Run the render-thread event loop.  Blocks until `Quit`.
@@ -1009,7 +1104,7 @@ impl RenderCore {
         // Mirror state lives only here, on this thread — it would make
         // `RenderCore` non-Send otherwise.
         // Filled in by the attach handler, which only the GPU renderers run.
-        #[cfg_attr(not(feature = "renderer-femtovg"), allow(unused_mut))]
+        #[cfg_attr(not(render_thread_can_draw), allow(unused_mut))]
         let mut render_window_adapter: Option<Rc<dyn WindowAdapter>> = None;
         let mut render_controls: HashMap<u64, ControlRegion> = HashMap::new();
         // The same control ids in paint order, so a hit test can tell which of
@@ -1023,23 +1118,23 @@ impl RenderCore {
         // render thread (the strong handle owns the ItemTree).  Moved in
         // only from `AttachComponent`; never leaves this thread.
         // Filled in by the attach handler, which only the GPU renderers run.
-        #[cfg_attr(not(feature = "renderer-femtovg"), allow(unused_mut))]
+        #[cfg_attr(not(render_thread_can_draw), allow(unused_mut))]
         let mut render_component: Option<Box<dyn std::any::Any>> = None;
         // How to ask the application about the properties of that component.
         // Filled in by the attach handler, which only the GPU renderers run.
-        #[cfg_attr(not(feature = "renderer-femtovg"), allow(unused_mut))]
+        #[cfg_attr(not(render_thread_can_draw), allow(unused_mut))]
         let mut render_property_access: Option<ComponentPropertyAccess> = None;
         // Last system accent forwarded by the UI thread; applied to the
         // mirror context on attach in case the accent update arrives before
         // the mirror component exists.
         // Read back in the mirror's attach, which only the GPU renderers do.
-        #[cfg_attr(not(feature = "renderer-femtovg"), allow(unused_variables))]
+        #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))]
         let mut accent: Option<Color> = None;
         // Set by the mirror tree when its own properties change, so the loop
         // knows the tree owes the screen a frame without the UI thread having to
         // ask for it.  A fresh cell per attachment: the flag belongs to the tree
         // that set it, not to this thread.
-        #[cfg(feature = "renderer-femtovg")]
+        #[cfg(render_thread_can_draw)]
         let mut frame_request: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         loop {
@@ -1047,7 +1142,7 @@ impl RenderCore {
             // timer, so while one plays the wait is capped at a frame interval;
             // otherwise the answer is when the tree's next timer is due.  This
             // is the shape the android-activity loop uses.
-            #[cfg(feature = "renderer-femtovg")]
+            #[cfg(render_thread_can_draw)]
             let wait = if surface.handover_pending() {
                 // Nothing this thread draws can reach the screen until the UI
                 // thread hands the window's graphics over, and that answer comes
@@ -1065,7 +1160,7 @@ impl RenderCore {
             };
             // Without a mirror tree there is no clock to keep here: nothing on
             // this thread changes on its own, so it sleeps until it is spoken to.
-            #[cfg(not(feature = "renderer-femtovg"))]
+            #[cfg(not(render_thread_can_draw))]
             let wait: Option<std::time::Duration> = None;
             let msg = match wait {
                 Some(wait) => match self.rx.recv_timeout(wait) {
@@ -1092,7 +1187,7 @@ impl RenderCore {
             let mut present = msg.is_none();
             if let Some(msg) = msg {
                 match msg {
-                    #[cfg_attr(not(feature = "renderer-femtovg"), allow(unused_variables))]
+                    #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))]
                     RenderMessage::Configure { window, width, height, scale_factor } => {
                         let window_id = window.id();
                         surface.configure(window, width, height, scale_factor as f32);
@@ -1106,7 +1201,7 @@ impl RenderCore {
                             // layout is computed for a different size than the one
                             // we present into and the right-hand side is clipped
                             // away.
-                            #[cfg(feature = "renderer-femtovg")]
+                            #[cfg(render_thread_can_draw)]
                             if let Some(adapter) = &render_window_adapter {
                                 adapter_configured(
                                     adapter,
@@ -1124,6 +1219,18 @@ impl RenderCore {
                             present = true;
                         }
                     }
+                    RenderMessage::AwaitGraphics { window_id, response } => {
+                        // This thread draws a window when it is the one drawing
+                        // into it, and it draws it once the UI thread has let go
+                        // of the graphics.  Saying so here -- and marking the
+                        // handover as the thing being waited for -- is what lets
+                        // the UI thread release them without ever painting.
+                        let draws = surface.owns(window_id);
+                        if draws && surface.draw.is_none() {
+                            surface.handover_pending = true;
+                        }
+                        let _ = response.send(draws);
+                    }
                     RenderMessage::GraphicsReleased { window_id } => {
                         // The window has no context on this side of the handover
                         // yet; take the one it is allowed to have.
@@ -1139,7 +1246,7 @@ impl RenderCore {
                         // so a resize has to reach the tree and not only the GL
                         // surface: a tree laid out for the old size is a tree whose
                         // controls sit where the user no longer points.
-                        #[cfg(feature = "renderer-femtovg")]
+                        #[cfg(render_thread_can_draw)]
                         if let Some(adapter) = &render_window_adapter {
                             adapter_configured(
                                 adapter,
@@ -1166,12 +1273,12 @@ impl RenderCore {
                     // A mirror needs a GL context to present into, so it exists
                     // only on the GPU renderers; the software build keeps replaying
                     // the UI-side tree and has no use for the component.
-                    #[cfg_attr(not(feature = "renderer-femtovg"), allow(unused_variables))]
+                    #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))]
                     RenderMessage::AttachComponent { factory, property_access } => {
                         // The factory runs *after* the headless platform is seeded:
                         // it instantiates the app's component, which needs this
                         // thread's `GLOBAL_CONTEXT` to already be claimed.
-                        #[cfg(feature = "renderer-femtovg")]
+                        #[cfg(render_thread_can_draw)]
                         {
                             // A tree that has just been built owes the screen a
                             // frame, and the adapter that hosts it reports the ones
@@ -1267,13 +1374,50 @@ impl RenderCore {
                         });
                         let _ = response.send(value);
                     }
+                    RenderMessage::PressControl { id, button } => {
+                        present |= send_pointer_half_to_control(
+                            render_window_adapter.as_ref(),
+                            render_controls.get(&id),
+                            MouseEventKind::Pressed,
+                            button,
+                        );
+                    }
+                    RenderMessage::ReleaseControl { id, button } => {
+                        present |= send_pointer_half_to_control(
+                            render_window_adapter.as_ref(),
+                            render_controls.get(&id),
+                            MouseEventKind::Released,
+                            button,
+                        );
+                    }
+                    RenderMessage::ScrollControl { id, delta_x, delta_y } => {
+                        present |= send_gesture_to_control(
+                            render_window_adapter.as_ref(),
+                            render_controls.get(&id),
+                            Gesture::Wheel { delta_x, delta_y },
+                        );
+                    }
+                    RenderMessage::PinchControl { id, delta } => {
+                        present |= send_gesture_to_control(
+                            render_window_adapter.as_ref(),
+                            render_controls.get(&id),
+                            Gesture::Pinch { delta },
+                        );
+                    }
+                    RenderMessage::RotateControl { id, delta } => {
+                        present |= send_gesture_to_control(
+                            render_window_adapter.as_ref(),
+                            render_controls.get(&id),
+                            Gesture::Rotation { delta },
+                        );
+                    }
                     RenderMessage::ActivateControl { id, response } => {
                         // A press and a release at the same point, which is all a
                         // click is before the tree has had its say about it.
                         let activated = render_window_adapter
                             .as_ref()
-                            .zip(render_item_rcs.get(&id))
-                            .is_some_and(|(adapter, item_rc)| activate_control(adapter, item_rc));
+                            .zip(render_controls.get(&id))
+                            .is_some_and(|(adapter, region)| activate_control(adapter, region));
                         let _ = response.send(activated);
                         // The tree changed: a `pressed` binding fired, a `clicked`
                         // handler may have changed anything at all.
@@ -1289,22 +1433,23 @@ impl RenderCore {
                         // rest of the application.
                         present |= used;
                     }
-                    RenderMessage::PointerToRenderControl { event } => {
-                        // The tree on this thread hit-tests the point, keeps the
-                        // grab and decides what the event means, so the dispatch
-                        // goes through the window like any other input. A press
-                        // the tree took changes what it draws (pressed, hovered,
-                        // scrolled, a menu that just opened), which is why an
-                        // accepted event is followed by a frame.
-                        let used = render_window_adapter.as_ref().is_some_and(|adapter| {
-                            matches!(
-                                adapter
-                                    .window()
-                                    .dispatch_event_with_result(WindowEvent::internal(event)),
-                                Ok(WindowEventDispatchResult::Accepted)
-                            )
-                        });
-                        present |= used;
+                    RenderMessage::RunOnScreenTree { task, done } => {
+                        // The call runs here because the tree it belongs to is
+                        // here: the mirror's window is a headless one, and its
+                        // component is the one the user is looking at. A call that
+                        // changes a property or opens a window therefore does it
+                        // to the tree that is drawn, and a frame follows for
+                        // whatever it changed.
+                        if let Some(tree) = render_window_adapter.as_ref().and_then(|adapter| {
+                            WindowInner::from_pub(adapter.window()).try_component()
+                        }) {
+                            task(&tree);
+                            present = true;
+                        }
+                        // The caller's channel closes whether the tree was there
+                        // or not, so a caller that is waiting for a value learns
+                        // the difference as a default rather than as a hang.
+                        let _ = done.send(());
                     }
                     RenderMessage::HitTest { x, y, response } => {
                         // The last control in paint order that contains the point is
@@ -1324,10 +1469,8 @@ impl RenderCore {
                         let _ = response.send(hit);
                     }
                     RenderMessage::RequestRedraw => {
-                        // Repaint what this thread draws.  A window whose graphics it does
-                        // not own was handed to the UI thread by
-                        // `submit_repaint_unowned_windows`, which is where the windows drawn
-                        // elsewhere get their repaint.
+                        // Repaint what this thread draws, which is every window:
+                        // there is no other thread left that draws.
                         present = true;
                     }
                     RenderMessage::Suspend { window_id } => {
@@ -1357,17 +1500,17 @@ impl RenderCore {
             // The tree can also be the reason there is a frame to draw: its own
             // properties changed while nothing was happening, or an animation is
             // playing and the frame clock is not a timer.
-            #[cfg(feature = "renderer-femtovg")]
+            #[cfg(render_thread_can_draw)]
             let (frame_requested, animating_now) =
                 (frame_request.replace(false), animating(&render_window_adapter));
-            #[cfg(not(feature = "renderer-femtovg"))]
+            #[cfg(not(render_thread_can_draw))]
             let (frame_requested, animating_now) = (false, false);
             // Only a window this thread has a tree for is drawn here.  Without
             // one the render thread stays out of the way, and its context must
             // never be taken from a window the UI thread draws itself.
             if render_component.is_some()
                 && (present || frame_requested || animating_now)
-                && let Some(state) = surface.obtain(&self.host)
+                && let Some(state) = surface.obtain()
             {
                 present_render_owned(
                     state,
@@ -1386,7 +1529,7 @@ impl RenderCore {
 /// to know about its controls: the geometry to hit-test a pointer against, and
 /// the `ItemRc` behind each id to answer and assign a control's properties.
 /// Returns `false` if the adapter is not ready yet.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 #[allow(clippy::too_many_arguments)]
 fn publish_mirror_controls(
     render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
@@ -1424,12 +1567,12 @@ fn publish_mirror_controls(
 /// How long the render thread waits between frames while an animation plays.
 /// It has no vsync source of its own, so this stands in for the display's
 /// refresh interval; the android-activity loop uses the same fallback.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 const RENDER_FRAME_INTERVAL_MS: u64 = 10;
 
 /// Whether the render-owned tree is animating, which is what tells the render
 /// thread that the screen is owed a frame without a message to say so.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 fn animating(adapter: &Option<Rc<dyn WindowAdapter>>) -> bool {
     adapter.as_ref().is_some_and(|adapter| adapter.window().has_active_animations())
 }
@@ -1438,7 +1581,7 @@ fn animating(adapter: &Option<Rc<dyn WindowAdapter>>) -> bool {
 /// real window geometry.  Without this its layout stays at the placeholder
 /// size from `create_window_adapter`, and the tree is laid out and clipped
 /// for a window that is not the one being presented into.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 fn adapter_configured(adapter: &Rc<dyn WindowAdapter>, size: PhysicalSize, scale_factor: f32) {
     // The upstream renderer asks the platform how big the window is rather than
     // taking it from the tree, so the adapter itself has to be told as well.
@@ -1456,10 +1599,10 @@ fn adapter_configured(adapter: &Rc<dyn WindowAdapter>, size: PhysicalSize, scale
 /// control geometry, because that is what the UI thread hit-tests the pointer
 /// against -- and it asks for the geometry alone, without encoding a frame that
 /// nobody would read.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 #[allow(clippy::too_many_arguments)]
 fn present_render_owned(
-    state: &mut GlRenderState,
+    state: &mut DrawTarget,
     render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     render_controls: &mut HashMap<u64, ControlRegion>,
     render_control_order: &mut Vec<u64>,
@@ -1478,12 +1621,8 @@ fn present_render_owned(
     let Some(adapter) = render_window_adapter.as_ref() else {
         return;
     };
-    if let Err(e) = state.ensure_upstream(adapter) {
-        eprintln!("dualslint render thread: upstream renderer init failed: {e}");
-        return;
-    }
-    if let Err(e) = state.render_upstream() {
-        eprintln!("dualslint render thread: upstream render failed: {e}");
+    if let Err(e) = state.present(adapter) {
+        eprintln!("dualslint render thread: present failed: {e}");
     }
 }
 
@@ -1491,10 +1630,10 @@ fn present_render_owned(
 /// thread to drive.  A component is only ever attached where one exists, so
 /// this has nothing to draw; it is here so that every build presents a message
 /// the same way instead of each handler remembering the feature list.
-#[cfg(not(feature = "renderer-femtovg"))]
+#[cfg(not(render_thread_can_draw))]
 #[allow(clippy::too_many_arguments)]
 fn present_render_owned(
-    _state: &mut GlRenderState,
+    _state: &mut DrawTarget,
     _render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     _render_controls: &mut HashMap<u64, ControlRegion>,
     _render_control_order: &mut Vec<u64>,
@@ -1875,9 +2014,8 @@ fn read_control_property(
 /// go through the window, which is also how the item stack is built: the tree
 /// finds for itself which items the point is inside, exactly as it would for a
 /// real press.
-fn activate_control(adapter: &Rc<dyn WindowAdapter>, item_rc: &ItemRc) -> bool {
-    let size = item_rc.geometry().size;
-    let position = item_rc.map_to_window(LogicalPoint::default()) + size.to_vector() * 0.5;
+fn activate_control(adapter: &Rc<dyn WindowAdapter>, region: &ControlRegion) -> bool {
+    let position = control_centre(region);
 
     for kind in [MouseEventKind::Pressed, MouseEventKind::Released] {
         let event = i_slint_core::platform::InternalEvent::Mouse(match kind {
@@ -1906,10 +2044,101 @@ fn activate_control(adapter: &Rc<dyn WindowAdapter>, item_rc: &ItemRc) -> bool {
         .is_ok()
 }
 
+/// A gesture that the UI thread has already attributed to a control.
+///
+/// Which control it belongs to is a question about geometry, and the UI thread
+/// answered it from the geometry the render thread published. What the gesture
+/// *does* is a question about the control, so it is asked here, on the thread
+/// that holds the control.
+enum Gesture {
+    Wheel { delta_x: f32, delta_y: f32 },
+    Pinch { delta: f32 },
+    Rotation { delta: f32 },
+}
+
+/// Hand a gesture to the tree at the control the UI thread named.
+///
+/// The event is placed at the control's centre because the tree hit-tests the
+/// point it is given, and the control the UI thread picked is the one that has
+/// to be under it.
+fn send_gesture_to_control(
+    adapter: Option<&Rc<dyn WindowAdapter>>,
+    region: Option<&ControlRegion>,
+    gesture: Gesture,
+) -> bool {
+    let Some((adapter, region)) = adapter.zip(region) else {
+        return false;
+    };
+    let position = control_centre(region);
+    let event = i_slint_core::platform::InternalEvent::Mouse(match gesture {
+        Gesture::Wheel { delta_x, delta_y } => BackendMouseEvent::Wheel {
+            position,
+            delta_x,
+            delta_y,
+            phase: i_slint_core::input::TouchPhase::Moved,
+        },
+        Gesture::Pinch { delta } => BackendMouseEvent::PinchGesture {
+            position,
+            delta,
+            phase: i_slint_core::input::TouchPhase::Moved,
+        },
+        Gesture::Rotation { delta } => BackendMouseEvent::RotationGesture {
+            position,
+            delta,
+            phase: i_slint_core::input::TouchPhase::Moved,
+        },
+    });
+    matches!(
+        adapter.window().dispatch_event_with_result(WindowEvent::internal(event)),
+        Ok(WindowEventDispatchResult::Accepted)
+    )
+}
+
 /// Which half of the click pair is being built.
 enum MouseEventKind {
     Pressed,
     Released,
+}
+
+/// The middle of a control, in the coordinates of the window the UI thread
+/// clicked in.
+///
+/// The published rectangle is used rather than the item's own position because a
+/// popup is a tree of its own that the window draws at an offset: the item's own
+/// position stops at the popup's edge, and the tree hit-tests the position it is
+/// given against the window it belongs to.
+fn control_centre(region: &ControlRegion) -> LogicalPoint {
+    region.geometry.origin + region.geometry.size.to_vector() * 0.5
+}
+
+/// Hand one half of a click pair to the control the UI thread named.
+///
+/// The event is placed at the control's centre, which is where the control is,
+/// and the tree hit-tests the point it is given.  The UI thread did the hit
+/// test that chose this control; this only gives the tree a point that is
+/// inside it.
+fn send_pointer_half_to_control(
+    adapter: Option<&Rc<dyn WindowAdapter>>,
+    region: Option<&ControlRegion>,
+    kind: MouseEventKind,
+    button: PointerEventButton,
+) -> bool {
+    let Some((adapter, region)) = adapter.zip(region) else {
+        return false;
+    };
+    let position = control_centre(region);
+    let event = i_slint_core::platform::InternalEvent::Mouse(match kind {
+        MouseEventKind::Pressed => {
+            BackendMouseEvent::Pressed { position, button, click_count: 1, touch_finger_id: 0 }
+        }
+        MouseEventKind::Released => {
+            BackendMouseEvent::Released { position, button, click_count: 1, touch_finger_id: 0 }
+        }
+    });
+    matches!(
+        adapter.window().dispatch_event_with_result(WindowEvent::internal(event)),
+        Ok(WindowEventDispatchResult::Accepted)
+    )
 }
 
 /// Hand a key to the tree that has the focus.
@@ -1939,7 +2168,7 @@ pub(crate) fn channel(
         event_loop_proxy: Some(event_loop_proxy),
         attached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let core = RenderCore::new(rx, host.clone());
+    let core = RenderCore::new(rx);
     (host, core)
 }
 
@@ -1952,89 +2181,84 @@ pub fn host() -> Option<RenderHost> {
     GLOBAL_RENDER_HOST.get().cloned()
 }
 
-/// Hand `window`'s drawing to the render thread, unless the application already
-/// attached a component.
+/// Hand `window`'s drawing to the render thread, and say whether the render
+/// thread is the one drawing it.
 ///
-/// Called where the UI thread is about to draw, because that is the last moment
-/// at which this window's component can still hand the render thread something.
-/// A window whose component left no factory behind, such as one a third-party
-/// [`ComponentFactory`] builds itself, is drawn here as before, and
-/// [`report_window_drawn_by_ui`] says so.
-pub(crate) fn take_over_drawing_of(window: &SlintApiWindow) {
+/// Called where the UI thread is about to be asked to draw, because that is the
+/// last moment at which this window's component can still hand the render thread
+/// something.  A window the render thread will not take is not drawn by the UI
+/// thread either: the UI thread does not draw, so
+/// [`report_window_no_one_draws`] names the reason instead of a blank window
+/// staying unexplained.
+pub(crate) fn take_over_drawing_of(window: &SlintApiWindow) -> bool {
     let Some(factory) = WindowInner::from_pub(window).render_factory() else {
-        report_window_drawn_by_ui(
+        report_window_no_one_draws(
             window,
             "its component left no render factory behind, which is what a \
              ComponentFactory that builds the tree itself, or a component that is \
              not the window's root, does",
         );
-        return;
+        return false;
     };
     let Some(host) = host() else {
-        report_window_drawn_by_ui(window, "no render thread is running");
-        return;
+        report_window_no_one_draws(window, "no render thread is running");
+        return false;
     };
-    if !cfg!(feature = "renderer-femtovg") {
-        // Attaching without a renderer on this thread would claim a
-        // render-owned tree that nothing draws.  Leaving the window on the UI
-        // thread is honest; the report is what keeps it from being silent.
-        report_window_drawn_by_ui(
+    if !cfg!(render_thread_can_draw) {
+        report_window_no_one_draws(
             window,
             "this build has no renderer on the render thread, because the \
              `renderer-femtovg` feature is off",
         );
-        return;
+        return false;
     }
-    if host.has_attached_component() {
-        if render_thread_owns(window) {
-            // The handover is still in flight for this very window: the attach
-            // has been sent, and the graphics context comes across a frame or
-            // two later.  Until then this thread still presents, which is the one
-            // frame it is allowed to draw on the way across.
-            return;
-        }
-        report_window_drawn_by_ui(
+    if !host.has_attached_component() {
+        host.attach_component_with_to(window, move || factory(), None);
+    } else if !render_thread_owns(window) {
+        report_window_no_one_draws(
             window,
             "the render thread is already drawing another window, and it draws \
              one window at a time",
         );
-        return;
+        return false;
     }
-    host.attach_component_with_to(window, move || factory(), None);
+    true
 }
 
-/// The windows this process has already reported as drawn by the UI thread.
+/// The windows this process has already reported as drawn by nobody.
 ///
 /// [`std::sync::Mutex::new`] is const, so this needs no lazy initialisation. The
 /// `Option` keeps the set empty until the first report.
-static UI_DRAWN_REPORTED: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
+static UNDRAWN_REPORTED: std::sync::Mutex<Option<std::collections::HashSet<usize>>> =
     std::sync::Mutex::new(None);
 
-/// Say, once per window, that the UI thread is the one drawing it.
+/// Say, once per window, that nothing is drawing it.
 ///
-/// This fork has the render thread own every control and every pixel, so a
-/// window the UI thread draws is a configuration the build cannot honour rather
-/// than a fallback to shrug at.  An app that looks render-owned and is not is
-/// worse than one that never claimed to be, which is the whole reason this
-/// exists.  Remembering the windows keeps a draw loop that runs 60 times a
-/// second from repeating the message on every frame.
-fn report_window_drawn_by_ui(window: &SlintApiWindow, reason: &str) {
+/// This fork has the render thread own every control and every pixel, and the UI
+/// thread draws nothing at all, so a window the render thread refuses is a
+/// window that stays blank.  A blank window with a reason is the honest outcome;
+/// a blank window without one is the bug this report exists to prevent, because
+/// the symptom -- an application that shows nothing -- names neither the
+/// missing renderer nor the missing factory.  Remembering the windows keeps a
+/// draw loop that runs 60 times a second from repeating the message every frame.
+fn report_window_no_one_draws(window: &SlintApiWindow, reason: &str) {
     if ON_RENDER_THREAD.with(|on| on.get()) {
         // The render thread is where a window is supposed to be drawn, and the
         // mirror's own draws come through here too.
         return;
     }
     {
-        let mut reported = UI_DRAWN_REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut reported = UNDRAWN_REPORTED.lock().unwrap_or_else(|e| e.into_inner());
         let reported = reported.get_or_insert_with(Default::default);
         if !reported.insert(window_identity(window)) {
             return;
         }
     }
     eprintln!(
-        "dualslint: the UI thread is drawing this window because {reason}. Only the \
-         render thread may draw, so this window's controls are not reachable through \
-         the render thread's control API."
+        "dualslint: nothing is drawing this window because {reason}. The render \
+         thread draws every window and the UI thread draws none, so this window \
+         will stay blank, and its controls are not reachable through the render \
+         thread's control API."
     );
 }
 
@@ -2365,7 +2589,7 @@ impl ControlInteraction {
 
     /// Forget the controls that the latest encode no longer contains, so that a
     /// control that comes back does not inherit a stale hover or press.
-    #[cfg(feature = "renderer-femtovg")]
+    #[cfg(render_thread_can_draw)]
     fn retain(&mut self, controls: &[ControlRegion]) {
         self.hovered.retain(|id| controls.iter().any(|c| c.id == *id));
         self.pressed.retain(|id| controls.iter().any(|c| c.id == *id));
@@ -2377,7 +2601,7 @@ impl ControlInteraction {
 /// The table is geometry and pointer state, and nothing else: it is what the UI
 /// thread needs to know *where* a control is, so that it can say which one the
 /// pointer landed on without knowing anything about how a click is answered.
-#[cfg(feature = "renderer-femtovg")]
+#[cfg(render_thread_can_draw)]
 fn publish_control_coords(controls: &[ControlRegion], interaction: &ControlInteraction) {
     let Some(map) = coordinate_map() else { return };
     let mut map = map.lock().unwrap();
@@ -2423,6 +2647,7 @@ pub(crate) fn set_hwnd(hwnd: isize) {
 /// renderer and this module's own replay path share this one context: a second
 /// context on the same native window is rejected by GLX/EGL, and a single
 /// context is all the render thread needs.
+#[cfg(feature = "renderer-femtovg")]
 struct GlObjects {
     context: glutin::context::PossiblyCurrentContext,
     surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
@@ -2511,6 +2736,160 @@ impl UpstreamRenderer {
     }
 }
 
+/// How the render thread puts a frame of the render-owned tree on screen.
+///
+/// A build picks one at compile time, and the window picks one when its graphics
+/// are released: a machine with a GPU presents through GL, and a build without
+/// one presents through a buffer it copies in.  Both are this thread's work --
+/// the point of the enum is that there is no third case in which the UI thread
+/// presents, because nothing outside this enum can draw at all.
+#[cfg(render_thread_can_draw)]
+enum DrawTarget {
+    #[cfg(feature = "renderer-femtovg")]
+    Gl(GlRenderState),
+    #[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
+    Software(SoftwareRenderState),
+}
+
+#[cfg(render_thread_can_draw)]
+impl DrawTarget {
+    /// Take a window's presentation over.
+    fn new(window: Arc<winit::window::Window>, width: u32, height: u32) -> Result<Self, String> {
+        // A build with both renderers prefers the GPU: the software path exists
+        // for a build that has nothing else, not as a fallback for a frame.
+        #[cfg(feature = "renderer-femtovg")]
+        {
+            GlRenderState::new(window, width, height).map(Self::Gl)
+        }
+        #[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
+        {
+            SoftwareRenderState::new(window, width, height).map(Self::Software)
+        }
+    }
+
+    fn width(&self) -> u32 {
+        match self {
+            #[cfg(feature = "renderer-femtovg")]
+            Self::Gl(state) => state.width,
+            #[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
+            Self::Software(state) => state.width,
+        }
+    }
+
+    fn height(&self) -> u32 {
+        match self {
+            #[cfg(feature = "renderer-femtovg")]
+            Self::Gl(state) => state.height,
+            #[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
+            Self::Software(state) => state.height,
+        }
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        match self {
+            #[cfg(feature = "renderer-femtovg")]
+            Self::Gl(state) => state.resize(width, height),
+            #[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
+            Self::Software(state) => state.resize(width, height),
+        }
+    }
+
+    /// Draw the render-owned component and put it on screen.
+    #[cfg_attr(not(feature = "renderer-femtovg"), allow(unused_variables))]
+    fn present(&mut self, window_adapter: &Rc<dyn WindowAdapter>) -> Result<(), PlatformError> {
+        match self {
+            #[cfg(feature = "renderer-femtovg")]
+            Self::Gl(state) => {
+                state.ensure_upstream(window_adapter)?;
+                state.render_upstream()
+            }
+            #[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
+            Self::Software(state) => state.present(window_adapter),
+        }
+    }
+}
+
+/// The render thread presenting through a pixel buffer.
+///
+/// This is the same software renderer the UI thread used to present with, on the
+/// other side of the handover: the frames are drawn here and copied to the
+/// window from here, so a build without a GPU is render-owned like any other.
+#[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
+struct SoftwareRenderState {
+    renderer: i_slint_renderer_software::SoftwareRenderer,
+    context: softbuffer::Context<Arc<winit::window::Window>>,
+    surface: softbuffer::Surface<Arc<winit::window::Window>, Arc<winit::window::Window>>,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
+impl SoftwareRenderState {
+    fn new(window: Arc<winit::window::Window>, width: u32, height: u32) -> Result<Self, String> {
+        let context = softbuffer::Context::new(window.clone())
+            .map_err(|e| format!("softbuffer context: {e}"))?;
+        let surface = softbuffer::Surface::new(&context, window)
+            .map_err(|e| format!("softbuffer surface: {e}"))?;
+        Ok(Self {
+            renderer: i_slint_renderer_software::SoftwareRenderer::new(),
+            context,
+            surface,
+            width,
+            height,
+        })
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+    }
+
+    fn present(&mut self, window_adapter: &Rc<dyn WindowAdapter>) -> Result<(), PlatformError> {
+        use i_slint_core::renderer::RendererSealed as _;
+        if self.renderer.window_adapter().is_none() {
+            // The renderer asks the platform how big the window is rather than
+            // taking it from the tree, so it needs to be told about the window it
+            // is drawing into before it can draw anything.
+            self.renderer.set_window_adapter(window_adapter);
+        }
+        let Some((width, height)) = NonZeroU32::new(self.width).zip(NonZeroU32::new(self.height))
+        else {
+            return Ok(());
+        };
+        self.surface.resize(width, height).map_err(|e| format!("softbuffer resize: {e}"))?;
+        let winit_window = self.surface.window().clone();
+        let mut buffer =
+            self.surface.buffer_mut().map_err(|e| format!("softbuffer buffer: {e}"))?;
+        self.renderer
+            .set_repaint_buffer_type(i_slint_renderer_software::RepaintBufferType::NewBuffer);
+        let damage = self
+            .renderer
+            .render(
+                bytemuck::cast_slice_mut::<u32, crate::renderer::sw::SoftBufferPixel>(
+                    &mut buffer[..],
+                ),
+                width.get() as usize,
+            )
+            .iter()
+            .filter_map(|(pos, size)| {
+                Some(softbuffer::Rect {
+                    x: pos.x as u32,
+                    y: pos.y as u32,
+                    width: NonZeroU32::new(size.width)?,
+                    height: NonZeroU32::new(size.height)?,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !damage.is_empty() {
+            winit_window.pre_present_notify();
+            buffer.present_with_damage(&damage).map_err(|e| format!("softbuffer present: {e}"))?;
+        }
+        let _ = &self.context;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "renderer-femtovg")]
 struct GlRenderState {
     /// The one GL context and surface for this window, shared with upstream's
     /// renderer so both draw through the same GL state.
@@ -2524,6 +2903,7 @@ struct GlRenderState {
     upstream: Option<UpstreamRenderer>,
 }
 
+#[cfg(feature = "renderer-femtovg")]
 impl GlRenderState {
     fn new(window: Arc<winit::window::Window>, width: u32, height: u32) -> Result<Self, String> {
         use glutin::context::{ContextApi, ContextAttributesBuilder};
