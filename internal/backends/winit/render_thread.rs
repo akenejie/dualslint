@@ -6,6 +6,7 @@ thread_local! {
 #[derive(Clone)]
 struct ThreadLocalAccess {
     coords: Arc<Mutex<PublishedControls>>,
+    item_map: Arc<Mutex<std::collections::HashMap<u64, i_slint_core::item_tree::ItemRc>>>,
 }
 
 #[cfg(not(render_thread_can_draw))]
@@ -1702,6 +1703,14 @@ fn publish_mirror_controls(
     // without this the UI thread would hit-test an empty table and no pointer
     // event would ever reach a control.
     publish_control_coords(coords, &table.controls, interaction);
+    // Set thread-local access so in-thread calls don't deadlock
+    #[cfg(render_thread_can_draw)]
+    {
+        let item_map: Arc<Mutex<std::collections::HashMap<u64, i_slint_core::item_tree::ItemRc>>> =
+            Arc::new(Mutex::new(render_item_rcs.clone()));
+        let tl = ThreadLocalAccess { coords: coords.clone(), item_map };
+        set_tl_access(Some(tl));
+    }
     true
 }
 
@@ -3266,3 +3275,10 @@ impl GlRenderState {
         }
     }
 }
+
+#[cfg(render_thread_can_draw)]
+fn set_tl_access(access: Option<ThreadLocalAccess>) {
+    THREAD_LOCAL_ACCESS.with(|a| *a.borrow_mut() = access);
+}
+#[cfg(not(render_thread_can_draw))]
+fn set_tl_access(_access: Option<ThreadLocalAccess>) {}
