@@ -352,6 +352,26 @@ pub enum RenderMessage {
         id: u64,
         /// Which button went down, so that a right press stays a right press.
         button: PointerEventButton,
+        /// Where the pointer went down, in the window's logical coordinates.
+        ///
+        /// A drag is a distance between two points, so the tree has to be given
+        /// the point the user pressed on: an event placed in the middle of the
+        /// control would make every drag start from a place the pointer was
+        /// never at.
+        position: LogicalPoint,
+    },
+    /// The pointer moved while a press was held: a drag.
+    ///
+    /// Named by position and not by control, because the point of a drag is
+    /// often to leave the control -- a `Flickable` follows the pointer past its
+    /// own edge -- and the tree's own grab is what decides which item keeps
+    /// receiving the moves.
+    MoveControl {
+        /// Where the pointer is now, in the window's logical coordinates.
+        position: LogicalPoint,
+        /// Which finger, for a touch: a drag is one finger's story, and the tree
+        /// tells two fingers apart by this.
+        finger_id: i32,
     },
     /// The UI thread resolved a release to a control: the hold is over.
     ReleaseControl {
@@ -359,12 +379,19 @@ pub enum RenderMessage {
         id: u64,
         /// Which button came up, to end the press it began.
         button: PointerEventButton,
+        /// Where the pointer came up, in the window's logical coordinates.
+        ///
+        /// A click is a press and a release at one point, so where the release
+        /// landed is what decides between the two.
+        position: LogicalPoint,
     },
     /// The UI thread resolved a wheel event to a control: this control is the
     /// one under the pointer, so it is the one the wheel is for.
     ScrollControl {
         /// The control the wheel belongs to.
         id: u64,
+        /// Where the wheel was turned, in the window's logical coordinates.
+        position: LogicalPoint,
         /// Horizontal wheel movement, in logical pixels.
         delta_x: f32,
         /// Vertical wheel movement, in logical pixels.
@@ -375,6 +402,8 @@ pub enum RenderMessage {
     PinchControl {
         /// The control under the pointer.
         id: u64,
+        /// Where the fingers were, in the window's logical coordinates.
+        position: LogicalPoint,
         /// How far the fingers moved apart.
         delta: f32,
     },
@@ -382,6 +411,8 @@ pub enum RenderMessage {
     RotateControl {
         /// The control under the pointer.
         id: u64,
+        /// Where the fingers were, in the window's logical coordinates.
+        position: LogicalPoint,
         /// How far the fingers rotated, in radians.
         delta: f32,
     },
@@ -703,13 +734,33 @@ impl RenderHost {
     /// This is the grab and the focus, and nothing else: whether the release
     /// that comes next is a click is decided by the tree, because the tree is
     /// what knows whether the pointer moved away in the meantime.
-    pub fn press_control(&self, id: u64, button: PointerEventButton) -> bool {
-        self.sender.send(RenderMessage::PressControl { id, button }).is_ok()
+    pub fn press_control(
+        &self,
+        id: u64,
+        button: PointerEventButton,
+        position: LogicalPoint,
+    ) -> bool {
+        self.sender.send(RenderMessage::PressControl { id, button, position }).is_ok()
+    }
+
+    /// Tell the tree that the pointer moved while the press was held.
+    ///
+    /// Sent for as long as the pointer is down, which is the whole of a drag: the
+    /// UI thread reports where the pointer is, and the tree decides what a
+    /// distance between two points means -- a slider's value, a `Flickable`'s
+    /// scroll position, a `TouchArea`'s `moved`.
+    pub fn move_control(&self, position: LogicalPoint, finger_id: i32) -> bool {
+        self.sender.send(RenderMessage::MoveControl { position, finger_id }).is_ok()
     }
 
     /// Tell the tree that the press on this control is over.
-    pub fn release_control(&self, id: u64, button: PointerEventButton) -> bool {
-        self.sender.send(RenderMessage::ReleaseControl { id, button }).is_ok()
+    pub fn release_control(
+        &self,
+        id: u64,
+        button: PointerEventButton,
+        position: LogicalPoint,
+    ) -> bool {
+        self.sender.send(RenderMessage::ReleaseControl { id, button, position }).is_ok()
     }
 
     /// Tell the tree that the wheel belongs to this control.
@@ -717,18 +768,24 @@ impl RenderHost {
     /// Which control it is, the UI thread decided from the published geometry;
     /// what scrolling it means is the tree's, because that is a property of the
     /// control rather than of the event.
-    pub fn scroll_control(&self, id: u64, delta_x: f32, delta_y: f32) -> bool {
-        self.sender.send(RenderMessage::ScrollControl { id, delta_x, delta_y }).is_ok()
+    pub fn scroll_control(
+        &self,
+        id: u64,
+        position: LogicalPoint,
+        delta_x: f32,
+        delta_y: f32,
+    ) -> bool {
+        self.sender.send(RenderMessage::ScrollControl { id, position, delta_x, delta_y }).is_ok()
     }
 
     /// Tell the tree that a pinch belongs to this control.
-    pub fn pinch_control(&self, id: u64, delta: f32) -> bool {
-        self.sender.send(RenderMessage::PinchControl { id, delta }).is_ok()
+    pub fn pinch_control(&self, id: u64, position: LogicalPoint, delta: f32) -> bool {
+        self.sender.send(RenderMessage::PinchControl { id, position, delta }).is_ok()
     }
 
     /// Tell the tree that a rotation belongs to this control.
-    pub fn rotate_control(&self, id: u64, delta: f32) -> bool {
-        self.sender.send(RenderMessage::RotateControl { id, delta }).is_ok()
+    pub fn rotate_control(&self, id: u64, position: LogicalPoint, delta: f32) -> bool {
+        self.sender.send(RenderMessage::RotateControl { id, position, delta }).is_ok()
     }
 
     /// Run a call against the tree this thread draws, and wait for it.
@@ -1411,41 +1468,53 @@ impl RenderCore {
                         });
                         let _ = response.send(value);
                     }
-                    RenderMessage::PressControl { id, button } => {
-                        present |= send_pointer_half_to_control(
+                    RenderMessage::PressControl { id, button, position } => {
+                        present |= send_pointer_event_to_control(
                             render_window_adapter.as_ref(),
                             render_controls.get(&id),
                             MouseEventKind::Pressed,
                             button,
+                            position,
                         );
                     }
-                    RenderMessage::ReleaseControl { id, button } => {
-                        present |= send_pointer_half_to_control(
+                    RenderMessage::MoveControl { position, finger_id } => {
+                        present |= send_pointer_move_to_tree(
+                            render_window_adapter.as_ref(),
+                            position,
+                            finger_id,
+                        );
+                    }
+                    RenderMessage::ReleaseControl { id, button, position } => {
+                        present |= send_pointer_event_to_control(
                             render_window_adapter.as_ref(),
                             render_controls.get(&id),
                             MouseEventKind::Released,
                             button,
+                            position,
                         );
                     }
-                    RenderMessage::ScrollControl { id, delta_x, delta_y } => {
+                    RenderMessage::ScrollControl { id, position, delta_x, delta_y } => {
                         present |= send_gesture_to_control(
                             render_window_adapter.as_ref(),
                             render_controls.get(&id),
                             Gesture::Wheel { delta_x, delta_y },
+                            position,
                         );
                     }
-                    RenderMessage::PinchControl { id, delta } => {
+                    RenderMessage::PinchControl { id, position, delta } => {
                         present |= send_gesture_to_control(
                             render_window_adapter.as_ref(),
                             render_controls.get(&id),
                             Gesture::Pinch { delta },
+                            position,
                         );
                     }
-                    RenderMessage::RotateControl { id, delta } => {
+                    RenderMessage::RotateControl { id, position, delta } => {
                         present |= send_gesture_to_control(
                             render_window_adapter.as_ref(),
                             render_controls.get(&id),
                             Gesture::Rotation { delta },
+                            position,
                         );
                     }
                     RenderMessage::ActivateControl { id, response } => {
@@ -2050,12 +2119,12 @@ fn read_control_property(
 /// `.slint` file already declares, none of it by a list of widget names in a
 /// backend.
 ///
-/// The position is the control's own centre, taken from its geometry rather
-/// than from the pointer, so the event describes the control the UI thread named
-/// rather than a coordinate the two threads would have to agree on. Both events
-/// go through the window, which is also how the item stack is built: the tree
-/// finds for itself which items the point is inside, exactly as it would for a
-/// real press.
+/// The position is the control's own centre, taken from its geometry, because
+/// the pointer is not part of this path: what arrives here is a key, so there is
+/// no place on screen the user pointed at and the control's middle is as good a
+/// point as any. Both events go through the window, which is also how the item
+/// stack is built: the tree finds for itself which items the point is inside,
+/// exactly as it would for a real press.
 fn activate_control(adapter: &Rc<dyn WindowAdapter>, region: &ControlRegion) -> bool {
     let position = control_centre(region);
 
@@ -2107,11 +2176,11 @@ fn send_gesture_to_control(
     adapter: Option<&Rc<dyn WindowAdapter>>,
     region: Option<&ControlRegion>,
     gesture: Gesture,
+    position: LogicalPoint,
 ) -> bool {
-    let Some((adapter, region)) = adapter.zip(region) else {
+    let Some((adapter, _region)) = adapter.zip(region) else {
         return false;
     };
-    let position = control_centre(region);
     let event = i_slint_core::platform::InternalEvent::Mouse(match gesture {
         Gesture::Wheel { delta_x, delta_y } => BackendMouseEvent::Wheel {
             position,
@@ -2136,39 +2205,43 @@ fn send_gesture_to_control(
     )
 }
 
-/// Which half of the click pair is being built.
+/// Which part of a click is being built: the press, or the release that ends it.
 enum MouseEventKind {
     Pressed,
     Released,
 }
 
-/// The middle of a control, in the coordinates of the window the UI thread
-/// clicked in.
+/// The middle of a control, in the coordinates of the window that published it.
 ///
-/// The published rectangle is used rather than the item's own position because a
-/// popup is a tree of its own that the window draws at an offset: the item's own
-/// position stops at the popup's edge, and the tree hit-tests the position it is
-/// given against the window it belongs to.
+/// Used for the events that have no pointer of their own -- the click a key
+/// stands for -- so that the point handed to the tree is inside the control the
+/// UI thread named.
 fn control_centre(region: &ControlRegion) -> LogicalPoint {
     region.geometry.origin + region.geometry.size.to_vector() * 0.5
 }
 
-/// Hand one half of a click pair to the control the UI thread named.
+/// Hand one half of a click to the control the UI thread named.
 ///
-/// The event is placed at the control's centre, which is where the control is,
-/// and the tree hit-tests the point it is given.  The UI thread did the hit
-/// test that chose this control; this only gives the tree a point that is
-/// inside it.
-fn send_pointer_half_to_control(
+/// The position is the one the pointer is at, in the coordinates of the window
+/// the UI thread heard about, which is the space the tree hit-tests in -- a popup
+/// included, because the popup's geometry is published in the window's
+/// coordinates too.
+///
+/// The control is only asked for as a check that it is still there: the frame
+/// that published it and the frame that dispatches to it are frames apart, and a
+/// control that has since gone should not be given an event.
+fn send_pointer_event_to_control(
     adapter: Option<&Rc<dyn WindowAdapter>>,
     region: Option<&ControlRegion>,
     kind: MouseEventKind,
     button: PointerEventButton,
+    position: LogicalPoint,
 ) -> bool {
-    let Some((adapter, region)) = adapter.zip(region) else {
+    if adapter.is_none() || region.is_none() {
         return false;
-    };
-    let position = control_centre(region);
+    }
+    let adapter = adapter.expect("checked above");
+
     let event = i_slint_core::platform::InternalEvent::Mouse(match kind {
         MouseEventKind::Pressed => {
             BackendMouseEvent::Pressed { position, button, click_count: 1, touch_finger_id: 0 }
@@ -2176,6 +2249,29 @@ fn send_pointer_half_to_control(
         MouseEventKind::Released => {
             BackendMouseEvent::Released { position, button, click_count: 1, touch_finger_id: 0 }
         }
+    });
+    matches!(
+        adapter.window().dispatch_event_with_result(WindowEvent::internal(event)),
+        Ok(WindowEventDispatchResult::Accepted)
+    )
+}
+
+/// Hand a move to the tree, for as long as a press is held.
+///
+/// No control is named: a drag that leaves the control it started on is
+/// ordinary, and the tree is what knows which item grabbed the pointer and how
+/// far it has travelled.
+fn send_pointer_move_to_tree(
+    adapter: Option<&Rc<dyn WindowAdapter>>,
+    position: LogicalPoint,
+    finger_id: i32,
+) -> bool {
+    let Some(adapter) = adapter else {
+        return false;
+    };
+    let event = i_slint_core::platform::InternalEvent::Mouse(BackendMouseEvent::Moved {
+        position,
+        touch_finger_id: finger_id,
     });
     matches!(
         adapter.window().dispatch_event_with_result(WindowEvent::internal(event)),

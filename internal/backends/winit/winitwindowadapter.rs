@@ -468,6 +468,12 @@ pub struct WinitWindowAdapter {
     /// render thread is told the result as two property assignments.
     render_hovered: Cell<Option<u64>>,
     render_pressed: Cell<Option<u64>>,
+    /// The button that is down, for as long as a press is held.
+    ///
+    /// Kept for the one release that arrives without a button of its own: the
+    /// pointer leaving the window, or a touch the OS cancels. A release the OS
+    /// reports names its own button, and a move names no button at all.
+    render_pressed_button: Cell<Option<PointerEventButton>>,
     current_resize_direction: Cell<Option<ResizeDirection>>,
     /// Allocates small i32 finger ids for iOS's pointer-valued touch ids.
     #[cfg(target_os = "ios")]
@@ -480,7 +486,7 @@ pub struct WinitWindowAdapter {
 /// began, and naming it on both is cheaper than remembering it separately.
 #[derive(Clone, Copy)]
 enum PointerAction {
-    Moved,
+    Moved { finger_id: i32 },
     Pressed(PointerEventButton),
     Released(PointerEventButton),
 }
@@ -534,6 +540,7 @@ impl WinitWindowAdapter {
             render_host: Default::default(),
             render_hovered: Default::default(),
             render_pressed: Default::default(),
+            render_pressed_button: Default::default(),
             current_resize_direction: Default::default(),
             #[cfg(target_os = "ios")]
             touch_finger_ids: Default::default(),
@@ -1448,8 +1455,8 @@ impl WinitWindowAdapter {
         // spellings of that, so they are named here once and the rest of the
         // function never has to know which device it came from.
         let (position, action) = match event {
-            Ev::Mouse(BackendMouseEvent::Moved { position, .. }) => {
-                (*position, PointerAction::Moved)
+            Ev::Mouse(BackendMouseEvent::Moved { position, touch_finger_id }) => {
+                (*position, PointerAction::Moved { finger_id: *touch_finger_id })
             }
             Ev::Mouse(BackendMouseEvent::Pressed { position, button, .. }) => {
                 (*position, PointerAction::Pressed(*button))
@@ -1468,21 +1475,38 @@ impl WinitWindowAdapter {
             }
             Ev::Mouse(BackendMouseEvent::Exit) => {
                 // The pointer left the window, so nothing under it is hovered and
-                // nothing is held.
+                // nothing is held. The tree is told where the pointer last was, so
+                // that whatever it grabbed ends rather than waiting for a release
+                // that is not coming.
+                if let (Some(pressed), Some(button)) =
+                    (self.render_pressed.replace(None), self.render_pressed_button.take())
+                {
+                    host.release_control(pressed, button, self.cursor_pos.get());
+                    host.apply_control_state(pressed, false, false);
+                }
                 self.set_render_hover(host, None);
                 self.set_render_pressed(host, None);
                 return true;
             }
-            Ev::Touch { position, phase, .. } => match phase {
+            Ev::Touch { id, position, phase } => match phase {
                 corelib::input::TouchPhase::Started => {
                     (*position, PointerAction::Pressed(PointerEventButton::Left))
                 }
-                corelib::input::TouchPhase::Moved => (*position, PointerAction::Moved),
+                corelib::input::TouchPhase::Moved => {
+                    (*position, PointerAction::Moved { finger_id: *id })
+                }
                 corelib::input::TouchPhase::Ended => {
                     (*position, PointerAction::Released(PointerEventButton::Left))
                 }
                 corelib::input::TouchPhase::Cancelled => {
-                    // A cancelled gesture never had a click in it.
+                    // A cancelled gesture never had a click in it, and the finger
+                    // is gone without a release, so the tree's hold ends here.
+                    if let (Some(pressed), Some(button)) =
+                        (self.render_pressed.replace(None), self.render_pressed_button.take())
+                    {
+                        host.release_control(pressed, button, *position);
+                        host.apply_control_state(pressed, false, false);
+                    }
                     self.set_render_pressed(host, None);
                     return true;
                 }
@@ -1496,14 +1520,24 @@ impl WinitWindowAdapter {
             PointerAction::Pressed(button) => {
                 self.set_render_hover(host, target);
                 self.set_render_pressed(host, target);
+                self.render_pressed_button.set(Some(button));
                 // The press is the grab and the focus, and nothing else: whether
                 // the release that follows lands here is what makes a click.
                 if let Some(id) = target {
-                    host.press_control(id, button);
+                    host.press_control(id, button, position);
                 }
             }
-            PointerAction::Moved => {
+            PointerAction::Moved { finger_id } => {
                 self.set_render_hover(host, target);
+                // A move while a button is down is a drag, and a drag is the one
+                // thing a hover cannot express: the tree needs the sequence of
+                // points to measure. So while the press holds, the moves go to
+                // the tree as moves, and the tree's own grab decides which item
+                // keeps them -- a `Flickable` follows the pointer past its own
+                // edge, and a slider follows it along its track.
+                if self.render_pressed.get().is_some() {
+                    host.move_control(position, finger_id);
+                }
             }
             PointerAction::Released(button) => {
                 // The release ends the hold on whichever control held it.  A
@@ -1511,7 +1545,8 @@ impl WinitWindowAdapter {
                 // the click is worth is the tree's to decide, because that is
                 // the application's own code.
                 if let Some(pressed) = self.render_pressed.replace(None) {
-                    host.release_control(pressed, button);
+                    self.render_pressed_button.set(None);
+                    host.release_control(pressed, button, position);
                     host.apply_control_state(
                         pressed,
                         self.render_hovered.get() == Some(pressed),
@@ -1561,7 +1596,7 @@ impl WinitWindowAdapter {
         delta_y: f32,
     ) -> bool {
         match host.control_at(position.x, position.y) {
-            Some(id) => host.scroll_control(id, delta_x, delta_y),
+            Some(id) => host.scroll_control(id, position, delta_x, delta_y),
             None => true,
         }
     }
@@ -1573,7 +1608,7 @@ impl WinitWindowAdapter {
         delta: f32,
     ) -> bool {
         match host.control_at(position.x, position.y) {
-            Some(id) => host.pinch_control(id, delta),
+            Some(id) => host.pinch_control(id, position, delta),
             None => true,
         }
     }
@@ -1585,7 +1620,7 @@ impl WinitWindowAdapter {
         delta: f32,
     ) -> bool {
         match host.control_at(position.x, position.y) {
-            Some(id) => host.rotate_control(id, delta),
+            Some(id) => host.rotate_control(id, position, delta),
             None => true,
         }
     }
