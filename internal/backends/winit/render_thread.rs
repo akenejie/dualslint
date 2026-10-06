@@ -1,3 +1,26 @@
+thread_local! {
+    static THREAD_LOCAL_ACCESS: std::cell::RefCell<Option<ThreadLocalAccess>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(render_thread_can_draw)]
+#[derive(Clone)]
+struct ThreadLocalAccess {
+    coords: Arc<Mutex<PublishedControls>>,
+}
+
+#[cfg(not(render_thread_can_draw))]
+struct ThreadLocalAccess {}
+
+#[cfg(render_thread_can_draw)]
+fn with_tl_access<R>(f: impl FnOnce(&ThreadLocalAccess) -> R) -> Option<R> {
+    THREAD_LOCAL_ACCESS.with(|a| a.borrow().as_ref().map(f))
+}
+
+#[cfg(not(render_thread_can_draw))]
+fn with_tl_access<R>(_f: impl FnOnce(&ThreadLocalAccess) -> R) -> Option<R> {
+    None
+}
+
 // Copyright © akenejie
 // SPDX-License-Identifier: AGPL-3.0-only
 //
@@ -881,6 +904,11 @@ impl RenderHost {
     /// click or key event, since the control geometry lives with the render
     /// thread.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<u64> {
+        if on_render_thread() {
+            if let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().control_at(x, y)) {
+                return r;
+            }
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel::<Option<u64>>(1);
         let _ = self.sender.send(RenderMessage::HitTest { x, y, response: tx });
         rx.recv().unwrap_or(None)
@@ -896,6 +924,11 @@ impl RenderHost {
     /// input behind compositing.  The answer is one composite old at worst,
     /// which for a pointer move is imperceptible.
     pub fn control_at(&self, x: f32, y: f32) -> Option<u64> {
+        if on_render_thread() {
+            if let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().control_at(x, y)) {
+                return r;
+            }
+        }
         self.coords.lock().unwrap().control_at(x, y)
     }
 
