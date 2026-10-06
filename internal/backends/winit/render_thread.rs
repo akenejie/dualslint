@@ -23,7 +23,9 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 #[cfg(render_thread_can_draw)]
 use std::rc::Weak;
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, mpsc};
 
 #[cfg(render_thread_can_draw)]
 use i_slint_core::api::PhysicalSize;
@@ -57,15 +59,22 @@ pub use i_slint_backend_scene::*;
 // Shared global state
 // ---------------------------------------------------------------------------
 
-/// Render host — the send-half.  The UI thread and any worker thread holds
-/// this to reach the render thread.
-pub(crate) static GLOBAL_RENDER_HOST: OnceLock<RenderHost> = OnceLock::new();
+/// The render threads of the process, one per window that a render thread draws.
+///
+/// A window is a surface, and a surface is composited by one thread and no
+/// other: two render threads sharing a window would each need the other's
+/// graphics context. So the render threads are per window, and this is where
+/// the ones that exist are listed, because an API without a window argument --
+/// `request_redraw`, the system accent colour -- is a request about all of them.
+static GLOBAL_HOSTS: Mutex<Vec<RenderHost>> = Mutex::new(Vec::new());
 
-/// Shared coordinate table between the render thread (writer: publishes the
-/// composited controls' geometry + state) and the UI thread / workers
-/// (reader: hit-testing during event processing).  Initialised together with
-/// the render host in `ensure_render_thread`.
-pub(crate) static GLOBAL_COORDINATE_MAP: OnceLock<Arc<Mutex<PublishedControls>>> = OnceLock::new();
+/// The window the user is looking at, which is the window an API without a
+/// window argument has to mean.
+///
+/// `control_at(x, y)` takes coordinates in a window, and a window is what makes
+/// them mean anything, so the window-less API is about the one the keyboard
+/// goes to. Recorded by the UI thread when a window takes focus.
+static ACTIVE_HOST: Mutex<Option<RenderHost>> = Mutex::new(None);
 
 /// Global HWND (Windows only) stored when the winit window is created.
 #[cfg(target_os = "windows")]
@@ -471,31 +480,24 @@ pub(crate) fn on_render_thread() -> bool {
     ON_RENDER_THREAD.with(|on| on.get())
 }
 
-thread_local! {
-    /// The window the render thread draws the attached component into, as the UI
-    /// thread knows it: the window the application named when it attached, or --
-    /// when it named none -- the first window that was created.
-    ///
-    /// The choice lives here rather than on the render thread because only this
-    /// thread knows which window the application meant, and because the answer has
-    /// to be given again whenever the native window is created: a window that was
-    /// hidden and shown again is a different native window with a different id,
-    /// while the adapter here is the same object.
-    static SURFACE_OWNER: std::cell::RefCell<Option<std::rc::Weak<dyn WindowAdapter>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Name `window` as the one the render thread draws into, and report its native
-/// window if it already has one.  The record outlives the native window, because
-/// a window that is hidden and shown again comes back as a new native window.
-fn name_surface_owner(window: &SlintApiWindow) -> Option<winit::window::WindowId> {
+/// `window` as the one a render thread presents into, and its native window if
+/// it already has one.
+///
+/// The identity outlives the native window, because a window that is hidden and
+/// shown again comes back as a new native window, while the adapter behind it
+/// is the same object.
+fn name_surface_owner(window: &SlintApiWindow) -> Option<(usize, winit::window::WindowId)> {
     let window_adapter = WindowInner::from_pub(window).window_adapter();
-    let (weak, window_id) = window_adapter
+    let (identity, window_id) = window_adapter
         .internal(i_slint_core::InternalToken)
         .and_then(|wa| (wa as &dyn std::any::Any).downcast_ref::<WinitWindowAdapter>())
-        .map(|adapter| (adapter.self_weak.clone(), adapter.winit_window().map(|w| w.id())))?;
-    SURFACE_OWNER.with(|owner| *owner.borrow_mut() = Some(weak));
-    window_id
+        .map(|adapter| {
+            (
+                std::rc::Rc::as_ptr(&window_adapter) as *const () as usize,
+                adapter.winit_window().map(|w| w.id()),
+            )
+        })?;
+    Some((identity, window_id?))
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +512,23 @@ pub struct RenderHost {
     /// the UI-thread encode path once the render thread owns the screen.
     /// Shared across all clones of the host so every thread sees the state.
     attached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The window this render thread presents into, as an address that stands
+    /// for the window's adapter while it lives.
+    ///
+    /// Per host, because a render thread presents into exactly one window and
+    /// the record is what tells a second window that this thread is not its
+    /// renderer. An address a later window is given once the old one is gone can
+    /// only make that window think it owns this thread, which costs it a frame,
+    /// never correctness.
+    surface: Arc<Mutex<Option<usize>>>,
+    /// The controls this render thread composited, published for the UI thread
+    /// and for workers to hit-test against.
+    ///
+    /// One table per render thread, because a control id names an item in one
+    /// tree: with one process-wide table two windows would publish ids that
+    /// mean different items, and a pointer in the second window would be
+    /// resolved against the first window's layout.
+    coords: Arc<Mutex<PublishedControls>>,
 }
 
 impl Clone for RenderHost {
@@ -518,6 +537,8 @@ impl Clone for RenderHost {
             sender: self.sender.clone(),
             event_loop_proxy: self.event_loop_proxy.clone(),
             attached: self.attached.clone(),
+            surface: self.surface.clone(),
+            coords: self.coords.clone(),
         }
     }
 }
@@ -603,13 +624,34 @@ impl RenderHost {
     ) where
         F: FnOnce() -> Box<dyn std::any::Any> + Send + 'static,
     {
-        if let Some(window_id) = name_surface_owner(window) {
+        if let Some((identity, window_id)) = name_surface_owner(window) {
+            self.set_surface(identity);
             let _ = self.sender.send(RenderMessage::SetSurfaceOwner { window_id });
         }
         self.attached.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = self
             .sender
             .send(RenderMessage::AttachComponent { factory: Box::new(factory), property_access });
+    }
+
+    /// Record which window this render thread presents into.
+    fn set_surface(&self, identity: usize) {
+        if let Ok(mut surface) = self.surface.lock() {
+            *surface = Some(identity);
+        }
+    }
+
+    /// Whether this render thread presents into this window.
+    ///
+    /// A render thread presents into one window, so the first window that names
+    /// it is the one it takes, and any later window is a window whose rendering
+    /// has to be a render thread of its own.
+    fn owns(&self, identity: usize) -> bool {
+        let mut surface = self.surface.lock().expect("the surface record is not poisoned");
+        if surface.is_none() {
+            *surface = Some(identity);
+        }
+        *surface == Some(identity)
     }
 
     /// Request the render thread to apply a pointer state to the given control
@@ -797,7 +839,7 @@ impl RenderHost {
     /// input behind compositing.  The answer is one composite old at worst,
     /// which for a pointer move is imperceptible.
     pub fn control_at(&self, x: f32, y: f32) -> Option<u64> {
-        coordinate_map()?.lock().unwrap().control_at(x, y)
+        self.coords.lock().unwrap().control_at(x, y)
     }
 
     /// Send an arbitrary closure to execute on the render thread.
@@ -822,15 +864,9 @@ impl RenderHost {
         let window_id = window.id();
         let _ = self.sender.send(RenderMessage::Configure { window, width, height, scale_factor });
         // A window is the surface or it is not, and this thread is the one that
-        // can tell: an application with several windows attaches to the one it
-        // means, and everything else stays the UI thread's to draw.
-        let is_surface = SURFACE_OWNER.with(|owner| {
-            let mut owner = owner.borrow_mut();
-            if owner.is_none() {
-                *owner = Some(adapter.clone());
-            }
-            owner.as_ref().is_some_and(|known| known.ptr_eq(&adapter))
-        });
+        // can tell: it presents into one window, the first one to name it, and a
+        // window it does not present into is a window this thread must not draw.
+        let is_surface = self.owns(std::rc::Weak::as_ptr(&adapter) as *const () as usize);
         if is_surface {
             let _ = self.sender.send(RenderMessage::SetSurfaceOwner { window_id });
         }
@@ -891,6 +927,9 @@ impl RenderHost {
 /// The render-thread receive half and event loop driver.
 pub(crate) struct RenderCore {
     rx: mpsc::Receiver<RenderMessage>,
+    /// The table this thread publishes into. It is the same table the UI thread
+    /// reads, reached from the other end through the [`RenderHost`].
+    coords: Arc<Mutex<PublishedControls>>,
 }
 
 /// The window the render thread presents into.
@@ -1090,8 +1129,8 @@ impl SurfaceState {
 }
 
 impl RenderCore {
-    fn new(rx: mpsc::Receiver<RenderMessage>) -> Self {
-        Self { rx }
+    fn new(rx: mpsc::Receiver<RenderMessage>, coords: Arc<Mutex<PublishedControls>>) -> Self {
+        Self { rx, coords }
     }
 
     /// Run the render-thread event loop.  Blocks until `Quit`.
@@ -1303,9 +1342,7 @@ impl RenderCore {
                             }
                             // From here on the render thread owns every control.  Drop
                             // the UI-thread's publish so peers never borrow stale ids.
-                            if let Some(map) = coordinate_map() {
-                                map.lock().unwrap().clear();
-                            }
+                            self.coords.lock().unwrap().clear();
                             present = true;
                         }
                     }
@@ -1514,6 +1551,7 @@ impl RenderCore {
             {
                 present_render_owned(
                     state,
+                    &self.coords,
                     &render_window_adapter,
                     &mut render_controls,
                     &mut render_control_order,
@@ -1532,6 +1570,7 @@ impl RenderCore {
 #[cfg(render_thread_can_draw)]
 #[allow(clippy::too_many_arguments)]
 fn publish_mirror_controls(
+    coords: &Arc<Mutex<PublishedControls>>,
     render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     render_controls: &mut HashMap<u64, ControlRegion>,
     render_control_order: &mut Vec<u64>,
@@ -1560,7 +1599,7 @@ fn publish_mirror_controls(
     // side effect of compositing an encoded frame, does not run there, and
     // without this the UI thread would hit-test an empty table and no pointer
     // event would ever reach a control.
-    publish_control_coords(&table.controls, interaction);
+    publish_control_coords(coords, &table.controls, interaction);
     true
 }
 
@@ -1603,6 +1642,7 @@ fn adapter_configured(adapter: &Rc<dyn WindowAdapter>, size: PhysicalSize, scale
 #[allow(clippy::too_many_arguments)]
 fn present_render_owned(
     state: &mut DrawTarget,
+    coords: &Arc<Mutex<PublishedControls>>,
     render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     render_controls: &mut HashMap<u64, ControlRegion>,
     render_control_order: &mut Vec<u64>,
@@ -1610,6 +1650,7 @@ fn present_render_owned(
     interaction: &mut ControlInteraction,
 ) {
     if !publish_mirror_controls(
+        coords,
         render_window_adapter,
         render_controls,
         render_control_order,
@@ -1634,6 +1675,7 @@ fn present_render_owned(
 #[allow(clippy::too_many_arguments)]
 fn present_render_owned(
     _state: &mut DrawTarget,
+    _coords: &Arc<Mutex<PublishedControls>>,
     _render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     _render_controls: &mut HashMap<u64, ControlRegion>,
     _render_control_order: &mut Vec<u64>,
@@ -2163,12 +2205,15 @@ pub(crate) fn channel(
     event_loop_proxy: winit::event_loop::EventLoopProxy<crate::SlintEvent>,
 ) -> (RenderHost, RenderCore) {
     let (tx, rx) = mpsc::channel();
+    let coords = Arc::new(Mutex::new(PublishedControls::default()));
     let host = RenderHost {
         sender: tx,
         event_loop_proxy: Some(event_loop_proxy),
         attached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        surface: Arc::new(Mutex::new(None)),
+        coords: coords.clone(),
     };
-    let core = RenderCore::new(rx);
+    let core = RenderCore::new(rx, coords);
     (host, core)
 }
 
@@ -2176,9 +2221,52 @@ pub(crate) fn channel(
 // Accessor helpers
 // ---------------------------------------------------------------------------
 
-/// Obtain the [`RenderHost`] for the current process.
-pub fn host() -> Option<RenderHost> {
-    GLOBAL_RENDER_HOST.get().cloned()
+/// Every render thread of this process, for the APIs that are not about one
+/// window.
+///
+/// A worker thread has no window of its own to name, so `request_redraw` means
+/// every window that a render thread draws, and that is what this is for.
+pub fn hosts() -> Vec<RenderHost> {
+    GLOBAL_HOSTS.lock().map(|hosts| hosts.clone()).unwrap_or_default()
+}
+
+/// The render thread of the window the user is looking at.
+///
+/// A process with one window has one answer; a process with several has the
+/// focused one, which is the only window whose coordinates a caller who named
+/// none can have meant.
+pub fn active_host() -> Option<RenderHost> {
+    if let Ok(active) = ACTIVE_HOST.lock()
+        && let Some(host) = active.as_ref()
+    {
+        return Some(host.clone());
+    }
+    let hosts = hosts();
+    (hosts.len() == 1).then(|| hosts[0].clone())
+}
+
+/// Record which window the user is looking at. Called by the UI thread, which
+/// is the thread that hears about focus.
+pub(crate) fn set_active_host(host: &RenderHost) {
+    if let Ok(mut active) = ACTIVE_HOST.lock() {
+        *active = Some(host.clone());
+    }
+}
+
+/// Start a render thread for one window and remember it.
+///
+/// Called by the window adapter that owns the surface, because a render thread
+/// is only worth starting for a window that exists: the window itself arrives
+/// later as [`RenderMessage::Configure`], and until then the thread waits.
+pub(crate) fn create_host(
+    event_loop_proxy: &winit::event_loop::EventLoopProxy<crate::SlintEvent>,
+) -> RenderHost {
+    let (host, mut core) = channel(event_loop_proxy.clone());
+    if let Ok(mut hosts) = GLOBAL_HOSTS.lock() {
+        hosts.push(host.clone());
+    }
+    std::thread::Builder::new().name("slint-render".into()).spawn(move || core.run()).ok();
+    host
 }
 
 /// Hand `window`'s drawing to the render thread, and say whether the render
@@ -2190,7 +2278,11 @@ pub fn host() -> Option<RenderHost> {
 /// thread either: the UI thread does not draw, so
 /// [`report_window_no_one_draws`] names the reason instead of a blank window
 /// staying unexplained.
-pub(crate) fn take_over_drawing_of(window: &SlintApiWindow) -> bool {
+pub(crate) fn take_over_drawing_of(window: &SlintApiWindow, host: Option<&RenderHost>) -> bool {
+    let Some(host) = host else {
+        report_window_no_one_draws(window, "this window has no render thread to draw it");
+        return false;
+    };
     let Some(factory) = WindowInner::from_pub(window).render_factory() else {
         report_window_no_one_draws(
             window,
@@ -2200,25 +2292,21 @@ pub(crate) fn take_over_drawing_of(window: &SlintApiWindow) -> bool {
         );
         return false;
     };
-    let Some(host) = host() else {
-        report_window_no_one_draws(window, "no render thread is running");
-        return false;
-    };
     if !cfg!(render_thread_can_draw) {
         report_window_no_one_draws(
             window,
-            "this build has no renderer on the render thread, because the \
-             `renderer-femtovg` feature is off",
+            "this build has no renderer on the render thread, because no renderer \
+             feature that can draw off the UI thread is enabled",
         );
         return false;
     }
     if !host.has_attached_component() {
         host.attach_component_with_to(window, move || factory(), None);
-    } else if !render_thread_owns(window) {
+    } else if !host.owns(window_identity(window)) {
         report_window_no_one_draws(
             window,
-            "the render thread is already drawing another window, and it draws \
-             one window at a time",
+            "this window's render thread is already presenting into another \
+             window, and a render thread presents into one window at a time",
         );
         return false;
     }
@@ -2241,7 +2329,7 @@ static UNDRAWN_REPORTED: std::sync::Mutex<Option<std::collections::HashSet<usize
 /// the symptom -- an application that shows nothing -- names neither the
 /// missing renderer nor the missing factory.  Remembering the windows keeps a
 /// draw loop that runs 60 times a second from repeating the message every frame.
-fn report_window_no_one_draws(window: &SlintApiWindow, reason: &str) {
+pub(crate) fn report_window_no_one_draws(window: &SlintApiWindow, reason: &str) {
     if ON_RENDER_THREAD.with(|on| on.get()) {
         // The render thread is where a window is supposed to be drawn, and the
         // mirror's own draws come through here too.
@@ -2260,17 +2348,6 @@ fn report_window_no_one_draws(window: &SlintApiWindow, reason: &str) {
          will stay blank, and its controls are not reachable through the render \
          thread's control API."
     );
-}
-
-/// Whether the render thread has been told to draw into `window`.
-fn render_thread_owns(window: &SlintApiWindow) -> bool {
-    let window_adapter = WindowInner::from_pub(window).window_adapter();
-    // `Weak::ptr_eq`, not `==` on the raw pointers: a fat pointer carries a
-    // vtable, and two trait objects for the same adapter do not have to carry
-    // the same one, so comparing them whole answers a question nobody asked.
-    let window_adapter = std::rc::Rc::downgrade(&window_adapter);
-    SURFACE_OWNER
-        .with(|owner| owner.borrow().as_ref().is_some_and(|known| known.ptr_eq(&window_adapter)))
 }
 
 /// A number that stands for `window` while it lives.
@@ -2295,7 +2372,7 @@ fn window_identity(window: &SlintApiWindow) -> usize {
 ///
 /// This is a no-op when the render thread was never started.
 pub fn request_redraw() {
-    if let Some(host) = GLOBAL_RENDER_HOST.get() {
+    for host in hosts() {
         host.request_redraw();
     }
 }
@@ -2325,7 +2402,7 @@ pub extern "C" fn slint_render_thread_request_redraw() {
 /// render thread, so it is usable from a pointer move.
 #[unsafe(no_mangle)]
 pub extern "C" fn slint_render_thread_control_at(x: f32, y: f32) -> u64 {
-    host().and_then(|host| host.control_at(x, y)).unwrap_or(0)
+    active_host().and_then(|host| host.control_at(x, y)).unwrap_or(0)
 }
 
 /// Like [`slint_render_thread_control_at`], but waits for the render thread to
@@ -2334,7 +2411,7 @@ pub extern "C" fn slint_render_thread_control_at(x: f32, y: f32) -> u64 {
 /// resolving a click.
 #[unsafe(no_mangle)]
 pub extern "C" fn slint_render_thread_hit_test(x: f32, y: f32) -> u64 {
-    host().and_then(|host| host.hit_test(x, y)).unwrap_or(0)
+    active_host().and_then(|host| host.hit_test(x, y)).unwrap_or(0)
 }
 
 /// Assign one property of a borrowed control, blocking until the render thread
@@ -2364,7 +2441,7 @@ pub unsafe extern "C" fn slint_render_thread_set_control_property(
     // SAFETY: the caller of this unsafe function promised that `value.text` is
     // null or a NUL-terminated string.
     let Some(value) = (unsafe { value.to_value() }) else { return false };
-    host().is_some_and(|host| host.set_control_property(id, property, value))
+    active_host().is_some_and(|host| host.set_control_property(id, property, value))
 }
 
 thread_local! {
@@ -2401,7 +2478,7 @@ pub unsafe extern "C" fn slint_render_thread_get_control_property(
     let Some(property) = (unsafe { std::ffi::CStr::from_ptr(property) }).to_str().ok() else {
         return false;
     };
-    let Some(value) = host().and_then(|host| host.get_control_property(id, property)) else {
+    let Some(value) = active_host().and_then(|host| host.get_control_property(id, property)) else {
         return false;
     };
 
@@ -2434,7 +2511,7 @@ pub extern "C" fn slint_render_thread_apply_control_state(id: u64, hovered: bool
     if id == 0 {
         return;
     }
-    if let Some(host) = host() {
+    if let Some(host) = active_host() {
         host.apply_control_state(id, hovered, pressed);
     }
 }
@@ -2457,7 +2534,7 @@ pub extern "C" fn slint_render_thread_attach_component(
     factory: Option<extern "C" fn() -> *mut c_void>,
 ) -> bool {
     let Some(factory) = factory else { return false };
-    let Some(host) = host() else { return false };
+    let Some(host) = active_host() else { return false };
     host.attach_component(move || {
         // The pointer comes from `factory`, which the caller promised to
         // produce on the calling thread and to hand over.  The render thread is
@@ -2504,7 +2581,7 @@ pub unsafe extern "C" fn slint_render_thread_attach_component_with_property_acce
     access: CSlintRenderThreadPropertyAccess,
 ) -> bool {
     let Some(factory) = factory else { return false };
-    let Some(host) = host() else { return false };
+    let Some(host) = active_host() else { return false };
     host.attach_component_with(
         move || {
             // SAFETY: as in `slint_render_thread_attach_component`, the pointer
@@ -2530,17 +2607,19 @@ pub unsafe extern "C" fn slint_render_thread_attach_component_with_property_acce
 /// OS (xdg-desktop-settings watcher or the winit window adapter); a no-op
 /// when the render thread has not been started.
 pub fn forward_system_accent(color: Color) {
-    if let Some(host) = GLOBAL_RENDER_HOST.get() {
+    for host in hosts() {
         host.submit_accent(color);
     }
 }
 
-/// Access the shared coordinate table.  Returns `None` until the winit
-/// backend has been configured (`ensure_render_thread`).  UI thread and
-/// workers call this during event processing to hit-test the pointer against
-/// the latest geometry that the render thread actually composited.
-pub fn coordinate_map() -> Option<Arc<Mutex<PublishedControls>>> {
-    GLOBAL_COORDINATE_MAP.get().cloned()
+/// The controls the given render thread last composited.
+///
+/// UI thread and workers hit-test against this during event processing, so it
+/// is the geometry the render thread actually drew rather than what the layout
+/// would say. It belongs to one render thread, because a control id names an
+/// item in one tree.
+pub fn coordinate_map(host: &RenderHost) -> Arc<Mutex<PublishedControls>> {
+    host.coords.clone()
 }
 
 /// Replace the shared coordinate table with the given control regions.
@@ -2602,8 +2681,11 @@ impl ControlInteraction {
 /// thread needs to know *where* a control is, so that it can say which one the
 /// pointer landed on without knowing anything about how a click is answered.
 #[cfg(render_thread_can_draw)]
-fn publish_control_coords(controls: &[ControlRegion], interaction: &ControlInteraction) {
-    let Some(map) = coordinate_map() else { return };
+fn publish_control_coords(
+    map: &Arc<Mutex<PublishedControls>>,
+    controls: &[ControlRegion],
+    interaction: &ControlInteraction,
+) {
     let mut map = map.lock().unwrap();
     map.clear();
     for c in controls {

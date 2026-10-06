@@ -453,6 +453,12 @@ pub struct WinitWindowAdapter {
     /// Whether a *mouse* button is currently pressed. Touch input is handled
     /// separately via `process_touch_input` and does not affect this flag.
     pressed: Cell<bool>,
+    /// The render thread that draws this window.
+    ///
+    /// A window is a surface, and a surface is composited by one thread: the
+    /// render thread that takes this window has to be the one that presents
+    /// into it, so the host is per window rather than per process.
+    render_host: RefCell<Option<crate::render_thread::RenderHost>>,
     /// The render-thread control the pointer is over, and the one with the press.
     ///
     /// These are the UI thread's own answers, kept because it is the thread that
@@ -525,6 +531,7 @@ impl WinitWindowAdapter {
             custom_cursor_source: Cell::new(None),
             cursor_pos: Default::default(),
             pressed: Default::default(),
+            render_host: Default::default(),
             render_hovered: Default::default(),
             render_pressed: Default::default(),
             current_resize_direction: Default::default(),
@@ -774,7 +781,7 @@ impl WinitWindowAdapter {
         // attached to it.  It only needs to know the window exists, and this is
         // the one place every renderer agrees on: whoever created the native
         // window, this window now exists.
-        if let Some(host) = crate::render_thread::host() {
+        if let Some(host) = self.render_host() {
             let size = self.size.get();
             let scale_factor = self.window().scale_factor() as f64;
             // The adapter goes along because it is what tells this window apart
@@ -822,7 +829,7 @@ impl WinitWindowAdapter {
 
                 // The window is about to go away, so the render thread has to
                 // let go of it as well.
-                if let Some(host) = crate::render_thread::host() {
+                if let Some(host) = self.render_host() {
                     host.submit_suspend(window.id());
                 }
 
@@ -918,7 +925,8 @@ impl WinitWindowAdapter {
             return Ok(());
         }
 
-        if !crate::render_thread::take_over_drawing_of(self.window()) {
+        let host = self.render_host();
+        if !crate::render_thread::take_over_drawing_of(self.window(), host.as_ref()) {
             return Ok(());
         }
 
@@ -927,7 +935,7 @@ impl WinitWindowAdapter {
         // exist, which the render thread does on its own: it keeps the request
         // until it can name a window to draw into.
         if let Some(window_id) = self.winit_window().map(|window| window.id())
-            && let Some(host) = crate::render_thread::host()
+            && let Some(host) = self.render_host()
             && host.await_graphics(window_id)
         {
             self.hand_over_graphics();
@@ -1107,7 +1115,7 @@ impl WinitWindowAdapter {
             // on screen.  It lays that tree out for the size it is told here,
             // and it says which window the size belongs to, because it draws one
             // window and another window's size is not its business.
-            if let Some(host) = crate::render_thread::host()
+            if let Some(host) = self.render_host()
                 && let Some(window_id) = self.winit_window().map(|window| window.id())
             {
                 host.submit_resize(window_id, physical_size.width, physical_size.height);
@@ -1353,22 +1361,43 @@ impl WinitWindowAdapter {
         self.window().dispatch_event(WindowEvent::internal(event));
     }
 
-    /// Whether the render thread has taken over the controls, in which case the
-    /// UI thread hands the pointer events to that tree instead of dispatching
-    /// them into its own.
-    pub(crate) fn render_owns_controls() -> bool {
-        crate::render_thread::host().is_some_and(|host| host.has_attached_component())
+    /// This window's render thread, started the first time it is asked for.
+    ///
+    /// Starting it here rather than when the process starts is what makes one
+    /// render thread per window instead of one per process: the thread is a
+    /// property of the surface it presents into.
+    pub(crate) fn render_host(&self) -> Option<crate::render_thread::RenderHost> {
+        if let Some(host) = self.render_host.borrow().as_ref() {
+            return Some(host.clone());
+        }
+        let host = crate::render_thread::create_host(&self.shared_backend_data.event_loop_proxy);
+        *self.render_host.borrow_mut() = Some(host.clone());
+        Some(host)
+    }
+
+    /// Whether a render thread has taken over *this* window's controls, in
+    /// which case the UI thread hands this window's events to that tree instead
+    /// of dispatching them into its own.
+    ///
+    /// Asking about one window's render thread rather than about the process's:
+    /// each window is drawn by a render thread of its own, and a window whose
+    /// tree stayed on this thread must not have its input sent to a thread that
+    /// has never been told about it. It reads the host this window already has
+    /// rather than asking for one, so that answering the question cannot start a
+    /// render thread.
+    pub(crate) fn render_owns_controls(&self) -> bool {
+        self.render_host.borrow().as_ref().is_some_and(|host| host.has_attached_component())
     }
 
     /// Hand one pointer event to the tree that owns the controls.
     ///
     /// This thread is the one that hears the pointer, so turning the OS
     /// coordinates into logical ones is its work; deciding what the event means
-    /// is not. A press, a move, a wheel notch and the button that was not the
-    /// left one all reach the items this way, on the thread the items live on,
-    /// which is what lets a `ContextMenu` open its menu, a `Flickable` scroll
-    /// and a slider follow a drag -- all of which are more than a property the
-    /// UI thread could have set on the item's behalf.
+    /// is not. A press, a release, a wheel notch, a pinch and the button that was
+    /// not the left one all reach the items this way, on the thread the items
+    /// live on, which is what lets a `ContextMenu` open its menu and an edit
+    /// field take a key -- both of which are more than a property the UI thread
+    /// could have set on the item's behalf.
     ///
     /// Turn an OS pointer event into property changes on the render thread's
     /// tree, and report whether the render thread is the one that has them.
@@ -1396,8 +1425,9 @@ impl WinitWindowAdapter {
         event: impl Into<corelib::platform::InternalEvent>,
     ) -> bool {
         let event = event.into();
-        if !Self::render_owns_controls()
-            || !crate::render_thread::host()
+        if !self.render_owns_controls()
+            || !self
+                .render_host()
                 .is_some_and(|host| self.apply_pointer_to_render_controls(&host, &event))
         {
             self.dispatch_internal_event(event);
@@ -1576,8 +1606,8 @@ impl WinitWindowAdapter {
     /// item. Falling back here would feed a second, UI-side tree that has no
     /// focus to put it in.
     fn dispatch_key_event_to_render_controls(&self, event: &InternalKeyEvent) {
-        if Self::render_owns_controls()
-            && crate::render_thread::host().is_some_and(|host| host.send_key_to_control(event))
+        if self.render_owns_controls()
+            && self.render_host().is_some_and(|host| host.send_key_to_control(event))
         {
             return;
         }
@@ -1649,6 +1679,13 @@ impl WinitWindowAdapter {
                 // Work around https://github.com/rust-windowing/winit/issues/4371
                 let have_focus =
                     if cfg!(target_os = "macos") { winit_window.has_focus() } else { have_focus };
+                if have_focus {
+                    // The window the user is looking at is the window that an
+                    // API without a window argument has to mean.
+                    if let Some(host) = self.render_host() {
+                        crate::render_thread::set_active_host(&host);
+                    }
+                }
                 self.activation_changed(have_focus)?;
             }
 
@@ -2120,9 +2157,9 @@ impl WindowAdapter for WinitWindowAdapter {
         // tree it draws, calling into another component -- is already where it
         // belongs. Posting it would wait for an event loop that this thread is,
         // and it is the one making the call.
-        if Self::render_owns_controls()
+        if self.render_owns_controls()
             && !crate::render_thread::on_render_thread()
-            && let Some(host) = crate::render_thread::host()
+            && let Some(host) = self.render_host()
         {
             match host.run_on_screen_tree(task) {
                 Ok(()) => return,
@@ -2667,7 +2704,7 @@ impl Drop for WinitWindowAdapter {
         // window the application closed, and would hold on to that surface for
         // the rest of the process.
         if let Some(window_id) = window_id
-            && let Some(host) = crate::render_thread::host()
+            && let Some(host) = self.render_host()
         {
             host.submit_suspend(window_id);
         }

@@ -42,8 +42,6 @@ mod ios;
 /// behind.
 pub mod render_thread;
 
-use i_slint_backend_scene::PublishedControls;
-
 /// Re-export of the winit crate.
 pub use winit;
 
@@ -828,20 +826,6 @@ impl Drop for Backend {
     }
 }
 
-/// Spawn the render thread on the first call (from `run_event_loop` or when
-/// a window adapter is created). Idempotent: later calls are no-ops. The
-/// thread runs `RenderCore::run()` which blocks on the mpsc channel.
-pub(crate) fn ensure_render_thread(proxy: &winit::event_loop::EventLoopProxy<SlintEvent>) {
-    use crate::render_thread;
-    if render_thread::GLOBAL_RENDER_HOST.get().is_none() {
-        let (host, mut core) = render_thread::channel(proxy.clone());
-        let _ = render_thread::GLOBAL_RENDER_HOST.set(host);
-        let _ = render_thread::GLOBAL_COORDINATE_MAP
-            .set(Arc::new(std::sync::Mutex::new(PublishedControls::default())));
-        std::thread::Builder::new().name("slint-render".into()).spawn(move || core.run()).ok();
-    }
-}
-
 impl i_slint_core::platform::Platform for Backend {
     fn bind_context(&self, _ctx: i_slint_core::SlintContextWeak, _: i_slint_core::InternalToken) {
         let _ = self.shared_data.context.set(_ctx.clone());
@@ -882,13 +866,9 @@ impl i_slint_core::platform::Platform for Backend {
     }
 
     fn create_window_adapter(&self) -> Result<Rc<dyn WindowAdapter>, PlatformError> {
-        // The render thread is a property of the backend, not of a renderer, so
-        // it starts with the first window rather than with whichever renderer
-        // this build selected.  An application attaches a render-owned
-        // component right after showing its first window, and asks the host
-        // for the render thread there.
-        ensure_render_thread(&self.shared_data.event_loop_proxy.clone());
-
+        // No render thread is started here: one is started per window, by that
+        // window's adapter, because a window is the surface a render thread
+        // presents into and a surface belongs to one thread.
         let mut attrs = WinitWindowAdapter::window_attributes()?;
 
         if let Some(hook) = &self.window_attributes_hook {
@@ -922,8 +902,6 @@ impl i_slint_core::platform::Platform for Backend {
     }
 
     fn run_event_loop(&self) -> Result<(), PlatformError> {
-        ensure_render_thread(&self.shared_data.event_loop_proxy.clone());
-
         let loop_state = self.event_loop_state.borrow_mut().take().unwrap_or_else(|| {
             EventLoopState::new(self.shared_data.clone(), self.custom_application_handler.take())
         });
