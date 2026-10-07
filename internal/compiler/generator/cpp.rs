@@ -3764,6 +3764,7 @@ impl PublicCallTarget {
 fn screen_tree_call_code(
     route: &PublicCallTarget,
     arg_types: &[SmolStr],
+    arg_sources: &[String],
     ret: &crate::langtype::Type,
     call: &str,
 ) -> Vec<String> {
@@ -3772,8 +3773,6 @@ fn screen_tree_call_code(
     };
     let returns_value = *ret != crate::langtype::Type::Void;
     let mut code = vec![
-        "slint::private_api::assert_main_thread();".to_string(),
-        "[[maybe_unused]] auto self = this;".to_string(),
         "auto local_tree = self->self_weak.lock();".to_string(),
         if returns_value {
             "if (!local_tree) { return {}; }".to_string()
@@ -3789,8 +3788,7 @@ fn screen_tree_call_code(
         code.push(format!("    {} result;", ret.cpp_type().unwrap()));
     }
     code.push("};".to_string());
-    let arg_names: Vec<String> = (0..arg_types.len()).map(|i| format!("arg_{i}")).collect();
-    code.push(format!("SlintScreenTreeCallData call_data{{ {} }};", arg_names.join(", ")));
+    code.push(format!("SlintScreenTreeCallData call_data{{ {} }};", arg_sources.join(", ")));
     code.push("slint::cbindgen_private::slint_windowrc_run_on_screen_tree(".to_string());
     code.push("    &self->m_globals.window().window_handle().handle(),".to_string());
     code.push("    &local_tree->into_dyn(),".to_string());
@@ -3926,7 +3924,18 @@ fn generate_public_api_for_properties(
                     access,
                     (0..callback.args.len()).map(|i| format!("data->arg_{i}")).join(", ")
                 );
-                screen_tree_call_code(call_target, &param_types, &callback.return_type, &call)
+                let mut code = vec![
+                    "slint::private_api::assert_main_thread();".into(),
+                    "[[maybe_unused]] auto self = this;".into(),
+                ];
+                code.extend(screen_tree_call_code(
+                    call_target,
+                    &param_types,
+                    &(0..param_types.len()).map(|i| format!("arg_{i}")).collect::<Vec<_>>(),
+                    &callback.return_type,
+                    &call,
+                ));
+                code
             } else {
                 vec![
                     "slint::private_api::assert_main_thread();".into(),
@@ -3986,7 +3995,18 @@ fn generate_public_api_for_properties(
                     "{access}({})",
                     (0..function.args.len()).map(|i| format!("data->arg_{i}")).join(", ")
                 );
-                screen_tree_call_code(call_target, &param_types, &function.return_type, &call)
+                let mut code = vec![
+                    "slint::private_api::assert_main_thread();".into(),
+                    "[[maybe_unused]] auto self = this;".into(),
+                ];
+                code.extend(screen_tree_call_code(
+                    call_target,
+                    &param_types,
+                    &(0..param_types.len()).map(|i| format!("arg_{i}")).collect::<Vec<_>>(),
+                    &function.return_type,
+                    &call,
+                ));
+                code
             } else {
                 vec![
                     "[[maybe_unused]] auto self = this;".into(),
@@ -4031,11 +4051,26 @@ fn generate_public_api_for_properties(
             ));
 
             if !p.read_only() {
-                let prop_setter: Vec<String> = vec![
+                let mut prop_setter: Vec<String> = vec![
                     "slint::private_api::assert_main_thread();".into(),
                     "[[maybe_unused]] auto self = this;".into(),
                     property_set_value_code(&p.prop, "value", ctx) + ";",
                 ];
+                // The value the application assigned is now on the tree it holds,
+                // but the tree the window draws is the one whose bindings decide
+                // what is seen, so carry the value there too. A backend that draws
+                // the tree the caller holds runs this here, where it assigns the
+                // value that is already set and changes nothing.
+                if call_target.takes(&[], &p.ty) && p.ty.is_property_type() {
+                    let call = property_set_value_code(&p.prop, "data->arg_0", ctx);
+                    prop_setter.extend(screen_tree_call_code(
+                        call_target,
+                        &[cpp_property_type.clone()],
+                        &["value".to_string()],
+                        &Type::Void,
+                        &call,
+                    ));
+                }
                 declarations.push((
                     Access::Public,
                     Declaration::Function(Function {

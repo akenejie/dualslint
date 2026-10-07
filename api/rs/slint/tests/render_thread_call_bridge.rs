@@ -300,3 +300,29 @@ fn a_handover_carries_the_application_state_onto_the_drawn_tree() {
         "the drawn tree was given the values the application set"
     );
 }
+
+/// A value the application assigns after the handover reaches the drawn tree.
+#[test]
+fn a_value_set_after_the_handover_reaches_the_drawn_tree() {
+    let platform = PlatformShowingTree::install();
+    let app = BridgeApp::new().expect("the platform makes windows");
+    let adapter = platform.adapter_of_last_window();
+
+    // The handover: a second tree exists, and the window shows it from now on.
+    let mirror = second_tree(&app);
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+
+    app.set_count(42);
+    app.set_note(SharedString::from("set later"));
+
+    assert_eq!(
+        (mirror.get_count(), mirror.get_note().as_str()),
+        (42, "set later"),
+        "the tree that is drawn was given the value the application assigned"
+    );
+    assert_eq!(
+        (app.get_count(), app.get_note().as_str()),
+        (42, "set later"),
+        "and the tree the application reads back says the same thing"
+    );
+}

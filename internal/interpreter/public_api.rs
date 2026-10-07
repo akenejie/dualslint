@@ -18,12 +18,13 @@ use i_slint_compiler::llr::{
     PublicProperty, SubComponentPublicProperty,
 };
 use i_slint_compiler::object_tree::PropertyVisibility;
-use i_slint_core::item_tree::{ItemRc, ItemTreeVTable};
+use i_slint_core::item_tree::{ItemRc, ItemTreeRc, ItemTreeVTable};
 use i_slint_core::model::Model;
+use i_slint_core::window::WindowInner;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use vtable::VRc;
+use vtable::{VRc, VRef};
 
 /// Look up a public property by name on the given public component.
 /// Normalizes `name` through `normalize_identifier` so
@@ -57,11 +58,37 @@ pub fn set(
 }
 
 /// Write a public property, addressed by the instance itself.
-pub fn set_on(
-    instance: &Instance,
-    name: &str,
-    mut value: Value,
-) -> Result<(), SetPropertyError> {
+pub fn set_on(instance: &Instance, name: &str, mut value: Value) -> Result<(), SetPropertyError> {
+    let (public, sub) = resolve_root(instance).ok_or(SetPropertyError::NoSuchProperty)?;
+    let prop = find_public_property(public, name).ok_or(SetPropertyError::NoSuchProperty)?;
+    if !prop.ty.is_property_type() {
+        return Err(SetPropertyError::NoSuchProperty);
+    }
+    if prop.read_only() {
+        return Err(SetPropertyError::AccessDenied);
+    }
+    if !check_and_coerce(&mut value, &prop.ty) {
+        return Err(SetPropertyError::WrongType);
+    }
+    let portable = i_slint_compiler::llr::is_thread_portable_type(&prop.ty);
+    let ctx = EvalContext::new(sub);
+    store_property(&ctx, &prop.prop, value.clone());
+    // The value is now on the tree the instance holds, but a backend may draw a
+    // tree of its own, and that is the one whose bindings decide what is seen.
+    // Carry the value there too, for a property whose type can travel.
+    if portable {
+        forward_public_property(instance, name, value);
+    }
+    Ok(())
+}
+
+/// Write a public property on `instance` itself, without carrying the value to
+/// the tree a backend may draw.
+///
+/// The handover and the carry below both land on the tree that is drawn, so the
+/// write has to stop here: forwarding it again would send the value back to the
+/// tree it just reached.
+fn set_local(instance: &Instance, name: &str, mut value: Value) -> Result<(), SetPropertyError> {
     let (public, sub) = resolve_root(instance).ok_or(SetPropertyError::NoSuchProperty)?;
     let prop = find_public_property(public, name).ok_or(SetPropertyError::NoSuchProperty)?;
     if !prop.ty.is_property_type() {
@@ -76,6 +103,43 @@ pub fn set_on(
     let ctx = EvalContext::new(sub);
     store_property(&ctx, &prop.prop, value);
     Ok(())
+}
+
+/// Carry `value` of the public property `name` from the instance the application
+/// holds to the tree the window shows, when a backend draws one of its own.
+///
+/// A backend that draws the tree the instance holds runs the task against that
+/// same tree, where [`set_local`] assigns the value that is already set.
+fn forward_public_property(instance: &Instance, name: &str, value: Value) {
+    let Some(adapter) = instance.window_adapter_or_default() else { return };
+    let Some(local_tree) = WindowInner::from_pub(adapter.window()).try_component() else {
+        return;
+    };
+    // `Value` is not `Send` because a model is a shared reference, but the
+    // carried value is one that can travel, and the task runs before
+    // `run_on_screen_tree` returns.
+    struct Carried {
+        name: String,
+        value: Value,
+    }
+    unsafe impl Send for Carried {}
+    let state = Carried { name: name.to_string(), value };
+    struct CarriedPtr(*const Carried);
+    unsafe impl Send for CarriedPtr {}
+    impl CarriedPtr {
+        fn get(&self) -> &Carried {
+            // SAFETY: the pointee outlives this call, which returns before it.
+            unsafe { &*self.0 }
+        }
+    }
+    let ptr = CarriedPtr(&state as *const _);
+    let run = move |tree: &ItemTreeRc| {
+        let carried = ptr.get();
+        let screen = VRef::downcast_pin::<Instance>(VRc::borrow_pin(tree))
+            .expect("the tree on screen is not this interpreter component");
+        let _ = set_local(screen.get_ref(), &carried.name, carried.value.clone());
+    };
+    adapter.run_on_screen_tree(local_tree, Box::new(run));
 }
 
 /// The public properties of `instance` whose value can cross to another thread,
@@ -108,7 +172,7 @@ pub fn portable_public_state(instance: &Instance) -> Vec<(String, Value)> {
 /// only mean one of them is not what the caller thinks it is.
 pub fn apply_portable_public_state(instance: &Instance, state: &[(String, Value)]) {
     for (name, value) in state {
-        let _ = set_on(instance, name, value.clone());
+        let _ = set_local(instance, name, value.clone());
     }
 }
 

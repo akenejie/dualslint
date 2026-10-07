@@ -285,3 +285,47 @@ fn a_handover_carries_the_application_state_onto_the_drawn_tree() {
         "a struct cannot travel, so the drawn tree keeps the declared value"
     );
 }
+
+/// A value set after the handover reaches the drawn tree as well, so that the
+/// bindings that decide what is seen see it.
+#[test]
+fn a_value_set_after_the_handover_reaches_the_drawn_tree() {
+    let platform = PlatformShowingTree::install();
+    let app = create_instance();
+    let adapter = platform.adapter_of_last_window();
+
+    // The handover: a second tree exists and the window shows it from now on.
+    let mirror = create_instance();
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+
+    app.set_property("count", Value::from(42)).unwrap();
+    app.set_property("note", Value::from(SharedString::from("set later"))).unwrap();
+
+    assert_eq!(
+        count_and_note(&mirror),
+        (Some(Value::from(42)), Some(Value::from(SharedString::from("set later")))),
+        "a value set after the handover reached the tree that is drawn"
+    );
+    assert_eq!(
+        count_and_note(&app),
+        (Some(Value::from(42)), Some(Value::from(SharedString::from("set later")))),
+        "the value is on the caller's own tree too"
+    );
+
+    // A struct cannot travel, so setting one stays with the caller.
+    let mut point = slint_interpreter::Struct::default();
+    point.set_field("x".into(), Value::from(5));
+    app.set_property("point", Value::Struct(point)).unwrap();
+    let Value::Struct(point) = app.get_property("point").unwrap() else {
+        panic!("point is a struct")
+    };
+    assert_eq!(point.get_field("x"), Some(&Value::from(5)), "the caller's tree holds the struct");
+    let Value::Struct(point) = mirror.get_property("point").unwrap() else {
+        panic!("point is a struct")
+    };
+    assert_eq!(
+        point.get_field("x"),
+        Some(&Value::from(0)),
+        "a struct cannot travel, so the drawn tree keeps the declared value"
+    );
+}

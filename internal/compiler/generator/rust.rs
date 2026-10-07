@@ -1359,12 +1359,33 @@ fn public_api(
             let setter_ident = accessor_names::rust_accessor_ident(name, AccessorKind::Setter);
             if !p.read_only() {
                 let set_value = property_set_value_tokens(&p.prop, quote!(value), ctx);
+                let forward = if call_target.takes(&[], &p.ty) && p.ty.is_property_type() {
+                    let read_back = primitive_property_value(
+                        &p.ty,
+                        MemberAccess::Direct(access_member(&p.prop, ctx).unwrap()),
+                    );
+                    let set_forwarded = property_set_value_tokens(&p.prop, quote!(forwarded), ctx);
+                    let carry = call_target.wrap(set_forwarded);
+                    quote!(
+                        // The value the application assigned is now on the tree it
+                        // holds, but the tree the window draws is the one whose
+                        // bindings decide what is seen, so carry the value there
+                        // too. A backend that draws the tree the caller holds runs
+                        // this here, where it assigns the value that is already
+                        // set and changes nothing.
+                        let forwarded = #read_back;
+                        #carry
+                    )
+                } else {
+                    quote!()
+                };
                 property_and_callback_accessors.push(quote!(
                     #[allow(dead_code)]
                     pub fn #setter_ident(&self, value: #rust_property_type) {
                         #[allow(unused_imports)]
                         let _self = #self_init;
-                        #set_value
+                        #set_value;
+                        #forward
                     }
                 ));
             } else {
