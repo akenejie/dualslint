@@ -1151,22 +1151,7 @@ fn access_callback_tracker(
 /// are the basic types, which are; a model is not, because it is a shared `Rc`
 /// that belongs to the tree it was made for.
 fn is_thread_portable_type(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Void
-            | Type::Int32
-            | Type::Float32
-            | Type::Bool
-            | Type::String
-            | Type::Color
-            | Type::Keys
-            | Type::Percent
-            | Type::Angle
-            | Type::Duration
-            | Type::PhysicalLength
-            | Type::LogicalLength
-            | Type::Rem
-    )
+    crate::llr::is_thread_portable_type(ty)
 }
 
 /// Which tree an exported component's calls run against.

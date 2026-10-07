@@ -775,6 +775,7 @@ fn gen_corelib(
             "slint_windowrc_drop",
             "slint_windowrc_clone",
             "slint_windowrc_ensure_tree_instantiated",
+            "slint_windowrc_run_on_screen_tree",
             "slint_windowrc_set_render_factory",
             "slint_windowrc_show",
             "slint_windowrc_hide",

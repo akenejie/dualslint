@@ -1503,6 +1503,16 @@ fn generate_public_component(
 
     let old_declarations = file.declarations.len();
 
+    // A component rooted in a window asks that window which tree it shows, so
+    // its callback and function calls follow the tree that is drawn. A tray
+    // icon is not a window, so there is nothing to ask.
+    let call_target = match component.top_level_type {
+        llr::TopLevelComponentType::Window => {
+            PublicCallTarget::ScreenTree { component_type: component_id.clone() }
+        }
+        llr::TopLevelComponentType::SystemTrayIcon => PublicCallTarget::OwnTree,
+    };
+
     generate_item_tree(
         &mut component_struct,
         &component.item_tree,
@@ -1528,6 +1538,7 @@ fn generate_public_component(
         &component.public_properties,
         &component.private_properties,
         &ctx,
+        &call_target,
     );
 
     // Window-rooted components route `show`/`hide` through the underlying
@@ -3606,6 +3617,7 @@ fn generate_global(
         &global.public_properties,
         &global.private_properties,
         &ctx,
+        &PublicCallTarget::OwnTree,
     );
     global_struct
         .members
@@ -3664,6 +3676,7 @@ fn generate_global_builtin(
         &global.public_properties,
         &global.private_properties,
         &ctx,
+        &PublicCallTarget::OwnTree,
     );
     file.definitions.extend(global_struct.extract_definitions().collect::<Vec<_>>());
     file.declarations.push(Declaration::Struct(global_struct));
@@ -3698,11 +3711,98 @@ fn generate_functions<'a>(
     })
 }
 
+/// Which tree an exported component's calls run against.
+enum PublicCallTarget {
+    /// The call runs against the tree the caller holds, which is the tree that
+    /// is drawn.
+    OwnTree,
+    /// The call runs against the tree the window shows, on the thread that tree
+    /// lives on. A backend can draw a tree of its own, and then the component
+    /// the caller holds is not the one on screen, so a call has to be carried
+    /// there to reach the bindings and callbacks that decide what it does.
+    ScreenTree { component_type: SmolStr },
+}
+
+impl PublicCallTarget {
+    /// Whether a call with these argument and return types can travel to the
+    /// thread that draws the tree on screen and bring a value back.
+    fn takes(&self, args: &[crate::langtype::Type], ret: &crate::langtype::Type) -> bool {
+        matches!(self, PublicCallTarget::ScreenTree { .. })
+            && crate::llr::is_thread_portable_type(ret)
+            && args.iter().all(crate::llr::is_thread_portable_type)
+    }
+}
+
+/// The statements that run a call against the tree the window shows.
+///
+/// `call` is the call itself, written against `self` (the component on screen)
+/// and the arguments as `data->arg_0`, `data->arg_1`, and so on. Its value is
+/// assigned to `data->result` unless the call returns nothing. The call is
+/// posted to the render thread and waited for, so plain values carry safely.
+fn screen_tree_call_code(
+    route: &PublicCallTarget,
+    arg_types: &[SmolStr],
+    ret: &crate::langtype::Type,
+    call: &str,
+) -> Vec<String> {
+    let PublicCallTarget::ScreenTree { component_type } = route else {
+        unreachable!("only screen-tree calls are generated here")
+    };
+    let returns_value = *ret != crate::langtype::Type::Void;
+    let mut code = vec![
+        "slint::private_api::assert_main_thread();".to_string(),
+        "[[maybe_unused]] auto self = this;".to_string(),
+        "auto local_tree = self->self_weak.lock();".to_string(),
+        if returns_value {
+            "if (!local_tree) { return {}; }".to_string()
+        } else {
+            "if (!local_tree) { return; }".to_string()
+        },
+        "struct SlintScreenTreeCallData {".to_string(),
+    ];
+    for (i, ty) in arg_types.iter().enumerate() {
+        code.push(format!("    {ty} arg_{i};"));
+    }
+    if returns_value {
+        code.push(format!("    {} result;", ret.cpp_type().unwrap()));
+    }
+    code.push("};".to_string());
+    let arg_names: Vec<String> = (0..arg_types.len()).map(|i| format!("arg_{i}")).collect();
+    code.push(format!("SlintScreenTreeCallData call_data{{ {} }};", arg_names.join(", ")));
+    code.push("slint::cbindgen_private::slint_windowrc_run_on_screen_tree(".to_string());
+    code.push("    &self->m_globals.window().window_handle().handle(),".to_string());
+    code.push("    &local_tree->into_dyn(),".to_string());
+    code.push("    &call_data,".to_string());
+    code.push(
+        "    [](void *user_data, const slint::cbindgen_private::ItemTreeRc *tree) {".to_string(),
+    );
+    code.push(
+        "        auto *data = static_cast<SlintScreenTreeCallData *>(user_data);".to_string(),
+    );
+    code.push(format!(
+        "        if (tree->vtable() != &{component_type}::static_vtable) {{ return; }}"
+    ));
+    code.push(format!(
+        "        [[maybe_unused]] auto self = static_cast<const {component_type} *>(tree->borrow().instance);"
+    ));
+    if returns_value {
+        code.push(format!("        data->result = {call};"));
+    } else {
+        code.push(format!("        {call};"));
+    }
+    code.push("    });".to_string());
+    if returns_value {
+        code.push("return call_data.result;".to_string());
+    }
+    code
+}
+
 fn generate_public_api_for_properties(
     declarations: &mut Vec<(Access, Declaration)>,
     public_properties: &llr::PublicProperties,
     private_properties: &llr::PrivateProperties,
     ctx: &EvaluationContext,
+    call_target: &PublicCallTarget,
 ) {
     for (name, p) in public_properties {
         let access = access_member(&p.prop, ctx).unwrap();
@@ -3710,15 +3810,24 @@ fn generate_public_api_for_properties(
         if let Type::Callback(callback) = &p.ty {
             let param_types =
                 callback.args.iter().map(|t| t.cpp_type().unwrap()).collect::<Vec<_>>();
-            let callback_emitter = vec![
-                "slint::private_api::assert_main_thread();".into(),
-                "[[maybe_unused]] auto self = this;".into(),
-                format!(
-                    "return {}.call({});",
+            let callback_emitter = if call_target.takes(&callback.args, &callback.return_type) {
+                let call = format!(
+                    "{}.call({})",
                     access,
-                    (0..callback.args.len()).map(|i| format!("arg_{i}")).join(", ")
-                ),
-            ];
+                    (0..callback.args.len()).map(|i| format!("data->arg_{i}")).join(", ")
+                );
+                screen_tree_call_code(call_target, &param_types, &callback.return_type, &call)
+            } else {
+                vec![
+                    "slint::private_api::assert_main_thread();".into(),
+                    "[[maybe_unused]] auto self = this;".into(),
+                    format!(
+                        "return {}.call({});",
+                        access,
+                        (0..callback.args.len()).map(|i| format!("arg_{i}")).join(", ")
+                    ),
+                ]
+            };
             declarations.push((
                 Access::Public,
                 Declaration::Function(Function {
@@ -3762,14 +3871,22 @@ fn generate_public_api_for_properties(
             let param_types =
                 function.args.iter().map(|t| t.cpp_type().unwrap()).collect::<Vec<_>>();
             let ret = function.return_type.cpp_type().unwrap();
-            let call_code = vec![
-                "[[maybe_unused]] auto self = this;".into(),
-                format!(
-                    "{}{access}({});",
-                    if function.return_type == Type::Void { "" } else { "return " },
-                    (0..function.args.len()).map(|i| format!("arg_{i}")).join(", ")
-                ),
-            ];
+            let call_code = if call_target.takes(&function.args, &function.return_type) {
+                let call = format!(
+                    "{access}({})",
+                    (0..function.args.len()).map(|i| format!("data->arg_{i}")).join(", ")
+                );
+                screen_tree_call_code(call_target, &param_types, &function.return_type, &call)
+            } else {
+                vec![
+                    "[[maybe_unused]] auto self = this;".into(),
+                    format!(
+                        "{}{access}({});",
+                        if function.return_type == Type::Void { "" } else { "return " },
+                        (0..function.args.len()).map(|i| format!("arg_{i}")).join(", ")
+                    ),
+                ]
+            };
             declarations.push((
                 Access::Public,
                 Declaration::Function(Function {

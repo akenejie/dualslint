@@ -2706,6 +2706,54 @@ pub mod ffi {
         }
     }
 
+    /// Run `task` against the tree the window in `handle` shows, on the thread
+    /// that draws it, and wait for it.
+    ///
+    /// This is the bridge that C++ generated code uses so that a callback or
+    /// function of a window-rooted component reaches the tree on screen, which
+    /// is what the Rust generator does with `Window::call_on_screen_tree`. The
+    /// tree the caller holds is `local_tree`, and it is what runs the call when
+    /// the window has no tree of its own. The call is synchronous: `task` has
+    /// run, on whichever thread, before this returns.
+    ///
+    /// Safety: `handle` and `local_tree` must point to valid values of their
+    /// types, and `user_data` must be valid for `task` to use. `task` and
+    /// `user_data` cross to the render thread as if they were `Send`, so
+    /// whatever they reach must be safe to use there -- which holds when the
+    /// call only carries plain values.
+    #[cfg(feature = "std")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_windowrc_run_on_screen_tree(
+        handle: *const WindowAdapterRcOpaque,
+        local_tree: *const ItemTreeRc,
+        user_data: *mut c_void,
+        task: extern "C" fn(*mut c_void, *const ItemTreeRc),
+    ) {
+        /// The callback and its data, carried to the render thread. The data is
+        /// the caller's and only has to live until the synchronous call returns,
+        /// so it never really needs to be `Send`; it just has to reach the
+        /// thread that draws.
+        struct PortableCall {
+            user_data: *mut c_void,
+            task: extern "C" fn(*mut c_void, *const ItemTreeRc),
+        }
+        // SAFETY: the caller guarantees, as documented above, that the task and
+        // its data can be used on the render thread and that the data outlives
+        // this call.
+        unsafe impl Send for PortableCall {}
+
+        let call = PortableCall { user_data, task };
+        let run = move |tree: &ItemTreeRc| {
+            // Hold the whole call so the closure carries the `Send` wrapper
+            // rather than capturing the raw pointer on its own.
+            let call = &call;
+            (call.task)(call.user_data, core::ptr::from_ref(tree))
+        };
+        let local = unsafe { &*local_tree }.clone();
+        let window_adapter = unsafe { &*(handle as *const Rc<dyn WindowAdapter>) };
+        window_adapter.run_on_screen_tree(local, Box::new(run));
+    }
+
     /// Remember how to make another instance of the component showing in `handle`.
     ///
     /// `ctor` and `dtor` are the generated code's own: only it knows how to build
