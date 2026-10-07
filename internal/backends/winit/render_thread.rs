@@ -6,7 +6,13 @@ thread_local! {
 #[derive(Clone)]
 struct ThreadLocalAccess {
     coords: Arc<Mutex<PublishedControls>>,
-    item_map: Arc<Mutex<std::collections::HashMap<u64, i_slint_core::item_tree::ItemRc>>>,
+    // The render loop's live state, shared rather than copied so a peer call
+    // that arrives from this very thread acts on the tree the loop is between
+    // frames with instead of waiting on a channel this thread owns.
+    item_map: Rc<RefCell<HashMap<u64, ItemRc>>>,
+    component: Rc<RefCell<Option<Box<dyn std::any::Any>>>>,
+    property_access: Rc<RefCell<Option<ComponentPropertyAccess>>>,
+    adapter: Rc<RefCell<Option<Rc<dyn WindowAdapter>>>>,
 }
 
 #[cfg(not(render_thread_can_draw))]
@@ -21,6 +27,16 @@ fn with_tl_access<R>(f: impl FnOnce(&ThreadLocalAccess) -> R) -> Option<R> {
 fn with_tl_access<R>(_f: impl FnOnce(&ThreadLocalAccess) -> R) -> Option<R> {
     None
 }
+
+// Set to `Some` when the loop is running on its thread and `None` once it ends.
+// It is the signal a peer call reads to skip the channel and act directly.
+#[cfg(render_thread_can_draw)]
+fn set_tl_access(access: Option<ThreadLocalAccess>) {
+    THREAD_LOCAL_ACCESS.with(|a| *a.borrow_mut() = access);
+}
+
+#[cfg(not(render_thread_can_draw))]
+fn set_tl_access(_access: Option<ThreadLocalAccess>) {}
 
 // Copyright © akenejie
 // SPDX-License-Identifier: AGPL-3.0-only
@@ -605,6 +621,21 @@ impl RenderHost {
         self.attached.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// True when this call comes from the very thread that runs this host's
+    /// render loop.
+    ///
+    /// That is the one case where posting a message and waiting for it would
+    /// wait on an event loop that is the caller: the loop is blocked inside the
+    /// callback making the call, so the call has to act in place. A call from a
+    /// *different* render thread is an ordinary cross-thread call and still goes
+    /// through the channel, which is why the host's own table is what identifies
+    /// a match rather than the thread flag alone.
+    fn is_own_render_thread(&self) -> bool {
+        on_render_thread()
+            && with_tl_access(|tl| Arc::as_ptr(&tl.coords) == Arc::as_ptr(&self.coords))
+                .unwrap_or(false)
+    }
+
     /// Send the app's component factory to the render thread.  `factory`
     /// executes on the render thread and must call the generated `App::new()`
     /// *there* (after seeding a headless platform via
@@ -731,6 +762,30 @@ impl RenderHost {
     ///
     /// Ui thread and library-external workers are equal peers here.
     pub fn activate_control(&self, id: u64) -> bool {
+        // A call from the render thread itself cannot wait on the channel it
+        // would answer on: it acts on the tree in place instead, using the same
+        // state the loop holds.
+        if self.is_own_render_thread()
+            && let Some(result) = with_tl_access(|tl| {
+                let region = {
+                    let coords = tl.coords.lock().unwrap();
+                    coords.by_id.get(&id).map(|c| ControlRegion {
+                        id,
+                        geometry: i_slint_core::lengths::LogicalRect::new(
+                            LogicalPoint::new(c.x, c.y),
+                            i_slint_core::lengths::LogicalSize::new(c.width, c.height),
+                        ),
+                    })
+                };
+                let adapter = tl.adapter.borrow().clone();
+                match (region, adapter) {
+                    (Some(region), Some(adapter)) => activate_control(&adapter, &region),
+                    _ => false,
+                }
+            })
+        {
+            return result;
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
         let _ = self.sender.send(RenderMessage::ActivateControl { id, response: tx });
         rx.recv().unwrap_or(false)
@@ -746,6 +801,19 @@ impl RenderHost {
     /// `key-pressed` handler and a `TextInput` are then all answered by the
     /// same code that answers them when the pointer does reach the tree.
     pub fn send_key_to_control(&self, event: &InternalKeyEvent) -> bool {
+        // In-thread callers hand the key to the tree here; there is no channel
+        // round-trip to wait on.
+        if self.is_own_render_thread()
+            && let Some(result) = with_tl_access(|tl| {
+                tl.adapter
+                    .borrow()
+                    .clone()
+                    .map(|adapter| send_key_to_tree(&adapter, event))
+                    .unwrap_or(false)
+            })
+        {
+            return result;
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
         let _ = self
             .sender
@@ -832,6 +900,24 @@ impl RenderHost {
         if !self.attached.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(task);
         }
+        // The loop owns the tree on this thread; asking it through the channel
+        // would wait on the very loop that is making the call. Run it here.
+        if self.is_own_render_thread() {
+            let tree = with_tl_access(|tl| {
+                tl.adapter
+                    .borrow()
+                    .as_ref()
+                    .and_then(|adapter| WindowInner::from_pub(adapter.window()).try_component())
+            })
+            .flatten();
+            return match tree {
+                Some(tree) => {
+                    task(&tree);
+                    Ok(())
+                }
+                None => Err(task),
+            };
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         match self.sender.send(RenderMessage::RunOnScreenTree { task, done: tx }) {
             Ok(()) => {
@@ -862,6 +948,25 @@ impl RenderHost {
         property: &str,
         value: ControlPropertyValue,
     ) -> bool {
+        // In-thread callers assign through the same state the loop holds.
+        if self.is_own_render_thread()
+            && let Some(result) = with_tl_access(|tl| {
+                let item_rc = tl.item_map.borrow().get(&id).cloned();
+                item_rc
+                    .map(|item_rc| {
+                        apply_control_property(
+                            tl.component.borrow().as_deref(),
+                            tl.property_access.borrow().as_ref(),
+                            &item_rc,
+                            property,
+                            &value,
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+        {
+            return result;
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
         let _ = self.sender.send(RenderMessage::SetControlProperty {
             id,
@@ -890,6 +995,22 @@ impl RenderHost {
     ///
     /// Returns `None` when the id or the property name does not resolve.
     pub fn get_control_property(&self, id: u64, property: &str) -> Option<ControlPropertyValue> {
+        // In-thread callers read through the same state the loop holds.
+        if self.is_own_render_thread()
+            && let Some(result) = with_tl_access(|tl| {
+                let item_rc = tl.item_map.borrow().get(&id).cloned();
+                item_rc.and_then(|item_rc| {
+                    read_control_property(
+                        tl.component.borrow().as_deref(),
+                        tl.property_access.borrow().as_ref(),
+                        &item_rc,
+                        property,
+                    )
+                })
+            })
+        {
+            return result;
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.sender.send(RenderMessage::GetControlProperty {
             id,
@@ -905,7 +1026,7 @@ impl RenderHost {
     /// click or key event, since the control geometry lives with the render
     /// thread.
     pub fn hit_test(&self, x: f32, y: f32) -> Option<u64> {
-        if on_render_thread() {
+        if self.is_own_render_thread() {
             if let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().control_at(x, y)) {
                 return r;
             }
@@ -1227,6 +1348,16 @@ impl RenderCore {
     /// Run the render-thread event loop.  Blocks until `Quit`.
     pub(crate) fn run(&mut self) {
         ON_RENDER_THREAD.with(|on| on.set(true));
+        // The loop is done when it returns; clear the state a peer call reads
+        // so a later call on this thread posts a message instead.
+        struct ClearOnExit;
+        impl Drop for ClearOnExit {
+            fn drop(&mut self) {
+                ON_RENDER_THREAD.with(|on| on.set(false));
+                set_tl_access(None);
+            }
+        }
+        let _clear_on_exit = ClearOnExit;
         // Render-thread state: the window to present into, and the GL context
         // and upstream renderer once the UI thread has handed the window's
         // graphics over.
@@ -1242,18 +1373,25 @@ impl RenderCore {
         let mut render_control_order: Vec<u64> = Vec::new();
         // Render-side item behind each control id, so property loans can
         // assign to the mirror tree item directly.  Stays on this thread.
-        let mut render_item_rcs: HashMap<u64, ItemRc> = HashMap::new();
+        let render_item_rcs: Rc<RefCell<HashMap<u64, ItemRc>>> =
+            Rc::new(RefCell::new(HashMap::new()));
         let mut interaction = ControlInteraction::default();
         // Keeps the mirror component tree alive for the lifetime of the
         // render thread (the strong handle owns the ItemTree).  Moved in
-        // only from `AttachComponent`; never leaves this thread.
+        // only from `AttachComponent`; never leaves this thread.  Shared with
+        // the thread-local access so a peer call from this thread finds it.
         // Filled in by the attach handler, which only the GPU renderers run.
-        #[cfg_attr(not(render_thread_can_draw), allow(unused_mut))]
-        let mut render_component: Option<Box<dyn std::any::Any>> = None;
+        let render_component: Rc<RefCell<Option<Box<dyn std::any::Any>>>> =
+            Rc::new(RefCell::new(None));
         // How to ask the application about the properties of that component.
         // Filled in by the attach handler, which only the GPU renderers run.
-        #[cfg_attr(not(render_thread_can_draw), allow(unused_mut))]
-        let mut render_property_access: Option<ComponentPropertyAccess> = None;
+        let render_property_access: Rc<RefCell<Option<ComponentPropertyAccess>>> =
+            Rc::new(RefCell::new(None));
+        // The headless adapter the mirror draws into, shared for the same
+        // reason as the component above.
+        #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))]
+        let shared_adapter: Rc<RefCell<Option<Rc<dyn WindowAdapter>>>> =
+            Rc::new(RefCell::new(None));
         // Last system accent forwarded by the UI thread; applied to the
         // mirror context on attach in case the accent update arrives before
         // the mirror component exists.
@@ -1417,10 +1555,22 @@ impl RenderCore {
                             let _ = i_slint_core::platform::set_platform(Box::new(
                                 RenderMirrorPlatform::new(frame_request.clone()),
                             ));
-                            render_component = Some(factory());
-                            render_property_access = property_access;
+                            render_component.borrow_mut().replace(factory());
+                            *render_property_access.borrow_mut() = property_access;
                             render_window_adapter =
                                 HEADLESS_ADAPTER_SLOT.with(|slot| slot.get().cloned());
+                            *shared_adapter.borrow_mut() = render_window_adapter.clone();
+                            // The loop is now the tree's owner on this thread, so
+                            // publish the shared state a peer call from this thread
+                            // reads instead of posting a message it could never
+                            // answer while it is the one running.
+                            set_tl_access(Some(ThreadLocalAccess {
+                                coords: self.coords.clone(),
+                                item_map: render_item_rcs.clone(),
+                                component: render_component.clone(),
+                                property_access: render_property_access.clone(),
+                                adapter: shared_adapter.clone(),
+                            }));
                             // Mirror the host's system accent into the mirror context
                             // so widget palettes (checked boxes, etc.) resolve the
                             // same colour the host would, instead of the default.
@@ -1444,16 +1594,16 @@ impl RenderCore {
                         // synthesized as input. The click itself is not state: it
                         // is a decision the item tree has to make, and that is what
                         // `ActivateControl` below delegates to the tree.
-                        let Some(item_rc) = render_item_rcs.get(&id) else {
+                        let Some(item_rc) = render_item_rcs.borrow().get(&id).cloned() else {
                             continue;
                         };
                         let mut changed = false;
                         if hovered != interaction.is_hovered(id) {
                             interaction.set_hovered(id, hovered);
                             changed |= apply_control_property(
-                                render_component.as_deref(),
-                                render_property_access.as_ref(),
-                                item_rc,
+                                render_component.borrow().as_deref(),
+                                render_property_access.borrow().as_ref(),
+                                &item_rc,
                                 "has-hover",
                                 &ControlPropertyValue::Bool(hovered),
                             );
@@ -1461,9 +1611,9 @@ impl RenderCore {
                         if pressed != interaction.is_pressed(id) {
                             interaction.set_pressed(id, pressed);
                             changed |= apply_control_property(
-                                render_component.as_deref(),
-                                render_property_access.as_ref(),
-                                item_rc,
+                                render_component.borrow().as_deref(),
+                                render_property_access.borrow().as_ref(),
+                                &item_rc,
                                 "pressed",
                                 &ControlPropertyValue::Bool(pressed),
                             );
@@ -1473,12 +1623,14 @@ impl RenderCore {
                     }
                     RenderMessage::SetControlProperty { id, property, value, response } => {
                         let ok = render_item_rcs
+                            .borrow()
                             .get(&id)
+                            .cloned()
                             .map(|item_rc| {
                                 apply_control_property(
-                                    render_component.as_deref(),
-                                    render_property_access.as_ref(),
-                                    item_rc,
+                                    render_component.borrow().as_deref(),
+                                    render_property_access.borrow().as_ref(),
+                                    &item_rc,
                                     &property,
                                     &value,
                                 )
@@ -1492,14 +1644,15 @@ impl RenderCore {
                     RenderMessage::GetControlProperty { id, property, response } => {
                         // Answering a read changes nothing on screen, so this does
                         // not re-present: the caller only needed to know the value.
-                        let value = render_item_rcs.get(&id).and_then(|item_rc| {
-                            read_control_property(
-                                render_component.as_deref(),
-                                render_property_access.as_ref(),
-                                item_rc,
-                                &property,
-                            )
-                        });
+                        let value =
+                            render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                                read_control_property(
+                                    render_component.borrow().as_deref(),
+                                    render_property_access.borrow().as_ref(),
+                                    &item_rc,
+                                    &property,
+                                )
+                            });
                         let _ = response.send(value);
                     }
                     RenderMessage::PressControl { id, button, position } => {
@@ -1630,7 +1783,7 @@ impl RenderCore {
                         // because it described a window that no longer exists.
                         render_controls.clear();
                         render_control_order.clear();
-                        render_item_rcs.clear();
+                        render_item_rcs.borrow_mut().clear();
                         interaction.clear();
                     }
                     RenderMessage::Quit => break,
@@ -1648,7 +1801,7 @@ impl RenderCore {
             // Only a window this thread has a tree for is drawn here.  Without
             // one the render thread stays out of the way, and its context must
             // never be taken from a window the UI thread draws itself.
-            if render_component.is_some()
+            if render_component.borrow().is_some()
                 && (present || frame_requested || animating_now)
                 && let Some(state) = surface.obtain()
             {
@@ -1658,7 +1811,7 @@ impl RenderCore {
                     &render_window_adapter,
                     &mut render_controls,
                     &mut render_control_order,
-                    &mut render_item_rcs,
+                    &render_item_rcs,
                     &mut interaction,
                 );
             }
@@ -1677,7 +1830,7 @@ fn publish_mirror_controls(
     render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     render_controls: &mut HashMap<u64, ControlRegion>,
     render_control_order: &mut Vec<u64>,
-    render_item_rcs: &mut HashMap<u64, ItemRc>,
+    render_item_rcs: &Rc<RefCell<HashMap<u64, ItemRc>>>,
     interaction: &mut ControlInteraction,
 ) -> bool {
     let Some(adapter) = render_window_adapter.as_ref() else {
@@ -1695,22 +1848,15 @@ fn publish_mirror_controls(
     *render_controls = table.controls.iter().map(|r| (r.id, r.clone())).collect();
     render_control_order.clear();
     render_control_order.extend(table.controls.iter().map(|r| r.id));
-    render_item_rcs.clear();
-    render_item_rcs.extend(table.item_refs);
+    // Writing into the shared map is what makes it visible to a peer call
+    // running on this same thread; no separate publish step is needed.
+    *render_item_rcs.borrow_mut() = table.item_refs.into_iter().collect();
     interaction.retain(&table.controls);
     // The only publish on the GPU path. `render_scene`, which publishes as a
     // side effect of compositing an encoded frame, does not run there, and
     // without this the UI thread would hit-test an empty table and no pointer
     // event would ever reach a control.
     publish_control_coords(coords, &table.controls, interaction);
-    // Set thread-local access so in-thread calls don't deadlock
-    #[cfg(render_thread_can_draw)]
-    {
-        let item_map: Arc<Mutex<std::collections::HashMap<u64, i_slint_core::item_tree::ItemRc>>> =
-            Arc::new(Mutex::new(render_item_rcs.clone()));
-        let tl = ThreadLocalAccess { coords: coords.clone(), item_map };
-        set_tl_access(Some(tl));
-    }
     true
 }
 
@@ -1757,7 +1903,7 @@ fn present_render_owned(
     render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     render_controls: &mut HashMap<u64, ControlRegion>,
     render_control_order: &mut Vec<u64>,
-    render_item_rcs: &mut HashMap<u64, ItemRc>,
+    render_item_rcs: &Rc<RefCell<HashMap<u64, ItemRc>>>,
     interaction: &mut ControlInteraction,
 ) {
     if !publish_mirror_controls(
@@ -1790,7 +1936,7 @@ fn present_render_owned(
     _render_window_adapter: &Option<Rc<dyn WindowAdapter>>,
     _render_controls: &mut HashMap<u64, ControlRegion>,
     _render_control_order: &mut Vec<u64>,
-    _render_item_rcs: &mut HashMap<u64, ItemRc>,
+    _render_item_rcs: &Rc<RefCell<HashMap<u64, ItemRc>>>,
     _interaction: &mut ControlInteraction,
 ) {
 }
@@ -3275,10 +3421,3 @@ impl GlRenderState {
         }
     }
 }
-
-#[cfg(render_thread_can_draw)]
-fn set_tl_access(access: Option<ThreadLocalAccess>) {
-    THREAD_LOCAL_ACCESS.with(|a| *a.borrow_mut() = access);
-}
-#[cfg(not(render_thread_can_draw))]
-fn set_tl_access(_access: Option<ThreadLocalAccess>) {}
