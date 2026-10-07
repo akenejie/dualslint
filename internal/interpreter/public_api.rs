@@ -385,8 +385,36 @@ pub fn invoke(
     name: &str,
     args: &[Value],
 ) -> Option<Value> {
-    use i_slint_compiler::langtype::Type;
-    let (public, sub) = resolve(instance)?;
+    invoke_on(instance, name, args)
+}
+
+/// Whether a call to `name` on `instance` can be carried to the thread that
+/// draws the window, run there, and bring its value back.
+///
+/// A window-rooted component's callback or function runs against the tree the
+/// window shows, which a backend may draw on another thread, so its arguments
+/// travel there and its return value comes back. Only plain values can make the
+/// trip; a model or a callback is a reference into the tree the caller holds.
+pub fn can_cross_threads(instance: &Instance, name: &str) -> bool {
+    use i_slint_compiler::llr::is_thread_portable_type;
+    let Some((public, _)) = resolve_root(instance) else { return false };
+    let Some(prop) = find_public_property(public, name) else { return false };
+    let (args, ret) = match &prop.ty {
+        Type::Callback(callback) => (&callback.args, &callback.return_type),
+        Type::Function(function) => (&function.args, &function.return_type),
+        _ => return false,
+    };
+    is_thread_portable_type(ret) && args.iter().all(is_thread_portable_type)
+}
+
+/// Run a public callback or function on `instance` without any thought for
+/// another thread.
+///
+/// [`invoke`] is what the public API calls, and it may carry the call to the
+/// tree the window shows; this is the call itself, taking the instance it runs
+/// on directly so a backend that has that tree at hand can reach it.
+pub fn invoke_on(instance: &Instance, name: &str, args: &[Value]) -> Option<Value> {
+    let (public, sub) = resolve_root(instance)?;
     let prop = find_public_property(public, name)?;
     // Only callbacks and functions are callable; propagate a miss for
     // anything else so the public API surfaces a `NoSuchCallable` error.
@@ -454,6 +482,12 @@ pub fn set_callback(
 fn resolve(
     instance: &VRc<ItemTreeVTable, Instance>,
 ) -> Option<(&PublicComponent, Pin<Rc<SubComponentInstance>>)> {
+    resolve_root(instance)
+}
+
+/// The public component and the root sub-component of an instance, addressed
+/// directly rather than through the `VRc` that normally carries it.
+fn resolve_root(instance: &Instance) -> Option<(&PublicComponent, Pin<Rc<SubComponentInstance>>)> {
     let cu = &instance.root_sub_component.compilation_unit;
     let public_index = instance.public_component_index?;
     let public = cu.public_components.get(public_index)?;
