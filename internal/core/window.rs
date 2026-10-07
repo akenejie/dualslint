@@ -708,6 +708,11 @@ pub struct WindowInner {
     /// Set by [`Self::set_render_factory`].
     #[cfg(feature = "std")]
     render_factory: RefCell<Option<Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>>>,
+
+    /// Set by [`Self::set_render_handover`]. Runs on the UI thread, so it does
+    /// not have to cross a thread boundary and is not `Send`.
+    #[cfg(feature = "std")]
+    render_handover: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl Drop for WindowInner {
@@ -727,6 +732,9 @@ impl WindowInner {
         let render_factory: RefCell<
             Option<Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>>,
         > = RefCell::new(None);
+
+        #[cfg(feature = "std")]
+        let render_handover: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
 
         let mut window_properties_tracker =
             PropertyTracker::new_with_dirty_handler(WindowPropertiesTracker {
@@ -780,6 +788,8 @@ impl WindowInner {
             native_drag: Default::default(),
             #[cfg(feature = "std")]
             render_factory,
+            #[cfg(feature = "std")]
+            render_handover,
         }
     }
 
@@ -1224,6 +1234,35 @@ impl WindowInner {
     #[doc(hidden)]
     pub fn render_factory(&self) -> Option<Arc<dyn Fn() -> Box<dyn std::any::Any> + Send + Sync>> {
         self.render_factory.borrow().clone()
+    }
+
+    /// Set what a backend runs once it hands this window's drawing to a tree of
+    /// its own.
+    ///
+    /// The factory given to [`Self::set_render_factory`] builds that tree from
+    /// the component *definition*, so the tree it builds starts from the
+    /// declared values and knows nothing the application set on the component it
+    /// holds. This is where the component offers to carry those values over: it
+    /// runs on the UI thread, right after the handover, and pushes the state
+    /// that belongs on the drawn tree through the same call the backend offers
+    /// for a callback.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn set_render_handover(&self, handover: Box<dyn Fn()>) {
+        *self.render_handover.borrow_mut() = Some(handover);
+    }
+
+    /// Run what [`Self::set_render_handover`] stored, on the thread that stored
+    /// it.
+    ///
+    /// A backend calls this from the handover itself, so it is the UI thread and
+    /// the component the application holds are both at hand.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn run_render_handover(&self) {
+        if let Some(handover) = self.render_handover.borrow().as_ref() {
+            handover();
+        }
     }
 
     /// Report that the in-flight native drag finished with `action`.
@@ -2772,6 +2811,45 @@ pub mod ffi {
             WindowInner::from_pub(window_adapter.window()).set_render_factory(Arc::new(
                 move || Box::new(OpaqueInstance(ctor(), dtor)) as Box<dyn core::any::Any>,
             ));
+        }
+    }
+
+    /// Remember how to carry a component's portable state onto the tree a
+    /// backend took over drawing with.
+    ///
+    /// The generated code supplies `invoke`, which reads the public properties
+    /// the application set and assigns them to the drawn tree, `user_data`,
+    /// which is how it reaches the component it belongs to, and `destroy`,
+    /// which frees that data. `invoke` runs on the UI thread, right after the
+    /// handover, through [`Self::set_render_handover`].
+    #[cfg(feature = "std")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_windowrc_set_render_handover(
+        handle: *const WindowAdapterRcOpaque,
+        invoke: extern "C" fn(*mut core::ffi::c_void),
+        user_data: *mut core::ffi::c_void,
+        destroy: extern "C" fn(*mut core::ffi::c_void),
+    ) {
+        unsafe {
+            struct Handover {
+                invoke: extern "C" fn(*mut core::ffi::c_void),
+                user_data: *mut core::ffi::c_void,
+                destroy: extern "C" fn(*mut core::ffi::c_void),
+            }
+            impl Handover {
+                fn run(&self) {
+                    (self.invoke)(self.user_data)
+                }
+            }
+            impl Drop for Handover {
+                fn drop(&mut self) {
+                    (self.destroy)(self.user_data)
+                }
+            }
+            let window_adapter = &*(handle as *const Rc<dyn WindowAdapter>);
+            let state = Handover { invoke, user_data, destroy };
+            WindowInner::from_pub(window_adapter.window())
+                .set_render_handover(Box::new(move || state.run()));
         }
     }
 

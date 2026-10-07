@@ -92,6 +92,35 @@ impl ComponentDefinitionInner {
         WindowInner::from_pub(window_adapter.window()).set_render_factory(Arc::new(move || {
             Box::new(Instance::new(compilation_unit.clone(), public_index)) as Box<dyn Any>
         }));
+        // The tree the factory builds starts from the declaration, so it does
+        // not have what the application set on this instance. Leave behind how
+        // to carry that state over, to run on this thread once a backend draws
+        // from a tree of its own.
+        let weak = VRc::downgrade(instance);
+        WindowInner::from_pub(window_adapter.window()).set_render_handover(Box::new(move || {
+            let Some(instance) = weak.upgrade() else { return };
+            let Some(adapter) = instance.window_adapter_or_default() else { return };
+            let state = public_api::portable_public_state(&instance);
+            // `Value` is not `Send` because a model is a shared reference, but
+            // the state holds only plain values, and the task runs before
+            // `run_on_screen_tree` returns.
+            struct CarriedState(Vec<(String, Value)>);
+            unsafe impl Send for CarriedState {}
+            let state = CarriedState(state);
+            struct StatePtr(*const CarriedState);
+            unsafe impl Send for StatePtr {}
+            let state = StatePtr(&state as *const _);
+            let local_tree = VRc::into_dyn(instance.clone());
+            let run = move |tree: &i_slint_core::item_tree::ItemTreeRc| {
+                let state = &state;
+                // SAFETY: the pointer is to `state`, which outlives this call.
+                let state = unsafe { &*state.0 };
+                let screen = vtable::VRef::downcast_pin::<Instance>(VRc::borrow_pin(tree))
+                    .expect("the tree on screen is not this interpreter component");
+                public_api::apply_portable_public_state(screen.get_ref(), &state.0);
+            };
+            adapter.run_on_screen_tree(local_tree, Box::new(run));
+        }));
     }
 
     /// Instantiate the component, reusing the given `WindowAdapter` instead

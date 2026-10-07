@@ -51,9 +51,18 @@ pub fn get(instance: &VRc<ItemTreeVTable, Instance>, name: &str) -> Option<Value
 pub fn set(
     instance: &VRc<ItemTreeVTable, Instance>,
     name: &str,
+    value: Value,
+) -> Result<(), SetPropertyError> {
+    set_on(instance, name, value)
+}
+
+/// Write a public property, addressed by the instance itself.
+pub fn set_on(
+    instance: &Instance,
+    name: &str,
     mut value: Value,
 ) -> Result<(), SetPropertyError> {
-    let (public, sub) = resolve(instance).ok_or(SetPropertyError::NoSuchProperty)?;
+    let (public, sub) = resolve_root(instance).ok_or(SetPropertyError::NoSuchProperty)?;
     let prop = find_public_property(public, name).ok_or(SetPropertyError::NoSuchProperty)?;
     if !prop.ty.is_property_type() {
         return Err(SetPropertyError::NoSuchProperty);
@@ -67,6 +76,40 @@ pub fn set(
     let ctx = EvalContext::new(sub);
     store_property(&ctx, &prop.prop, value);
     Ok(())
+}
+
+/// The public properties of `instance` whose value can cross to another thread,
+/// with their current values.
+///
+/// A backend that draws a tree of its own builds it from the declaration, so the
+/// tree starts from the declared values and knows nothing the application set on
+/// the instance it holds. This is what the instance offers to carry over: the
+/// names and values that can travel, which the drawn tree can be given.
+pub fn portable_public_state(instance: &Instance) -> Vec<(String, Value)> {
+    let Some((public, sub)) = resolve_root(instance) else { return Vec::new() };
+    let ctx = EvalContext::new(sub);
+    public
+        .public_properties
+        .values()
+        .filter(|prop| {
+            prop.ty.is_property_type()
+                && !prop.read_only()
+                && i_slint_compiler::llr::is_thread_portable_type(&prop.ty)
+        })
+        .map(|prop| (prop.display_name.to_string(), load_property(&ctx, &prop.prop)))
+        .collect()
+}
+
+/// Give `instance` the values [`portable_public_state`] collected from another
+/// instance of the same component.
+///
+/// A name that no longer fits the component is skipped rather than refused,
+/// because the two instances come from the same declaration and a mismatch can
+/// only mean one of them is not what the caller thinks it is.
+pub fn apply_portable_public_state(instance: &Instance, state: &[(String, Value)]) {
+    for (name, value) in state {
+        let _ = set_on(instance, name, value.clone());
+    }
 }
 
 /// The sub-component that owns the item at `flat_item_index`, together with the

@@ -278,3 +278,25 @@ fn a_call_that_cannot_travel_stays_with_the_caller() {
     // The value comes back from the tree that ran the call, whichever that was.
     assert_eq!(app.invoke_echo(Pt { x: 5 }), 5);
 }
+
+/// A handover carries the state the application set onto the drawn tree.
+#[test]
+fn a_handover_carries_the_application_state_onto_the_drawn_tree() {
+    let platform = PlatformShowingTree::install();
+    let app = BridgeApp::new().expect("the platform makes windows");
+    let adapter = platform.adapter_of_last_window();
+
+    app.set_count(7);
+    app.set_note(SharedString::from("the application"));
+
+    // The handover: a second tree exists, and the window shows it from now on.
+    let mirror = second_tree(&app);
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+    WindowInner::from_pub(app.window()).run_render_handover();
+
+    assert_eq!(
+        (mirror.get_count(), mirror.get_note().as_str()),
+        (7, "the application"),
+        "the drawn tree was given the values the application set"
+    );
+}

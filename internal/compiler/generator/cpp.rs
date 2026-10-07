@@ -2241,6 +2241,28 @@ fn generate_item_tree(
                 "slint::cbindgen_private::slint_windowrc_set_render_factory(                 reinterpret_cast<const slint::cbindgen_private::WindowAdapterRcOpaque*>                 (&window.window_handle()),                  []() -> void * {{ slint::private_api::RenderThreadTreeScope scope; return new slint::ComponentHandle<{0}>({0}::create()); }},                  [](void *instance) {{ delete static_cast<slint::ComponentHandle<{0}> *>(instance); }});",
                 target_struct.name
             ));
+            // The factory builds a tree from the declaration, so it starts from
+            // the declared values. Carry what the application set onto it.
+            if let Some(component) =
+                root.public_components.iter().find(|p| p.name == target_struct.name)
+            {
+                let handover_ctx = EvaluationContext {
+                    compilation_unit: root,
+                    current_scope: EvaluationScope::SubComponent(sub_tree.root, None),
+                    generator_state: CppGeneratorContext {
+                        global_access: "(&self->m_globals)".to_string(),
+                        conditional_includes,
+                    },
+                    argument_types: &[],
+                };
+                if let Some(handover) = render_handover_code(
+                    &component.public_properties,
+                    &target_struct.name,
+                    &handover_ctx,
+                ) {
+                    create_code.extend(handover);
+                }
+            }
         } else {
             create_code.push("self->user_init();".to_string());
         }
@@ -3795,6 +3817,94 @@ fn screen_tree_call_code(
         code.push("return call_data.result;".to_string());
     }
     code
+}
+
+/// The statements that carry a component's portable state onto the tree a
+/// backend took over drawing with.
+///
+/// The factory the render thread is given builds a second tree from the
+/// declaration, so it starts from the declared values. This is what closes the
+/// gap: it runs right after the handover, reads each public property that can
+/// travel from the component the application holds, and assigns it to the tree
+/// that is drawn, through the same call a routed callback uses. A property that
+/// cannot travel is left alone, as a call that cannot travel is.
+fn render_handover_code(
+    public_properties: &llr::PublicProperties,
+    component_type: &SmolStr,
+    ctx: &EvaluationContext,
+) -> Option<Vec<String>> {
+    let portable: Vec<_> = public_properties
+        .iter()
+        .filter(|(_, p)| {
+            p.ty.is_property_type() && !p.read_only() && crate::llr::is_thread_portable_type(&p.ty)
+        })
+        .collect();
+    if portable.is_empty() {
+        return None;
+    }
+
+    let mut code = vec![
+        // The render thread builds the tree that is drawn by calling this same
+        // constructor. That tree is already the one on screen, so it has nothing
+        // to hand over, and registering again would replace the handover the
+        // application's own component left behind.
+        "if (!slint::private_api::render_thread_tree_scope()) {".to_string(),
+        "    struct SlintRenderHandoverData {".to_string(),
+        format!(
+            "        vtable::VWeak<slint::private_api::ItemTreeVTable, {component_type}> weak;"
+        ),
+        "    };".to_string(),
+        format!(
+            "    auto *handover_data = new SlintRenderHandoverData{{ vtable::VWeak<slint::private_api::ItemTreeVTable, {component_type}>(self_rc) }};"
+        ),
+        "    slint::cbindgen_private::slint_windowrc_set_render_handover(".to_string(),
+        "        reinterpret_cast<const slint::cbindgen_private::WindowAdapterRcOpaque*>(&window.window_handle()),".to_string(),
+        "        [](void *user_data) {".to_string(),
+        "            auto *handover = static_cast<SlintRenderHandoverData *>(user_data);".to_string(),
+        "            auto caller_rc = handover->weak.lock();".to_string(),
+        "            if (!caller_rc) { return; }".to_string(),
+        "            auto *caller = &**caller_rc;".to_string(),
+        "            struct SlintHandoverValues {".to_string(),
+    ];
+    for (i, (_, p)) in portable.iter().enumerate() {
+        code.push(format!("                {} value_{i};", p.ty.cpp_type().unwrap()));
+    }
+    code.push("            };".to_string());
+    let getters = portable
+        .iter()
+        .map(|(name, _)| {
+            format!("caller->{}()", accessor_names::cpp_accessor_name(name, AccessorKind::Getter))
+        })
+        .collect::<Vec<_>>();
+    code.push(format!("            SlintHandoverValues values{{ {} }};", getters.join(", ")));
+    code.extend([
+        "            slint::cbindgen_private::slint_windowrc_run_on_screen_tree(".to_string(),
+        "                &caller->m_globals.window().window_handle().handle(),".to_string(),
+        "                &caller->self_weak.lock()->into_dyn(),".to_string(),
+        "                &values,".to_string(),
+        "                [](void *data, const slint::cbindgen_private::ItemTreeRc *tree) {".to_string(),
+        "                    auto *values = static_cast<SlintHandoverValues *>(data);".to_string(),
+        format!(
+            "                    if (tree->vtable() != &{component_type}::static_vtable) {{ return; }}"
+        ),
+        format!(
+            "                    [[maybe_unused]] auto self = const_cast<{component_type} *>(static_cast<const {component_type} *>(tree->borrow().instance));"
+        ),
+    ]);
+    for (i, (_, p)) in portable.iter().enumerate() {
+        code.push(format!(
+            "                    {};",
+            property_set_value_code(&p.prop, &format!("values->value_{i}"), ctx)
+        ));
+    }
+    code.extend([
+        "                });".to_string(),
+        "        },".to_string(),
+        "        handover_data,".to_string(),
+        "        [](void *user_data) { delete static_cast<SlintRenderHandoverData *>(user_data); });".to_string(),
+        "}".to_string(),
+    ]);
+    Some(code)
 }
 
 fn generate_public_api_for_properties(

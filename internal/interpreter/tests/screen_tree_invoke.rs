@@ -31,6 +31,8 @@ const SOURCE: &str = r#"
         height: 240px;
         in-out property <int> count: 1;
         in-out property <string> note: "";
+        // A struct cannot travel, so a handover cannot carry this one.
+        in-out property <Pt> point: { x: 0 };
 
         callback add(int, string);
         // A struct cannot travel with a call, so this one says what happens to
@@ -248,5 +250,38 @@ fn a_call_that_cannot_cross_stays_with_the_caller() {
         count_and_note(&mirror),
         (Some(Value::from(1)), Some(Value::from(SharedString::from("")))),
         "the tree that is drawn is left as it was"
+    );
+}
+
+/// A handover carries the state the application set onto the drawn tree.
+#[test]
+fn a_handover_carries_the_application_state_onto_the_drawn_tree() {
+    let platform = PlatformShowingTree::install();
+    let app = create_instance();
+    let adapter = platform.adapter_of_last_window();
+
+    app.set_property("count", Value::from(7)).unwrap();
+    app.set_property("note", Value::from(SharedString::from("the application"))).unwrap();
+    let mut point = slint_interpreter::Struct::default();
+    point.set_field("x".into(), Value::from(9));
+    app.set_property("point", Value::Struct(point.clone())).unwrap();
+
+    // The handover: a second tree exists and the window shows it from now on.
+    let mirror = create_instance();
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+    i_slint_core::window::WindowInner::from_pub(app.window()).run_render_handover();
+
+    assert_eq!(
+        count_and_note(&mirror),
+        (Some(Value::from(7)), Some(Value::from(SharedString::from("the application")))),
+        "the drawn tree was given the values the application set"
+    );
+    let Value::Struct(point) = mirror.get_property("point").unwrap() else {
+        panic!("point is a struct")
+    };
+    assert_eq!(
+        point.get_field("x"),
+        Some(&Value::from(0)),
+        "a struct cannot travel, so the drawn tree keeps the declared value"
     );
 }

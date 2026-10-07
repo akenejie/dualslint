@@ -384,6 +384,23 @@ fn generate_public_component(
         llr::TopLevelComponentType::SystemTrayIcon => CallTarget::OwnTree,
     };
 
+    // A tray has no window to hand over, and a component with no property a
+    // thread can carry has nothing to hand over.
+    let render_handover = if matches!(llr.top_level_type, llr::TopLevelComponentType::Window)
+        && has_portable_public_state(&llr.public_properties)
+    {
+        let body = render_handover_state(&llr.public_properties, &inner_component_id, &ctx);
+        quote!(
+            let weak = slint::Weak::<#public_component_id>::new(sp::VRc::downgrade(&inner));
+            sp::WindowInner::from_pub(window.window()).set_render_handover(Box::new(move || {
+                let Some(component) = weak.upgrade() else { return };
+                #body
+            }));
+        )
+    } else {
+        quote!()
+    };
+
     let property_and_callback_accessors = public_api(
         &llr.public_properties,
         &llr.private_properties,
@@ -431,6 +448,7 @@ fn generate_public_component(
                         "the render thread could not create another instance of the component"
                     ),
                 );
+                #render_handover
             )),
         ),
         llr::TopLevelComponentType::SystemTrayIcon => {
@@ -1152,6 +1170,54 @@ fn access_callback_tracker(
 /// that belongs to the tree it was made for.
 fn is_thread_portable_type(ty: &Type) -> bool {
     crate::llr::is_thread_portable_type(ty)
+}
+
+/// The statements that carry a component's portable state onto the tree a
+/// backend took over drawing with.
+///
+/// The factory the render thread is given builds a second tree from the
+/// declaration, so it starts from the declared values. This is what closes the
+/// gap: it runs on the UI thread right after the handover, reads each public
+/// property that can travel from the component the application holds, and
+/// assigns it to the tree that is drawn. A property that cannot travel is left
+/// alone, exactly as a call that cannot travel is.
+fn render_handover_state(
+    public_properties: &llr::PublicProperties,
+    inner_component_id: &proc_macro2::Ident,
+    ctx: &EvaluationContext,
+) -> TokenStream {
+    let carries = public_properties.iter().filter_map(|(name, p)| {
+        if !p.ty.is_property_type() || p.read_only() || !is_thread_portable_type(&p.ty) {
+            return None;
+        }
+        let getter = accessor_names::rust_accessor_ident(name, AccessorKind::Getter);
+        let set_value = property_set_value_tokens(&p.prop, quote!(value), ctx);
+        Some(quote! {
+            {
+                let value = component.#getter();
+                let local_tree = sp::VRc::into_dyn(component.0.clone());
+                slint::ComponentHandle::window(&component)
+                    .call_on_screen_tree(local_tree, move |tree| {
+                        let component = sp::VRc::map_dyn(tree.clone(), |tree| {
+                            sp::VRef::downcast_pin::<#inner_component_id>(tree).expect(
+                                "the tree on screen is not the component the handover belongs to",
+                            )
+                        });
+                        let _self = component.as_pin_ref();
+                        #set_value
+                    });
+            }
+        })
+    });
+    quote!(#(#carries)*)
+}
+
+/// Whether a component has any public property whose value [`render_handover_state`]
+/// can carry. A component with none has nothing to hand over.
+fn has_portable_public_state(public_properties: &llr::PublicProperties) -> bool {
+    public_properties
+        .values()
+        .any(|p| p.ty.is_property_type() && !p.read_only() && is_thread_portable_type(&p.ty))
 }
 
 /// Which tree an exported component's calls run against.

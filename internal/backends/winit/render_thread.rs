@@ -2586,6 +2586,12 @@ pub(crate) fn take_over_drawing_of(window: &SlintApiWindow, host: Option<&Render
     }
     if !host.has_attached_component() {
         host.attach_component_with_to(window, move || factory(), None);
+        // The tree the render thread just built starts from the declared
+        // values, so give the component whose drawing it took over the chance
+        // to carry the state the application set onto it. The attach message is
+        // already in the render thread's queue, so anything this sends behind it
+        // reaches a tree that exists.
+        WindowInner::from_pub(window).run_render_handover();
     } else if !host.owns(window_identity(window)) {
         report_window_no_one_draws(
             window,
