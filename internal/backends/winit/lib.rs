@@ -126,12 +126,18 @@ mod xdg_desktop_settings;
 pub(crate) mod wasm_input_helper;
 
 cfg_if::cfg_if! {
-    if #[cfg(enable_femtovg_renderer)] {
+    // The UI thread draws nothing: it creates a renderer only to release it to
+    // the render thread, which draws the window. So a renderer the render thread
+    // can drive must lead this list, and only a build with nothing drawable in
+    // it can name a renderer the render thread cannot drive.
+    if #[cfg(all(feature = "renderer-femtovg", supports_opengl))] {
         const DEFAULT_RENDERER_NAME: &str = "FemtoVG";
-    } else if #[cfg(enable_skia_renderer)] {
-        const DEFAULT_RENDERER_NAME: &str = "Skia";
     } else if #[cfg(feature = "renderer-software")] {
         const DEFAULT_RENDERER_NAME: &str = "Software";
+    } else if #[cfg(enable_skia_renderer)] {
+        const DEFAULT_RENDERER_NAME: &str = "Skia";
+    } else if #[cfg(feature = "renderer-femtovg-wgpu")] {
+        const DEFAULT_RENDERER_NAME: &str = "FemtoVG";
     } else if #[cfg(feature = "renderer-vello")] {
         const DEFAULT_RENDERER_NAME: &str = "Vello";
     } else {
@@ -143,14 +149,16 @@ fn default_renderer_factory(
     shared_backend_data: &Rc<SharedBackendData>,
 ) -> Result<Box<dyn WinitCompatibleRenderer>, PlatformError> {
     cfg_if::cfg_if! {
-        if #[cfg(enable_skia_renderer)] {
-            renderer::skia::WinitSkiaRenderer::new_suspended(shared_backend_data)
-        } else if #[cfg(feature = "renderer-femtovg-wgpu")] {
-            renderer::femtovg::WGPUFemtoVGRenderer::new_suspended(shared_backend_data)
-        } else if #[cfg(all(feature = "renderer-femtovg", supports_opengl))] {
+        // Drawable renderers first, for the reason [`DEFAULT_RENDERER_NAME`]
+        // gives: the render thread draws, and only these can be handed to it.
+        if #[cfg(all(feature = "renderer-femtovg", supports_opengl))] {
             renderer::femtovg::GlutinFemtoVGRenderer::new_suspended(shared_backend_data)
         } else if #[cfg(feature = "renderer-software")] {
             renderer::sw::WinitSoftwareRenderer::new_suspended(shared_backend_data)
+        } else if #[cfg(enable_skia_renderer)] {
+            renderer::skia::WinitSkiaRenderer::new_suspended(shared_backend_data)
+        } else if #[cfg(feature = "renderer-femtovg-wgpu")] {
+            renderer::femtovg::WGPUFemtoVGRenderer::new_suspended(shared_backend_data)
         } else if #[cfg(feature = "renderer-vello")] {
             // Last in the chain: vello is opt-in and only becomes the default
             // when it is the only renderer built in.
@@ -161,34 +169,49 @@ fn default_renderer_factory(
     }
 }
 
+/// Whether the render thread can draw what the named renderer produces.
+///
+/// The render thread draws with the femtovg-gl renderer, or with the software
+/// renderer when femtovg is not built in.  Every other name selects a renderer
+/// the UI thread would have to drive itself -- which it does not do, because
+/// the UI thread does not draw.  Naming one of those is a request this build
+/// cannot meet, and it is better to say so than to draw with something else.
+fn named_renderer_is_render_thread_drawable(renderer_name: &str) -> bool {
+    match renderer_name {
+        "gl" | "femtovg" => cfg!(all(feature = "renderer-femtovg", supports_opengl)),
+        "sw" | "software" => {
+            cfg!(all(feature = "renderer-software", not(feature = "renderer-femtovg")))
+        }
+        _ => false,
+    }
+}
+
+/// A suspended renderer, as the fallback builds it: `new_suspended` for each
+/// renderer the render thread can draw.
+type RendererFactory =
+    fn(&Rc<SharedBackendData>) -> Result<Box<dyn WinitCompatibleRenderer>, PlatformError>;
+
 fn try_create_window_with_fallback_renderer(
     shared_backend_data: &Rc<SharedBackendData>,
     attrs: winit::window::WindowAttributes,
     _proxy: &winit::event_loop::EventLoopProxy<SlintEvent>,
     #[cfg(all(muda, target_os = "macos"))] muda_enable_default_menu_bar: bool,
 ) -> Option<Rc<WinitWindowAdapter>> {
-    [
-        #[cfg(any(
-            feature = "renderer-skia",
-            feature = "renderer-skia-opengl",
-            feature = "renderer-skia-vulkan"
-        ))]
-        renderer::skia::WinitSkiaRenderer::new_suspended,
-        #[cfg(feature = "renderer-femtovg-wgpu")]
-        renderer::femtovg::WGPUFemtoVGRenderer::new_suspended,
-        #[cfg(all(
-            feature = "renderer-femtovg",
-            supports_opengl,
-            not(feature = "renderer-femtovg-wgpu")
-        ))]
-        renderer::femtovg::GlutinFemtoVGRenderer::new_suspended,
-        #[cfg(feature = "renderer-software")]
-        renderer::sw::WinitSoftwareRenderer::new_suspended,
-        #[cfg(feature = "renderer-vello")]
-        renderer::vello::WinitVelloRenderer::new_suspended,
-    ]
-    .into_iter()
-    .find_map(|renderer_factory| {
+    // Only renderers the render thread can draw: a fallback exists to find a
+    // renderer that works, and a renderer the UI thread alone could draw would
+    // leave the window blank.  A build with no such renderer has no fallback
+    // to run, which is why nothing is pushed there.
+    #[allow(unused_mut)]
+    let mut factories: Vec<RendererFactory> = Vec::new();
+    #[cfg(all(
+        feature = "renderer-femtovg",
+        supports_opengl,
+        not(feature = "renderer-femtovg-wgpu")
+    ))]
+    factories.push(renderer::femtovg::GlutinFemtoVGRenderer::new_suspended);
+    #[cfg(feature = "renderer-software")]
+    factories.push(renderer::sw::WinitSoftwareRenderer::new_suspended);
+    factories.into_iter().find_map(|renderer_factory| {
         Some(WinitWindowAdapter::new(
             shared_backend_data.clone(),
             renderer_factory(shared_backend_data).ok()?,
@@ -873,6 +896,21 @@ impl i_slint_core::platform::Platform for Backend {
 
         if let Some(hook) = &self.window_attributes_hook {
             attrs = hook(attrs);
+        }
+
+        // An explicitly named renderer the render thread cannot drive is a
+        // request this build cannot meet.  Say so instead of falling back to a
+        // renderer that draws a window the caller did not ask for.
+        if cfg!(render_thread_can_draw)
+            && let Some(renderer_name) = &self.shared_data.renderer_name
+            && !named_renderer_is_render_thread_drawable(renderer_name)
+        {
+            return Err(format!(
+                "the render thread cannot draw with the `{renderer_name}` renderer; on this \
+                 backend the UI thread does not draw, so use `renderer-femtovg` or \
+                 `renderer-software`"
+            )
+            .into());
         }
 
         let adapter = create_renderer(&self.shared_data).map_or_else(

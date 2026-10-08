@@ -9,7 +9,11 @@ fn main() {
        ios_and_friends: { all(target_vendor = "apple", not(target_os = "macos"))},
        enable_skia_renderer: { any(feature = "renderer-skia", feature = "renderer-skia-opengl", feature = "renderer-skia-vulkan", ios_and_friends) },
        enable_femtovg_renderer: { any(feature = "renderer-femtovg", feature = "renderer-femtovg-wgpu") },
-       render_thread_can_draw: { any(any(feature = "renderer-femtovg", feature = "renderer-femtovg-wgpu"), feature = "renderer-software") },
+       // The render thread draws with upstream's femtovg-gl renderer, or with
+       // the software renderer when femtovg is not built in.  The femtovg-wgpu
+       // renderer is not among them: nothing on the render thread drives it, so
+       // listing it here would promise a draw it cannot make.
+       render_thread_can_draw: { any(feature = "renderer-femtovg", feature = "renderer-software") },
        enable_accesskit: { all(feature = "accessibility", not(target_arch = "wasm32")) },
        supports_opengl: { all(any(feature = "renderer-skia-opengl", feature = "renderer-femtovg"), not(ios_and_friends)) },
        supports_vulkan: { any(all(target_family = "unix", not(target_vendor = "apple")), all(any(target_vendor = "apple", target_family = "windows"), feature = "renderer-skia-vulkan")) },
