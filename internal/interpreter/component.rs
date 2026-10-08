@@ -135,6 +135,11 @@ impl ComponentDefinitionInner {
             Some(window_adapter),
             self.type_loaders.clone(),
         );
+        // This instance becomes the window's root when it is shown, exactly as
+        // one that created its own window does, so it leaves behind what a
+        // backend needs to build a tree of its own. Without this the window it
+        // is shown in has no factory, and nothing draws it.
+        self.leave_render_factory(&vrc);
         ComponentInstanceInner(vrc)
     }
 
@@ -142,6 +147,10 @@ impl ComponentDefinitionInner {
     /// in the given outer item tree. Used by the `ComponentFactory` path
     /// to embed an interpreter-built component inside a natively compiled
     /// one.
+    ///
+    /// No factory is left behind: an embedded instance is not the root of the
+    /// window it ends up in, and registering its constructor for that window
+    /// would have the backend draw a component that is only a part of it.
     pub fn create_embedded(
         &self,
         parent: vtable::VWeak<ItemTreeVTable>,

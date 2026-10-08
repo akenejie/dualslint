@@ -50,6 +50,47 @@ fn reuse_window() {
     };
 }
 
+/// A component created into an existing window becomes that window's root when
+/// it is shown, so it has to leave the render thread a constructor the way one
+/// that created its own window does. Without one, nothing draws the window it
+/// is later shown in, and the backend can only report that instead.
+#[cfg(feature = "internal")]
+#[test]
+fn a_component_created_into_an_existing_window_leaves_a_factory() {
+    i_slint_backend_testing::init_no_event_loop();
+    use crate::Compiler;
+    use i_slint_core::platform::Platform;
+    use i_slint_core::window::WindowInner;
+
+    let code = r#"
+        export component MainWindow inherits Window {
+            in-out property<string> text_text: "foo";
+        }
+    "#;
+    let compiler = Compiler::default();
+    let result = spin_on::spin_on(compiler.build_from_source(code.into(), Default::default()));
+    assert!(!result.has_errors(), "{:?}", result.diagnostics().collect::<Vec<_>>());
+    let definition = result.component("MainWindow").unwrap();
+
+    // A window that neither generated code nor an interpreter instance ran for
+    // has nothing for a backend to build a tree with.
+    let backend = i_slint_backend_testing::TestingBackend::new(
+        i_slint_backend_testing::TestingBackendOptions { mock_time: true, ..Default::default() },
+    );
+    let adapter = backend.create_window_adapter().expect("the testing backend makes windows");
+    assert!(
+        WindowInner::from_pub(adapter.window()).render_factory().is_none(),
+        "the window starts out without a factory"
+    );
+
+    let _instance = definition.create_with_existing_window(adapter.window()).unwrap();
+    assert!(
+        WindowInner::from_pub(adapter.window()).render_factory().is_some(),
+        "the instance is what the window will show, so it is what the render \
+         thread has to be able to rebuild"
+    );
+}
+
 #[test]
 fn set_wrong_struct() {
     i_slint_backend_testing::init_no_event_loop();

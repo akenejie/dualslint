@@ -818,7 +818,7 @@ mod tests {
     /// whatever row happens to sit at that index in the first one found.
     #[test]
     fn a_repeated_element_is_reached_through_its_own_item() {
-        let mut instance = compile(
+        let instance = compile(
             r#"
                 import { CheckBox } from "std-widgets.slint";
                 export struct Row { title: string, done: bool }
