@@ -103,6 +103,15 @@ fn install_timers(sub: &Pin<Rc<SubComponentInstance>>, weak_sub: &Weak<SubCompon
         move || {
             let Some(owner_rc) = weak_sub.upgrade() else { return };
             let owner = Pin::new(owner_rc);
+            // When the window draws a tree this thread does not own, this one
+            // is a husk: its timers describe state nothing draws. Stop them and
+            // do not let this re-run of the update start them again.
+            if crate::instance::is_shelved(&owner) {
+                for timer in &owner.timers {
+                    timer.stop();
+                }
+                return;
+            }
             let cu = owner.compilation_unit.clone();
             let sc = &cu.sub_components[owner.sub_component_idx];
             for (idx, t) in sc.timers.iter().enumerate() {
@@ -135,6 +144,15 @@ fn install_timers(sub: &Pin<Rc<SubComponentInstance>>, weak_sub: &Weak<SubCompon
                 let expr = triggered_expr.clone();
                 timer.start(i_slint_core::timers::TimerMode::Repeated, interval, move || {
                     let Some(owner) = weak.upgrade() else { return };
+                    // The last line of defense: a timer restarted on the husk
+                    // (for example one a repeated row owns) goes quiet on its
+                    // next fire.
+                    if crate::instance::is_shelved(&owner) {
+                        if let Some(timer) = owner.timers.get(idx) {
+                            timer.stop();
+                        }
+                        return;
+                    }
                     let mut ctx = EvalContext::new(Pin::new(owner));
                     eval_expression(&mut ctx, &expr);
                 });

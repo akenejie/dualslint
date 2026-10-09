@@ -246,6 +246,10 @@ pub struct Instance {
     /// returns the right row height) while still deferring `init_code`
     /// until the core's `init_instances` step.
     pub init_code_run: OnceCell<()>,
+    /// Whether a backend took the window over and drew a tree of its own. This
+    /// instance is then a husk: its timers describe state nothing draws, and
+    /// nothing running on this thread should keep them going.
+    pub shelved: std::cell::Cell<bool>,
     /// When this instance has been embedded into another item tree via
     /// `embed_component`, stores the weak handle to the outer item tree and
     /// the flat index of the `ComponentContainer` it substitutes into.
@@ -331,6 +335,25 @@ fn collect_item_refs<'a>(
 }
 
 impl Instance {
+    /// Put this tree on the shelf. A backend that took the window over draws a
+    /// tree of its own, so this one is a husk: its timers describe state
+    /// nothing shows. Stopping them is what leaves the drawn tree's own timers
+    /// as the only ones running. The flag also guards callbacks and the timer
+    /// driver (via [`is_shelved`]), so a timer a callback restarted does not
+    /// wake this thread again.
+    pub fn shelve(&self) {
+        self.shelved.set(true);
+        fn stop_all(sub: &Pin<Rc<SubComponentInstance>>) {
+            for timer in &sub.timers {
+                timer.stop();
+            }
+            for child in &sub.sub_components {
+                stop_all(child);
+            }
+        }
+        stop_all(&self.root_sub_component);
+    }
+
     /// Like [`Self::try_window_adapter`], but collapse the error case to
     /// `None` for the many callers that only need best-effort access.
     pub fn window_adapter_or_default(&self) -> Option<WindowAdapterRc> {
@@ -781,6 +804,7 @@ fn build_instance(
         window_attached: OnceCell::new(),
         bindings_installed: OnceCell::new(),
         init_code_run: OnceCell::new(),
+        shelved: std::cell::Cell::new(false),
         embedded_in: OnceCell::new(),
         type_loaders,
     });
@@ -845,6 +869,18 @@ pub(crate) fn install_bindings_for_repeated_row(vrc: &VRc<ItemTreeVTable, Instan
         crate::globals::install_global_bindings(&vrc.globals);
     }
     crate::bindings::install_bindings_only(vrc);
+}
+
+/// Whether the tree `sub` belongs to is on the shelf. Sub-component timers
+/// check this so nothing on a husk keeps firing; `None` while the root weak is
+/// not yet back-filled (during construction) means a timer cannot be guarded
+/// yet, and there is no handover going on then, so `false` is the right answer.
+pub fn is_shelved(sub: &SubComponentInstance) -> bool {
+    sub.root
+        .get()
+        .and_then(|root| root.upgrade())
+        .map(|instance| instance.as_pin_ref().shelved.get())
+        .unwrap_or(false)
 }
 
 /// Back-fill the root weak reference on every sub-component under `sub`.

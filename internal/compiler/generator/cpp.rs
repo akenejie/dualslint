@@ -917,6 +917,39 @@ pub fn generate(
         }),
     ));
 
+    // Whether this tree is a husk: a backend draws a tree of its own, so nothing
+    // this thread computes for the window is seen. Every component of a tree
+    // holds the same SharedGlobals, so one flag says it for all of them.
+    globals_struct.members.push((
+        Access::Public,
+        Declaration::Var(Var {
+            ty: "bool".into(),
+            name: "slint_shelved".into(),
+            init: Some("false".into()),
+            ..Default::default()
+        }),
+    ));
+
+    globals_struct.members.push((
+        Access::Public,
+        Declaration::Function(Function {
+            name: "slint_is_shelved".into(),
+            signature: "() const -> bool".into(),
+            statements: Some(vec!["return slint_shelved;".into()]),
+            ..Default::default()
+        }),
+    ));
+
+    globals_struct.members.push((
+        Access::Public,
+        Declaration::Function(Function {
+            name: "slint_shelve".into(),
+            signature: "() -> void".into(),
+            statements: Some(vec!["slint_shelved = true;".into()]),
+            ..Default::default()
+        }),
+    ));
+
     let mut init_global = Vec::new();
     let mut clone_constructor_global_inits = Vec::new();
 
@@ -2259,6 +2292,12 @@ fn generate_item_tree(
                     &component.public_properties,
                     &target_struct.name,
                     &handover_ctx,
+                    // A tree whose timers outlive the handover would go on firing
+                    // on this thread while the window draws the other one, so the
+                    // shelf has to close in on them too. (Sweeps the whole unit,
+                    // a coarser net than needs to be cast, but shelving a tree
+                    // that turned out to have no timers does it no harm.)
+                    root.sub_components.iter().any(|sc| !sc.timers.is_empty()),
                 ) {
                     create_code.extend(handover);
                 }
@@ -2723,7 +2762,8 @@ fn generate_sub_component(
             update_timers.push(format!(
                 "   if (!self->{name}.running() || self->{name}.interval() != interval)"
             ));
-            update_timers.push(format!("       self->{name}.start(slint::TimerMode::Repeated, interval, [self] {{ {callback}; }});"));
+            update_timers.push(format!(
+                "       self->{name}.start(slint::TimerMode::Repeated, interval, [self] {{ if (self->globals->slint_is_shelved()) {{ self->{name}.stop(); return; }} {callback}; }});"));
             update_timers.push(format!("}} else {{ self->{name}.stop(); }} }}"));
             target_struct.members.push((
                 field_access,
@@ -3830,6 +3870,7 @@ fn render_handover_code(
     public_properties: &llr::PublicProperties,
     component_type: &SmolStr,
     ctx: &EvaluationContext,
+    shelve_timers: bool,
 ) -> Option<Vec<String>> {
     let portable: Vec<_> = public_properties
         .iter()
@@ -3837,7 +3878,7 @@ fn render_handover_code(
             p.ty.is_property_type() && !p.read_only() && crate::llr::is_thread_portable_type(&p.ty)
         })
         .collect();
-    if portable.is_empty() {
+    if portable.is_empty() && !shelve_timers {
         return None;
     }
 
@@ -3862,41 +3903,60 @@ fn render_handover_code(
         "            auto caller_rc = handover->weak.lock();".to_string(),
         "            if (!caller_rc) { return; }".to_string(),
         "            auto *caller = &**caller_rc;".to_string(),
-        "            struct SlintHandoverValues {".to_string(),
     ];
-    for (i, (_, p)) in portable.iter().enumerate() {
-        code.push(format!("                {} value_{i};", p.ty.cpp_type().unwrap()));
+    // The value is read here rather than through the public getter: by now the
+    // window has a tree of its own, so the getter would ask that tree what it
+    // holds, and the tree is what is about to be given this value.
+    if portable.is_empty() {
+        // Nothing a thread can carry, but a tree with timers still has to go on
+        // the shelf: its timers describe state nothing draws, and nothing stops
+        // them otherwise.
+        code.push(
+            "            // Nothing a thread can carry, but the timers still need the shelf."
+                .to_string(),
+        );
+        code.push("            caller->m_globals.slint_shelve();".to_string());
+    } else {
+        code.push("            struct SlintHandoverValues {".to_string());
+        for (i, (_, p)) in portable.iter().enumerate() {
+            code.push(format!("                {} value_{i};", p.ty.cpp_type().unwrap()));
+        }
+        code.push("            };".to_string());
+        code.push("            SlintHandoverValues values{};".to_string());
+        code.push("            [[maybe_unused]] auto self = caller;".to_string());
+        for (i, (_, p)) in portable.iter().enumerate() {
+            let access = access_member(&p.prop, ctx).unwrap();
+            code.push(format!("            values.value_{i} = {access}.get();"));
+        }
+        code.extend([
+            "            slint::cbindgen_private::slint_windowrc_run_on_screen_tree(".to_string(),
+            "                &caller->m_globals.window().window_handle().handle(),".to_string(),
+            "                &caller->self_weak.lock()->into_dyn(),".to_string(),
+            "                &values,".to_string(),
+            "                [](void *data, const slint::cbindgen_private::ItemTreeRc *tree) {".to_string(),
+            "                    auto *values = static_cast<SlintHandoverValues *>(data);".to_string(),
+            format!(
+                "                    if (tree->vtable() != &{component_type}::static_vtable) {{ return; }}"
+            ),
+            format!(
+                "                    [[maybe_unused]] auto self = const_cast<{component_type} *>(static_cast<const {component_type} *>(tree->borrow().instance));"
+            ),
+        ]);
+        for (i, (_, p)) in portable.iter().enumerate() {
+            code.push(format!(
+                "                    {};",
+                property_set_value_code(&p.prop, &format!("values->value_{i}"), ctx)
+            ));
+        }
+        code.extend([
+            "                });".to_string(),
+            // The state has crossed to the tree that is drawn. This component is
+            // now a husk: shelving it stops its timers.
+            "            // The state crossed over; this tree is now a husk, and its timers go quiet.".to_string(),
+            "            caller->m_globals.slint_shelve();".to_string(),
+        ]);
     }
-    code.push("            };".to_string());
-    let getters = portable
-        .iter()
-        .map(|(name, _)| {
-            format!("caller->{}()", accessor_names::cpp_accessor_name(name, AccessorKind::Getter))
-        })
-        .collect::<Vec<_>>();
-    code.push(format!("            SlintHandoverValues values{{ {} }};", getters.join(", ")));
     code.extend([
-        "            slint::cbindgen_private::slint_windowrc_run_on_screen_tree(".to_string(),
-        "                &caller->m_globals.window().window_handle().handle(),".to_string(),
-        "                &caller->self_weak.lock()->into_dyn(),".to_string(),
-        "                &values,".to_string(),
-        "                [](void *data, const slint::cbindgen_private::ItemTreeRc *tree) {".to_string(),
-        "                    auto *values = static_cast<SlintHandoverValues *>(data);".to_string(),
-        format!(
-            "                    if (tree->vtable() != &{component_type}::static_vtable) {{ return; }}"
-        ),
-        format!(
-            "                    [[maybe_unused]] auto self = const_cast<{component_type} *>(static_cast<const {component_type} *>(tree->borrow().instance));"
-        ),
-    ]);
-    for (i, (_, p)) in portable.iter().enumerate() {
-        code.push(format!(
-            "                    {};",
-            property_set_value_code(&p.prop, &format!("values->value_{i}"), ctx)
-        ));
-    }
-    code.extend([
-        "                });".to_string(),
         "        },".to_string(),
         "        handover_data,".to_string(),
         "        [](void *user_data) { delete static_cast<SlintRenderHandoverData *>(user_data); });".to_string(),
@@ -4035,11 +4095,36 @@ fn generate_public_api_for_properties(
             ));
         } else {
             let cpp_property_type = p.ty.cpp_type().expect("Invalid type in public properties");
-            let prop_getter: Vec<String> = vec![
+            let mut prop_getter = vec![
                 "slint::private_api::assert_main_thread();".into(),
                 "[[maybe_unused]] auto self = this;".into(),
-                format!("return {}.get();", access),
             ];
+            // What the application reads has to be the value the tree the window
+            // draws holds, because that is the tree whose bindings decide what is
+            // seen. A handler that ran there changed the property where it ran, so
+            // reading the tree the application holds would answer with a state the
+            // window never showed. A value that cannot travel is read where the
+            // caller is, exactly as a call that cannot travel runs there.
+            //
+            // "Cannot travel" is this fork's one accepted divergence, and it is a
+            // physical one, not a choice: a model, an image, a brush or a struct
+            // holding one of those is a shared reference that `Send` refuses to
+            // move across a thread, and a call that carries one cannot either. Such
+            // a property is owned by whichever tree the caller runs against, and
+            // each tree keeps its own copy; the drawn tree's copy is whatever its
+            // own bindings made it. Everything that can travel is routed, writes
+            // included, so for it the two trees are the same tree.
+            if call_target.takes(&[], &p.ty) && p.ty.is_property_type() {
+                prop_getter.extend(screen_tree_call_code(
+                    call_target,
+                    &[],
+                    &[],
+                    &p.ty,
+                    &format!("{access}.get()"),
+                ));
+            } else {
+                prop_getter.push(format!("return {access}.get();"));
+            }
             declarations.push((
                 Access::Public,
                 Declaration::Function(Function {

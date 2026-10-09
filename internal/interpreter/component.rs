@@ -100,6 +100,10 @@ impl ComponentDefinitionInner {
         WindowInner::from_pub(window_adapter.window()).set_render_handover(Box::new(move || {
             let Some(instance) = weak.upgrade() else { return };
             let Some(adapter) = instance.window_adapter_or_default() else { return };
+            // A backend drew a tree of its own for the window, so this one is a
+            // husk: its timers describe state nothing draws. Shelving it stops
+            // them; the drawn tree carries its own.
+            instance.shelve();
             let state = public_api::portable_public_state(&instance);
             // `Value` is not `Send` because a model is a shared reference, but
             // the state holds only plain values, and the task runs before

@@ -21,6 +21,7 @@ use i_slint_compiler::object_tree::PropertyVisibility;
 use i_slint_core::item_tree::{ItemRc, ItemTreeRc, ItemTreeVTable};
 use i_slint_core::model::Model;
 use i_slint_core::window::WindowInner;
+use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -39,13 +40,84 @@ pub fn find_public_property<'a>(
 
 /// Read the value of a public property on `instance`.
 pub fn get(instance: &VRc<ItemTreeVTable, Instance>, name: &str) -> Option<Value> {
-    let (public, sub) = resolve(instance)?;
+    // What the application reads has to be the value the tree the window draws
+    // holds, because that tree's bindings decide what is seen, and a handler
+    // that ran there changed the property where it ran. A value that cannot
+    // travel is read where the caller is, exactly as a call that cannot travel
+    // runs there.
+    //
+    // "Cannot travel" is this fork's one accepted divergence, and it is a
+    // physical one, not a choice: a model, an image, a brush or a struct
+    // holding one of those is a shared reference that `Send` refuses to move
+    // across a thread. Such a property is owned by whichever tree the caller
+    // runs against, and each tree keeps its own copy; the drawn tree's copy is
+    // whatever its own bindings made it. Everything that can travel is routed,
+    // writes included, so for it the two trees are the same tree.
+    let crosses = {
+        let (public, _) = resolve(instance)?;
+        let prop = find_public_property(public, name)?;
+        if !prop.ty.is_property_type() {
+            return None;
+        }
+        i_slint_compiler::llr::is_thread_portable_type(&prop.ty)
+    };
+    if crosses && let Some(value) = get_from_screen_tree(instance, name) {
+        return Some(value);
+    }
+    get_local(instance, name)
+}
+
+/// Read a public property from the instance itself, with no thought for a tree
+/// another thread may be drawing.
+fn get_local(instance: &Instance, name: &str) -> Option<Value> {
+    let (public, sub) = resolve_root(instance)?;
     let prop = find_public_property(public, name)?;
     if !prop.ty.is_property_type() {
         return None;
     }
     let ctx = EvalContext::new(sub);
     Some(load_property(&ctx, &prop.prop))
+}
+
+/// Read a public property from the tree the window shows.
+///
+/// A backend that draws a tree of its own answers from there; one that draws the
+/// tree the instance holds answers from that one, which is the same tree. When
+/// there is no window to ask, `None` says so and the caller reads the instance
+/// it holds.
+fn get_from_screen_tree(instance: &Instance, name: &str) -> Option<Value> {
+    let adapter = instance.window_adapter_or_default()?;
+    let local_tree = WindowInner::from_pub(adapter.window()).try_component()?;
+    // The answer comes back through a pointer rather than a channel, because
+    // `Value` is not `Send` -- a model is a shared reference. The task the
+    // backend runs is what fills the slot, and the backend runs it before
+    // `run_on_screen_tree` returns, so the slot is complete before it is read.
+    #[derive(Copy, Clone)]
+    struct Answer(*const RefCell<Option<Value>>);
+    // SAFETY: the slot lives on this stack frame, and the task that writes
+    // through the pointer runs before `run_on_screen_tree` returns.
+    unsafe impl Send for Answer {}
+    impl Answer {
+        fn fill(&self, value: Option<Value>) {
+            // SAFETY: the pointee outlives this call, which returns before it.
+            unsafe { *(*self.0).borrow_mut() = value }
+        }
+        fn take(&self) -> Option<Value> {
+            // SAFETY: the pointee is this frame's slot, which the task above
+            // already wrote, and nothing writes it again before this reads it.
+            unsafe { (*self.0).borrow().clone() }
+        }
+    }
+    let slot = RefCell::new(None);
+    let answer = Answer(&slot as *const _);
+    let name = name.to_string();
+    let run = move |tree: &ItemTreeRc| {
+        let screen = VRef::downcast_pin::<Instance>(VRc::borrow_pin(tree))
+            .expect("the tree on screen is not this interpreter component");
+        answer.fill(get_local(screen.get_ref(), &name));
+    };
+    adapter.run_on_screen_tree(local_tree, Box::new(run));
+    answer.take()
 }
 
 /// Write a public property on `instance`.
@@ -75,7 +147,10 @@ pub fn set_on(instance: &Instance, name: &str, mut value: Value) -> Result<(), S
     store_property(&ctx, &prop.prop, value.clone());
     // The value is now on the tree the instance holds, but a backend may draw a
     // tree of its own, and that is the one whose bindings decide what is seen.
-    // Carry the value there too, for a property whose type can travel.
+    // Carry the value there too, for a property whose type can travel; one that
+    // cannot (a model, an image, a brush -- a shared reference `Send` refuses to
+    // cross a thread) is the one known gap, and it is owned by whichever tree
+    // the caller ran against, each side keeping its own copy.
     if portable {
         forward_public_property(instance, name, value);
     }

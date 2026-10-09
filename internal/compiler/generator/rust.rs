@@ -384,10 +384,14 @@ fn generate_public_component(
         llr::TopLevelComponentType::SystemTrayIcon => CallTarget::OwnTree,
     };
 
-    // A tray has no window to hand over, and a component with no property a
-    // thread can carry has nothing to hand over.
+    // A tray has no window to hand over, and a window that neither carries a
+    // property a thread can share nor runs a timer has nothing a handover can
+    // do. A timer alone is enough: when a backend takes the window over this
+    // component's timers describe state nothing draws, so they have to go on the
+    // shelf too.
     let render_handover = if matches!(llr.top_level_type, llr::TopLevelComponentType::Window)
-        && has_portable_public_state(&llr.public_properties)
+        && (has_portable_public_state(&llr.public_properties)
+            || unit.sub_components.iter().any(|sc| !sc.timers.is_empty()))
     {
         let body = render_handover_state(&llr.public_properties, &inner_component_id, &ctx);
         quote!(
@@ -734,10 +738,27 @@ fn generate_shared_globals(
             #(#pub_token #from_library_global_names : ::core::pin::Pin<sp::Rc<#from_library_global_types>>,)*
             window_adapter : sp::OnceCell<sp::WindowAdapterRc>,
             root_item_tree_weak : sp::VWeak<sp::ItemTreeVTable>,
+            // Whether a tree this thread holds is still the one the window
+            // draws. Every component of a tree shares the same `SharedGlobals`,
+            // so one flag says it for all of them.
+            slint_shelved : ::core::cell::Cell<bool>,
             #(#[allow(dead_code)]
             #library_shared_globals_names : sp::Rc<#library_shared_globals_types>,)*
         }
         impl SharedGlobals {
+            /// Whether this tree is a husk: a backend draws a tree of its own,
+            /// so nothing this thread computes for the window is seen.
+            fn slint_is_shelved(&self) -> bool {
+                self.slint_shelved.get()
+            }
+
+            /// Put the tree on the shelf. A backend that took the window over
+            /// has its own tree, and this one is left with nothing but the state
+            /// the application reads and writes through the window's calls.
+            fn slint_shelve(&self) {
+                self.slint_shelved.set(true);
+            }
+
             #pub_token fn new(root_item_tree_weak : sp::VWeak<sp::ItemTreeVTable>) -> sp::Rc<Self> {
                 #(let #library_shared_globals_names = #library_shared_globals_types::new(root_item_tree_weak.clone());)*
                 sp::Rc::new(Self {
@@ -745,6 +766,7 @@ fn generate_shared_globals(
                     #(#from_library_global_names : #library_global_vars.clone(),)*
                     window_adapter : ::core::default::Default::default(),
                     root_item_tree_weak,
+                    slint_shelved : ::core::cell::Cell::new(false),
                     #(#library_shared_globals_names,)*
                 })
             }
@@ -767,6 +789,9 @@ fn generate_shared_globals(
                     window_adapter: window_adapter.into(),
                     // `root_item_tree_weak` is only used to init the window_adapter. Since we have the window_adapter here already we don't need this variable
                     root_item_tree_weak: ::core::default::Default::default(),
+                    // A popup shows what the window that owns it draws, so the
+                    // popup and its owner are on the shelf together.
+                    slint_shelved: ::core::cell::Cell::new(self.slint_shelved.get()),
                     #(#library_shared_globals_names: self.#library_shared_globals_names.clone(),)*
                 })
             }
@@ -1181,20 +1206,31 @@ fn is_thread_portable_type(ty: &Type) -> bool {
 /// property that can travel from the component the application holds, and
 /// assigns it to the tree that is drawn. A property that cannot travel is left
 /// alone, exactly as a call that cannot travel is.
+///
+/// The same moment the tree is handed over it is put on the shelf: its timers
+/// describe state the shelf does not draw, so they are stopped from now on.
 fn render_handover_state(
     public_properties: &llr::PublicProperties,
     inner_component_id: &proc_macro2::Ident,
     ctx: &EvaluationContext,
 ) -> TokenStream {
-    let carries = public_properties.iter().filter_map(|(name, p)| {
+    let carries = public_properties.iter().filter_map(|(_, p)| {
         if !p.ty.is_property_type() || p.read_only() || !is_thread_portable_type(&p.ty) {
             return None;
         }
-        let getter = accessor_names::rust_accessor_ident(name, AccessorKind::Getter);
         let set_value = property_set_value_tokens(&p.prop, quote!(value), ctx);
+        let read = primitive_property_value(
+            &p.ty,
+            MemberAccess::Direct(access_member(&p.prop, ctx).unwrap()),
+        );
         Some(quote! {
             {
-                let value = component.#getter();
+                // The value is read here rather than through the public getter:
+                // by now the window has a tree of its own, so the getter would
+                // ask that tree what it holds, and the tree is what is about to
+                // be given this value.
+                let _self = sp::VRc::as_pin_ref(&component.0);
+                let value = #read;
                 let local_tree = sp::VRc::into_dyn(component.0.clone());
                 slint::ComponentHandle::window(&component)
                     .call_on_screen_tree(local_tree, move |tree| {
@@ -1209,7 +1245,15 @@ fn render_handover_state(
             }
         })
     });
-    quote!(#(#carries)*)
+    quote!(#(#carries)*
+
+        // A backend drew a tree of its own for the window, so this component's
+        // copy of the controls is a husk: the state it would compute is not what
+        // is on screen. Shelving it stops the timers it runs, which describe
+        // state nothing draws and would otherwise go on firing on this thread.
+        // The tree the backend draws carries its own timers, so the window keeps
+        // animating without this thread even waking up.
+        sp::VRc::as_pin_ref(&component.0).globals().slint_shelve();)
 }
 
 /// Whether a component has any public property whose value [`render_handover_state`]
@@ -1347,12 +1391,35 @@ fn public_api(
 
             let prop_expression = primitive_property_value(&p.ty, MemberAccess::Direct(prop));
 
-            property_and_callback_accessors.push(quote!(
-                #[allow(dead_code)]
-                pub fn #getter_ident(&self) -> #rust_property_type {
+            // What the application reads has to be the value the tree the window
+            // draws holds, because that is the tree whose bindings decide what is
+            // seen. A handler that ran there changed the property where it ran, so
+            // reading the tree the application holds would answer with a state the
+            // window never showed. A value that cannot travel is read where the
+            // caller is, exactly as a call that cannot travel runs there.
+            //
+            // "Cannot travel" is this fork's one accepted divergence, and it is a
+            // physical one, not a choice: a model, an image, a brush or a struct
+            // holding one of those is a shared reference that `Send` refuses to
+            // move across a thread, and a call that carries one cannot either. Such
+            // a property is owned by whichever tree the caller runs against, and
+            // each tree keeps its own copy; the drawn tree's copy is whatever its
+            // own bindings made it. Everything that can travel is routed, writes
+            // included, so for it the two trees are the same tree.
+            let read = if call_target.takes(&[], &p.ty) && p.ty.is_property_type() {
+                call_target.wrap(quote!(#prop_expression))
+            } else {
+                quote!(
                     #[allow(unused_imports)]
                     let _self = #self_init;
                     #prop_expression
+                )
+            };
+
+            property_and_callback_accessors.push(quote!(
+                #[allow(dead_code)]
+                pub fn #getter_ident(&self) -> #rust_property_type {
+                    #read
                 }
             ));
 
@@ -2004,6 +2071,17 @@ fn generate_sub_component(
                         self.#ident.start(sp::TimerMode::Repeated, interval, move || {
                             if let Some(self_rc) = self_weak.upgrade() {
                                 let _self = self_rc.as_pin_ref();
+                                // When the window draws a tree this thread does
+                                // not own, this one is a husk: its timers
+                                // describe state nothing draws. Stopping them
+                                // here is the last line of defense -- the drawn
+                                // tree carries its own -- so even a timer an
+                                // inner component restarted on the husk goes
+                                // quiet on its next fire.
+                                if _self.globals().slint_is_shelved() {
+                                    _self.#ident.stop();
+                                    return;
+                                }
                                 #callback
                             }
                         });

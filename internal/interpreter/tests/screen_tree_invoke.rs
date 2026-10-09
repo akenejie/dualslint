@@ -7,8 +7,10 @@
 //! A backend that took the window over builds a second tree from the factory
 //! the component left behind, and from then on the instance the application
 //! holds is not the one on screen. `invoke_*` has to land on the tree that is
-//! drawn, carrying plain arguments there and their answer back, while a call
-//! that carries something a thread cannot hold stays with the caller.
+//! drawn, carrying plain arguments there and their answer back, and a property
+//! that can travel is read from there too, because that tree's bindings decide
+//! what is seen. A call that carries something a thread cannot hold stays with
+//! the caller.
 //!
 //! The adapter below is the seam the winit render thread implements: it says
 //! which tree the window shows. It is the only way to have two trees of one
@@ -49,6 +51,34 @@ const SOURCE: &str = r#"
         set-struct(point) => {
             root.count = point.x;
             root.note = "struct";
+        }
+    }
+
+    // A timer is this tree's whole reason to be handed over: when a backend
+    // takes the window, the timers this thread runs describe state nothing
+    // draws, so they have to go on the shelf with the tree.
+    export component Blink inherits Window {
+        width: 320px;
+        height: 240px;
+        property <int> blinks: 0;
+        Timer {
+            interval: 1000ms;
+            running: true;
+            triggered => { root.blinks += 1; }
+        }
+    }
+
+    // A timer plus a count that can travel: the count closes the gap at the
+    // handover, and the drawing side's own timer is the one that keeps it
+    // moving from then on.
+    export component Tick inherits Window {
+        width: 320px;
+        height: 240px;
+        in-out property <int> ticks: 0;
+        Timer {
+            interval: 1000ms;
+            running: true;
+            triggered => { root.ticks += 1; }
         }
     }
 "#;
@@ -162,6 +192,14 @@ fn create_instance() -> ComponentInstance {
     result.component("Rerouted").expect("component should compile").create().unwrap()
 }
 
+/// Build the `Tick` component of [`SOURCE`], timers and all.
+fn create_tick() -> ComponentInstance {
+    let result =
+        spin_on::spin_on(Compiler::default().build_from_source(SOURCE.into(), Default::default()));
+    assert!(!result.has_errors(), "{:?}", result.diagnostics().collect::<Vec<_>>());
+    result.component("Tick").expect("component should compile").create().unwrap()
+}
+
 /// The tree behind an instance, which is the tree its window shows.
 fn tree_of(instance: &ComponentInstance) -> ItemTreeRc {
     WindowInner::from_pub(instance.window())
@@ -182,12 +220,12 @@ fn a_call_reaches_the_tree_the_window_shows() {
     // Nothing has taken the window over, so the call lands on the caller's own
     // tree -- which is also what says the call goes through the hook at all.
     app.invoke("add", &[Value::from(2), Value::from(SharedString::from("first"))]).unwrap();
+    assert_eq!(adapter.calls.get(), 1, "the call went through the hook");
     assert_eq!(
         count_and_note(&app),
         (Some(Value::from(3)), Some(Value::from(SharedString::from("first")))),
         "with no tree of its own, the window shows the caller's own tree"
     );
-    assert_eq!(adapter.calls.get(), 1, "the call went through the hook");
 
     // The handover: a second tree exists, and the window shows it from now on.
     let mirror = create_instance();
@@ -199,10 +237,28 @@ fn a_call_reaches_the_tree_the_window_shows() {
         (Some(Value::from(5)), Some(Value::from(SharedString::from("after")))),
         "the call landed on the tree that is drawn"
     );
+}
+
+/// What an application reads once a call has changed the tree that is drawn.
+#[test]
+fn a_read_comes_from_the_tree_the_window_shows() {
+    let platform = PlatformShowingTree::install();
+    let app = create_instance();
+    let adapter = platform.adapter_of_last_window();
+
+    let mirror = create_instance();
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+
+    app.invoke("add", &[Value::from(4), Value::from(SharedString::from("after"))]).unwrap();
+    assert_eq!(
+        count_and_note(&mirror),
+        (Some(Value::from(5)), Some(Value::from(SharedString::from("after")))),
+        "the call landed on the tree that is drawn"
+    );
     assert_eq!(
         count_and_note(&app),
-        (Some(Value::from(3)), Some(Value::from(SharedString::from("first")))),
-        "the tree nothing draws is left as it was"
+        (Some(Value::from(5)), Some(Value::from(SharedString::from("after")))),
+        "and what the application reads is the state that tree holds"
     );
 }
 
@@ -224,7 +280,11 @@ fn a_functions_answer_comes_from_the_tree_the_window_shows() {
         Ok(Value::from(11)),
         "the answer comes from the tree that is drawn"
     );
-    assert_eq!(app.get_property("count"), Ok(Value::from(1)), "the caller's own tree is untouched");
+    assert_eq!(
+        app.get_property("count"),
+        Ok(Value::from(10)),
+        "and that is what the application reads"
+    );
 }
 
 /// A call that carries a struct stays with the caller.
@@ -234,22 +294,37 @@ fn a_call_that_cannot_cross_stays_with_the_caller() {
     let app = create_instance();
     let adapter = platform.adapter_of_last_window();
 
-    let mirror = create_instance();
-    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
-
+    // Before a handover the window shows the caller's own tree, so a call that
+    // cannot travel runs there all the same, and what the application reads is
+    // the same tree.
     let mut point = slint_interpreter::Struct::default();
     point.set_field("x".into(), Value::from(7));
     app.invoke("set-struct", &[Value::Struct(point)]).unwrap();
-
     assert_eq!(
         count_and_note(&app),
         (Some(Value::from(7)), Some(Value::from(SharedString::from("struct")))),
         "a struct cannot travel, so the call ran on the caller's own tree"
     );
+
+    let mirror = create_instance();
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+
+    // A struct cannot travel after the handover either: the call stays with the
+    // caller, and the tree that is drawn is left as it was. What the application
+    // reads afterwards is the tree the window draws, which the call never
+    // reached.
+    let mut point = slint_interpreter::Struct::default();
+    point.set_field("x".into(), Value::from(9));
+    app.invoke("set-struct", &[Value::Struct(point)]).unwrap();
     assert_eq!(
         count_and_note(&mirror),
         (Some(Value::from(1)), Some(Value::from(SharedString::from("")))),
         "the tree that is drawn is left as it was"
+    );
+    assert_eq!(
+        count_and_note(&app),
+        (Some(Value::from(1)), Some(Value::from(SharedString::from("")))),
+        "what the application reads is the tree the window draws, not the one the call wrote"
     );
 }
 
@@ -328,4 +403,83 @@ fn a_value_set_after_the_handover_reaches_the_drawn_tree() {
         Some(&Value::from(0)),
         "a struct cannot travel, so the drawn tree keeps the declared value"
     );
+}
+
+/// A tree whose only reason to hand over is its timers sets a handover up all
+/// the same, so the shelf closes on them the moment a backend takes the window.
+#[test]
+fn a_tree_that_only_ticks_sets_up_a_handover() {
+    let platform = PlatformShowingTree::install();
+    let app = {
+        let result = spin_on::spin_on(
+            Compiler::default().build_from_source(SOURCE.into(), Default::default()),
+        );
+        assert!(!result.has_errors(), "{:?}", result.diagnostics().collect::<Vec<_>>());
+        result.component("Blink").expect("component should compile").create().unwrap()
+    };
+    let adapter = platform.adapter_of_last_window();
+
+    // Nothing a thread can carry, but the timers still need the shelf: without
+    // a handover clause this tree would have been skipped entirely.
+    let mirror = {
+        let result = spin_on::spin_on(
+            Compiler::default().build_from_source(SOURCE.into(), Default::default()),
+        );
+        assert!(!result.has_errors(), "{:?}", result.diagnostics().collect::<Vec<_>>());
+        result.component("Blink").expect("component should compile").create().unwrap()
+    };
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+    WindowInner::from_pub(app.window()).run_render_handover();
+
+    // The handover ran without carrying anything and put the tree on the
+    // shelf. What the drawn tree does afterwards is its own business.
+}
+
+/// A tree that ticks and carries a count: the tick runs on the drawn tree once
+/// the handover happened, and the count the application reads is the drawn
+/// tree's.
+#[test]
+fn a_ticking_tree_hands_over_and_keeps_ticking_on_the_drawn_side() {
+    let platform = PlatformShowingTree::install();
+    let app = create_tick();
+    let adapter = platform.adapter_of_last_window();
+
+    // Before a backend takes the window over, the component's own timer runs
+    // on this thread.
+    i_slint_backend_testing::testing_backend::mock_elapsed_time(2000);
+    i_slint_core::platform::update_timers_and_animations();
+    let first = match app.get_property("ticks").unwrap() {
+        Value::Number(n) => n as i64,
+        other => panic!("ticks is no number: {other:?}"),
+    };
+    assert!(first >= 1, "the application's own timer counted before the handover");
+
+    // Hand over: a second tree is drawn, and it gets the count so far.
+    let mirror = create_tick();
+    let after_handover = match app.get_property("ticks").unwrap() {
+        Value::Number(n) => n as i64,
+        other => panic!("ticks is no number: {other:?}"),
+    };
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+    WindowInner::from_pub(app.window()).run_render_handover();
+    match mirror.get_property("ticks").unwrap() {
+        Value::Number(n) if n as i64 == after_handover => {}
+        other => panic!("the count did not travel with the handover: {other:?}"),
+    }
+
+    // More time passes: the drawn tree's own timer is the one that counts now,
+    // the shelf having silenced the one this thread still calls ours.
+    i_slint_backend_testing::testing_backend::mock_elapsed_time(3000);
+    i_slint_core::platform::update_timers_and_animations();
+
+    let mirror_now = match mirror.get_property("ticks").unwrap() {
+        Value::Number(n) => n as i64,
+        other => panic!("ticks is no number: {other:?}"),
+    };
+    assert!(mirror_now > after_handover, "the drawn tree keeps ticking");
+    let app_now = match app.get_property("ticks").unwrap() {
+        Value::Number(n) => n as i64,
+        other => panic!("ticks is no number: {other:?}"),
+    };
+    assert_eq!(app_now, mirror_now, "what the application reads is the drawn tree's count");
 }

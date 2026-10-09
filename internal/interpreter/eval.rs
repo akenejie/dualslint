@@ -2325,7 +2325,11 @@ fn call_builtin_function(
             {
                 let instance = walk_to(ctx, *parent_level, &local_reference.sub_component_path);
                 if let Some(timer) = instance.timers.get(usize::from(*timer_idx)) {
-                    timer.restart();
+                    // A husk's timers describe state nothing draws, so the last
+                    // thing a callback on it should do is bring one back.
+                    if !crate::instance::is_shelved(&instance) {
+                        timer.restart();
+                    }
                 }
             }
             Value::Void
