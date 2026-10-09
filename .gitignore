@@ -71,3 +71,5 @@ tools/editor/skia-sources.json
 
 # Working notes (scratch, not for review)
 /notes.local/
+cppbuild/
+examples/target/
