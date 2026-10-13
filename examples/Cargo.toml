@@ -61,9 +61,9 @@ version = "1.18.0"
 # These are path dependencies on workspace members. The `version` pin is required
 # by `cargo xtask check_license_headers` (REUSE compliance), which enforces that
 # every slint/i-slint path dependency specifies `version = "=<workspace version>"`.
-i-slint-backend-testing = { version = "=1.18.0", path = "../internal/backends/testing", default-features = false }
-i-slint-core = { version = "=1.18.0", path = "../internal/core", default-features = false }
-i-slint-renderer-software = { version = "=1.18.0", path = "../internal/renderers/software", default-features = false }
+i-slint-backend-testing = { version = "=0.1.0", path = "../internal/backends/testing", default-features = false }
+i-slint-core = { version = "=0.1.0", path = "../internal/core", default-features = false }
+i-slint-renderer-software = { version = "=0.1.0", path = "../internal/renderers/software", default-features = false }
 
 bytemuck = { version = "1.13.1" }
 cfg_aliases = { version = "0.2.2" }

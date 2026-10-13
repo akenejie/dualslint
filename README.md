@@ -246,14 +246,13 @@ fn main() -> Result<(), slint::PlatformError> {
 
 ### バージョン管理
 
-**dualslint のリリースバージョンは git タグ `v0.1.0`（`v0.1.0-slint-v1.18.0`）で、上流 slint `v1.18.0`
-（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`）と API 互換です。**
+このリリース（dualslint）のバージョンは **0.1.0** です。正式な所在は `Cargo.toml` の
+`[workspace.package]` → `version`（`0.1.0`）で、リリース時にはここを更新します。
 
-- クレートの Cargo バージョン（`1.18.0`）は**上流 slint のバージョン**（互換の基盤）です。dualslint 自身の
-  リリースバージョンではありません。
-- fork 側の修正は基盤（上流 slint のバージョン）を固定したまま積まれ、互換性を保ちます。同じ基盤の上で
-  複数の fork リリースが生まれる可能性があるため、dualslint 側は独自のバージョン（`v0.1.0`、次は `v0.2.0` …）で
-  タグ付けします。タグ名の末尾（`slint-v1.18.0`）が互換する上流バージョンを示します。
+dualslint は上流 slint `v1.18.0`（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`）と
+**API 互換**です。dualslint の修正はこの互換基盤の上に積まれ、基盤を変えずに複数の dualslint リリースが
+生まれることがあります。そのため dualslint のバージョン（`0.1.0`、次は `0.2.0` …）は互換基盤の
+バージョンとは別に管理されます。
 
 ---
 
