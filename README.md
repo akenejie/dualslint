@@ -239,20 +239,10 @@ fn main() -> Result<(), slint::PlatformError> {
 | 項目 | 値 |
 |---|---|
 | 上流リポジトリ | https://github.com/slint-ui/slint |
-| ベース | `master`（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`、2026-09-12、version `1.18.0`） |
+| ベース | `master`（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`、2026-09-12） |
 | 公開先 | https://github.com/akenejie/dualslint |
 | フォークブランチ | `master` |
 | 主な変更対象 | `internal/backends/winit`・`internal/backends/scene`・`internal/backends/android-activity`・`internal/core`・`internal/compiler`・`internal/interpreter`・`api/{rs,cpp,node,python}` |
-
-### バージョン管理
-
-このリリース（dualslint）のバージョンは **0.1.0** です。正式な所在は `Cargo.toml` の
-`[workspace.package]` → `version`（`0.1.0`）で、リリース時にはここを更新します。
-
-dualslint は上流 slint `v1.18.0`（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`）と
-**API 互換**です。dualslint の修正はこの互換基盤の上に積まれ、基盤を変えずに複数の dualslint リリースが
-生まれることがあります。そのため dualslint のバージョン（`0.1.0`、次は `0.2.0` …）は互換基盤の
-バージョンとは別に管理されます。
 
 ---
 

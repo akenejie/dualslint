@@ -2317,7 +2317,7 @@ checksum = "48ce8546b993eaf241d69ded33b1be6d205dd9857ec879d9d18bd05d3676e144"
 
 [[package]]
 name = "i-slint-backend-android-activity"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "android-activity 0.5.2",
  "android-activity 0.6.1",
@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-backend-linuxkms"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "bytemuck",
  "calloop 0.14.4",
@@ -2354,7 +2354,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-backend-qt"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "const-field-offset",
  "cpp",
@@ -2371,7 +2371,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-backend-scene"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "i-slint-core",
  "lyon_path",
@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-backend-selector"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "cfg-if",
  "cfg_aliases",
@@ -2396,7 +2396,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-backend-testing"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "cfg_aliases",
  "i-slint-common",
@@ -2407,7 +2407,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-backend-winit"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -2454,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-common"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "derive_more",
  "fontique",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-compiler"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "annotate-snippets",
  "base64",
@@ -2506,7 +2506,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-core"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "accesskit",
  "async-channel",
@@ -2561,7 +2561,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-core-macros"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "quote",
  "serde_json",
@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-live-preview"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "i-slint-compiler",
  "i-slint-core",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-renderer-anyrender"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "anyrender",
  "i-slint-core",
@@ -2593,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-renderer-femtovg"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "cfg-if",
  "const-field-offset",
@@ -2612,7 +2612,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-renderer-skia"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "bytemuck",
  "cfg-if",
@@ -2649,7 +2649,7 @@ dependencies = [
 
 [[package]]
 name = "i-slint-renderer-software"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "bytemuck",
  "clru",
@@ -5310,7 +5310,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "slint"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "const-field-offset",
  "i-slint-backend-linuxkms",
@@ -5333,7 +5333,7 @@ dependencies = [
 
 [[package]]
 name = "slint-build"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "derive_more",
  "fontique",
@@ -5344,7 +5344,7 @@ dependencies = [
 
 [[package]]
 name = "slint-cpp"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "anyhow",
  "cbindgen",
@@ -5362,7 +5362,7 @@ dependencies = [
 
 [[package]]
 name = "slint-interpreter"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "derive_more",
  "i-slint-backend-linuxkms",
@@ -5384,7 +5384,7 @@ dependencies = [
 
 [[package]]
 name = "slint-macros"
-version = "0.1.0"
+version = "1.18.0"
 dependencies = [
  "i-slint-compiler",
  "proc-macro2",
