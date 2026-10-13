@@ -1,16 +1,17 @@
 # Copyright © akenejie
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# SceneFrame / DrawCommand types and the snapshot encoder for 2-thread
-# backends.  The types are plain `Send` data crossed over a channel; the
-# encoder walks a Slint item tree and is renderer-agnostic (the replay target
-# decides how to draw the commands).  The winit backend replays these onto
-# FemtoVG/GL; other platforms can ignore the protocol and present from their
-# own render thread instead.
+# Control protocol for the 2-thread backends: the shared control table
+# (`PublishedControls`) a UI thread hit-tests against, the tagged property
+# value (`ControlPropertyValue` / `CSlintControlPropertyValue`) and the C ABI
+# property-access seam (`ComponentPropertyAccess`).  Also the geometry-only
+# item-tree walk (`controls::encode_window_controls`) that publishes control
+# geometry without drawing anything — drawing stays with the upstream renderer
+# on the render thread.
 
 [package]
 name = "i-slint-backend-scene"
-description = "SceneFrame snapshot types and encoder for the 2-thread backends"
+description = "Control protocol types and geometry-only encoder for the 2-thread backends"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

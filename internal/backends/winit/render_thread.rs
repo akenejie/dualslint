@@ -1168,7 +1168,8 @@ struct RenderSurface {
 /// A window has one OpenGL context and this thread has one tree, so one window is
 /// *the* surface: the one the attached component asked for, or -- when the
 /// application did not say -- the first one that was configured. The others are
-/// the UI thread's to draw, because this thread has no tree for them.
+/// windows this thread has no tree for, and the UI thread does not draw them
+/// either, so nothing draws them: they are reported as undrawn and stay blank.
 ///
 /// Every message about a window says which window it is about. That is not
 /// bookkeeping: a window whose graphics were handed over is drawn by this thread
@@ -1223,8 +1224,9 @@ impl SurfaceState {
     ///
     /// The UI thread decides which window this is, because only it knows which
     /// window the application meant.  Naming a different one gives the old one
-    /// back to the UI thread: its graphics were never handed over -- this thread
-    /// is being told to ask for another window's -- so it still draws itself.
+    /// back to nobody: its graphics were never handed over -- this thread is
+    /// being told to ask for another window's -- and the UI thread draws
+    /// nothing, so the old window is left blank and reported as undrawn.
     fn set_owner(&mut self, window_id: winit::window::WindowId) -> bool {
         if self.owner == Some(window_id) {
             return false;
@@ -2655,10 +2657,10 @@ fn window_identity(window: &SlintApiWindow) -> usize {
 /// Request a window repaint through the render thread.
 ///
 /// This is the replacement for the removed [`Window::request_redraw`] entry
-/// point, and it reaches whichever thread draws the window: a window the render
-/// thread owns is re-encoded and re-presented there, and a window the UI thread
-/// still draws is repainted by the UI thread.  It is safe to call from any
-/// thread.
+/// point, and it reaches the thread that draws the window: a window the render
+/// thread owns is re-encoded and re-presented there.  A window no render thread
+/// draws for has no other thread to draw it, so nothing is repainted for it
+/// here.  It is safe to call from any thread.
 ///
 /// This is a no-op when the render thread was never started.
 pub fn request_redraw() {

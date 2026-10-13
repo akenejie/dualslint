@@ -2277,9 +2277,13 @@ impl WindowAdapter for WinitWindowAdapter {
         // RedrawRequested is delivered in time, so the frame keeps showing stale
         // pixels.
         //
-        // We instead forward every request straight to winit and let the native
-        // surface present/coalesce. This guarantees each `request_redraw()` ends
-        // up as a `RedrawRequested` -> `window.draw()` in the same event cycle.
+        // We instead forward every request straight to winit so that each
+        // `request_redraw()` ends up as a `RedrawRequested` -> `draw()` in the
+        // same event cycle.  This thread never presents, so the draw that
+        // follows is not a frame: it is the moment the handover starts, and the
+        // render thread draws the window from then on.  A request for a window
+        // the render thread will not take is answered by the report that says
+        // why it stays blank.
         //
         // Unless the render thread owns the graphics: that window is drawn from
         // the other thread, and asking this one to present would be two threads

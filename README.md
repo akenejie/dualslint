@@ -1,270 +1,205 @@
 # dualslint — UIスレッドとRenderスレッドを分離したslintのフォーク
 
-このリポジトリは [slint-ui/slint](https://github.com/slint-ui/slint) のフォークです。フォークの変更は `i-slint-backend-winit`
-（`internal/backends/winit`）のみです。
+このリポジトリは [slint-ui/slint](https://github.com/slint-ui/slint) のフォークです。フォークの変更は
+主に winit バックエンド（`i-slint-backend-winit`）と、それを支える core / コンパイラ / 言語バインディングに
+及びます。詳細は[「上流slintからの変更点」](#上流slintからの変更点)を参照してください。
 
-提供する API は上流の Slint に準拠しています。フォークは上流の公開 API を削除・変更せず、描画スレッドに関するAPIを追加しています。
+提供する API は上流の Slint に準拠することを方針としていますが、描画権威の移動に伴い
+`Window::request_redraw()` を削除しています（置き換えは `slint::render_thread::request_redraw()`）。
+詳細は[「上流 API との関係」](#上流-api-との関係)を参照してください。
 
 ## このフォークの目的
+
 GUI は人間とコンピュータの間の情報伝達のための手段です。その中でも、アニメーションを適切に使えば、人間から見える情報は増えます。
 そのようなとき、コンピュータがアニメーションを描き続ける処理（出力）とマウス・キーボード操作の処理（入力）を並列に処理したいことがあるはずです。
 ゲームやWebではUIと描画のスレッド分離は一般的かもしれませんが、ボタンやテキストボックスを使ったツール開発ではスレッド分離は珍しいでしょう。
 したがって、**軽量かつ2スレッドなGUIを構築する**、というのが、このフォークの目的となります。
 
+## 思想（render 主権）
+
+フォークは次の 5 点を設計の土台としています。
+
+1. **2 スレッド化。** 上流は 1 スレッドで OS 入力も描画も行いますが、本フォークは UI スレッドと
+   render（描画）スレッドに分離します。
+2. **UI は OS との通信（入力）に専念する。** ウィンドウの作成・イベントループ・マウス／キーボード入力の解決は
+   UI スレッドの仕事です。
+3. **render は画面への出力に専念する。** GL コンテキスト、描画、プレゼントは render スレッドのみが行います。
+4. **render 主権。** 画面に描かれている item tree（プロパティを含む）は render が所有します。UI は tree や
+   裏画面を render に送りません。render は「再描画して」と言われただけで再描画できるだけの情報
+   （= その component をもう一度生成できる factory）を持ちます。UI スレッドも worker も render に対等な API で
+   接します。
+5. **UI は一切描画を行わない。**
+
+「UI スレッドが描画した図をシリアライズして render へ送る」方式は、所有権を UI が握るために生まれた
+中間表現であり、**思想違反として廃止済み**です。描画は上流のコード（`FemtoVGRenderer::render()`）を
+render スレッド上でそのまま駆動します。
+
 ## アーキテクチャ（2スレッド分離）
 
-Rust製で軽量なGUIライブラリであるslintですが、標準の slint は、描画（シーングラフ・GL コンテキスト・プレゼンタ）を必ず UI スレッド（ウィンドウを作ったスレッド）に縛ります。
-本フォークは 描画を UI スレッドから完全に切り離し、独立した描画スレッドに移動させます。
+上流 slint は、描画（シーングラフ・GL コンテキスト・プレゼンタ）を必ず UI スレッド（ウィンドウを作った
+スレッド）に縛ります。本フォークは 描画を UI スレッドから完全に切り離し、独立した描画スレッドへ移します。
+画面に表示される tree は render スレッドが自分のスレッド上で生成した **mirror** です。
 
 | 担当 | UI スレッド | 描画スレッド（Render スレッド） |
 |---|---|---|
 | ウィンドウ / イベントループ | ✅ winit のイベントループとネイティブウィンドウ | — |
-| 入力（マウス・キーボード）・OS イベント | ✅ | — |
-| シーングラフ（item tree）・プロパティ | ✅ | — |
-| テキストレイアウト（sharedparley） | ✅（UI スレッドで字句を生成） | — |
+| 入力（マウス・キーボード）・OS イベント | ✅ 座標を論理ピクセルへ直し、発行済み geometry で hit-test | — |
+| 画面に描かれる item tree・プロパティ | — | ✅ factory から作った mirror tree（bindings/timers 含む） |
+| テキストレイアウト（sharedparley） | — | ✅ 上流の描画経路内で実施 |
 | GL コンテキスト（glutin） | — | ✅ |
-| 描画（FemtoVG canvas） | — | ✅ |
-| スワップチェーン / プレゼント | — | ✅（`swap_buffers`） |
-
-UI スレッドはシーングラフを **シリアライズ**（スナップショット化）して描画スレッドへ送り、描画スレッドはそれを
-**リプレイ** するだけです。GL コンテキストは描画スレッド上で作成されるため、UI スレッドは GL を一切触りません。
-`winit::window::Window` は `Send + Sync` なので、UI スレッドで作ったネイティブウィンドウのハンドルを描画スレッドへ渡せます。
+| 描画（上流 `FemtoVGRenderer` / `SoftwareRenderer`） | — | ✅ |
+| スワップチェーン / プレゼント | — | ✅（`swap_buffers` / `present_with_damage`） |
 
 ```
- UI スレッド                              描画スレッド
- ┌───────────────────────────┐          ┌───────────────────────────┐
- │ winit event loop          │          │ glutin GL context         │
- │ window (native)           │          │ FemtoVG canvas            │
- │ scene graph (items)       │          │ swap chain / present      │
- │ SnapshotEncoder ──┐       │          │                           │
- └───────────────────┼───────┘          └─────────────▲─────────────┘
-					 │ mpsc channel                    │
-			   RenderMessage::                        （プレゼント後）
-			   {Configure, Resize,                    RequestRedraw を
-				RenderScene(SceneFrame),               UI スレッドへ返す
-				User, Suspend, Quit}
+UI スレッド                              Render スレッド
+┌────────────────────────────┐          ┌────────────────────────────┐
+│ winit event loop           │          │ own item tree (mirror)     │
+│ window (native)            │          │ property graph / bindings  │
+│ app 自身の component の handle │          │ glutin GL context          │
+│ 入力イベントの解決          │          │ 上流 renderer::render()    │
+│  └─ hit-test / 動詞化 ─────┼────┐     │ swap / present             │
+└────────────────────────────┘    │     └─────────────▲──────────────┘
+                                  │ mpsc             │
+                     {Configure, Resize,  ───────────┘
+                      AttachComponent,                  control geometry /
+                     ApplyControlState,                 状態を共有表へ publish
+                     ActivateControl,
+                     KeyToRenderControl,
+                     SetControlProperty,
+                     GetControlProperty,
+                     RunOnScreenTree, …}
 ```
 
-描画のペーシングは、描画スレッドがフレームをプレゼントした後に `CustomEvent::RequestRedraw` を UI スレッドへ
-送り返すことで行われます（UI スレッドからネイティブ `request_redraw()` が呼ばれ、次のフレームの `RedrawRequested`
-がスケジュールされます）。
+- **画面の扱い方**は上流と同じ 1 本の tree に対するものだけです。UI スレッドから見ると、その tree は
+  スレッドを隔てた別インスタンスなので、`render_thread` の API（下表）を介して操作します。
+- アプリの handle が握る component（`AppWindow` 等）は UI スレッド側にも残りますが、**それは描画の
+  対象ではありません**。表示されているのは render スレッドが factory から作った mirror です。
+- 入力は生のまま render へ渡しません。UI スレッドが publish 済み geometry で hit-test し、コントロールを
+  名指す「動詞」（hover / press / activate / scroll / pinch / rotate）だけを渡します。コントロールが
+  何をするか（`clicked` / `toggled` / `accepted` の実行）は、tree を所有する render スレッドの責務です。
 
-## 上流slintからの変更点
+## ハンドオーバー（描画権の引き渡し）
 
-| # | ファイル | 変更 |
-|---|---------|------|
-| 1 | `internal/backends/winit/render_thread.rs` | **書き換え（本体）** … 描画スレッドの GL ドライバ。mpsc プロトコル（`RenderMessage`）・`SceneFrame`/`DrawCommand` のレトゥインドモード・門番の `RenderHost`/`RenderCore` |
-| 2 | `internal/backends/winit/snapshot.rs` | **新規追加** … `SnapshotEncoder`。UI スレッド上で item tree を `SceneFrame`（`DrawCommand` 列）へ直列化。テキストは sharedparley で字句（glyph run）に分解し、フォントの実バイト列を同梱 |
-| 3 | `internal/backends/winit/renderer/dual.rs` | **新規追加** … `DualThreadRenderer` / `DualCoreRenderer`。`WinitCompatibleRenderer` の実装。`resume()` でネイティブウィンドウを生成して raw handle を `Configure` で描画スレッドへ送出、`render()` で `SnapshotEncoder` によるエンコード＋`submit_scene()` を行う |
-| 4 | `internal/backends/winit/lib.rs` | `ensure_render_thread()` とモジュール配線。デフォルトレンダラーを `renderer::dual::DualThreadRenderer` にルーティング |
-| 5 | `internal/backends/winit/winitwindowadapter.rs` | `request_redraw()` をスロットル/合流せずに winit へ直接転送 |
-| 6 | `internal/backends/winit/event_loop.rs` | `CustomEvent::RequestRedraw`（描画スレッド → UI スレッドのフレームペーシング）の処理 |
-| 7 | `internal/backends/winit/Cargo.toml` | `femtovg`/`glutin`/`glutin-winit`/`rgb`/`imgref` を常時依存化。`i-slint-core` に `box-shadow-cache` feature を追加。`linebender_resource_handle` を廃止 |
-| 8 | `README.md` | 本ドキュメント |
+生成コード（Rust / C++ ジェネレータと interpreter）は、window の root component を生成した時点で
+**render factory**（その component を render スレッド上でもう 1 個生成できる `Fn() -> Box<dyn Any>`）を
+`WindowInner::render_factory` に残します。アプリのコードは何も書く必要がありません。
 
-削除した `frame_throttle.rs` / `apple_display_link.rs` は以前のフォーク版の名残です（描画のペーシングは現在
-描画スレッドが担当するため、UI スレッド側のリフレッシュレートスロットルは不要です）。
+1. UI スレッドが初回 `draw()` に達すると、`take_over_drawing_of()` が factory の有無・render スレッドの
+   有無・描画可能な renderer の有無を確認し、`AttachComponent` を送ります。
+2. render スレッドは factory を自分のスレッド上で実行し（headless window adapter + own platform）、
+   mirror tree を生成します。ここで上流の描画経路（テキスト整形含む）が render スレッド上で動き始めます。
+3. UI スレッドはウィンドウの graphics（GL context）を render へ渡し（`hand_over_graphics` →
+   `GraphicsReleased`）、以降 render スレッドが全フレームを描いてプレゼントします。
+4. 引き渡しができない window（factory がない / render スレッドが無い / renderer が描けない / 2 つ目以降の
+   window）は、**blank のまま理由を一度だけ報告**して停止します。UI スレッドが静かに描くことはありません。
+
+ハンドオーバー前後で、アプリが show 前に設定した public プロパティの値は mirror へ引き継がれます
+（`run_render_handover`）。show 後の public プロパティの setter も、型がスレッドを越えられるものなら
+描画中の tree（screen tree）へ転送されます。
 
 ## 描画スレッドのプロトコル
 
-UI スレッド → 描画スレッドは **mpsc チャネル** 1本です。`RenderHost`（送信側）と `RenderCore`（受信側）を
-`render_thread::channel()` が生成し、`ensure_render_thread()` がスレッドを起動します。
+UI スレッド → 描画スレッドは **mpsc チャネル** です。送信側 `RenderHost`（`Clone` + `Send`）は任意スレッドから
+使えます。`RenderMessage` の主な variant:
 
 ```rust
 pub enum RenderMessage {
-	Configure { window: Arc<winit::window::Window>, width: u32, height: u32, scale_factor: f64 },
-	Resize { width: u32, height: u32 },
-	RenderScene { frame: SceneFrame },
-	SetOverlay { overlay: OverlayFrame },
-	User(Box<dyn FnOnce() + Send>),
-	Suspend,
-	Quit,
+    Configure { window, width, height, scale_factor },
+    Resize { window_id, width, height },
+    User(Box<dyn FnOnce() + Send>),              // 任意クロージャを render スレッドで実行
+    AttachComponent { factory, property_access }, // mirror tree を render スレッド上で生成
+    ApplyControlState { id, hovered, pressed },
+    SetControlProperty { id, property, value, response },
+    GetControlProperty { id, property, response },
+    ActivateControl { id, response },
+    KeyToRenderControl { event, response },
+    PressControl { id, button, position },
+    MoveControl { position, finger_id },
+    ReleaseControl { id, button, position },
+    ScrollControl { id, position, delta_x, delta_y },
+    PinchControl { id, position, delta },
+    RotateControl { id, position, delta },
+    RunOnScreenTree { task, done },
+    RequestRedraw,
+    SetAccent { color },
+    HitTest { x, y, response },
+    AwaitGraphics { window_id, response },
+    GraphicsReleased { window_id },
+    SetSurfaceOwner { window_id },
+    Suspend { window_id },
+    Quit,
 }
 ```
 
-- `Configure` … UI スレッドで作ったネイティブウィンドウのハンドル。描画スレッドが glutin GL コンテキストと
-  **FemtoVG canvas を自スレッド上で生成** します。
-- `RenderScene` … `SceneFrame`（下記）をリプレイして `swap_buffers()` でプレゼント。
-- `SetOverlay` … UI シーンの上に合成するオーバーレイ層を差し替え。**任意のスレッドから送信可能**。
-- `Suspend` … GL コンテキストとウィンドウの `Arc` を解放（UI スレッド側からネイティブウィンドウ破棄可能にする）。
-- `User` … 任意クロージャーを描画スレッドで実行（診断・補助用）。
-- `Quit` … スレッド終了。
+- スレッドをまたぐ **フレーム（`SceneFrame` / `DrawCommand`）は送りません**。render スレッドは自分の
+  mirror tree を保持しており、`RequestRedraw`（あるいは tree 自身の timer / animation / property 変更）が
+  あるたびに自スレッド上で描画・プレゼントします。
+- render スレッドは**自分専用の frame clock** を持ちます。UI スレッドからのメッセージ、mirror tree の
+  `request_redraw()`、timer の期限、animation のフレーム間隔のいずれかで起床し、プレゼントします。
+- 描画が終わるたびに UI スレッドへ再描画要求を返すのではなく、render スレッドが自分の clock で次の
+  frame を決めて回します。
 
-### UI スレッド非依存の描画（オーバーレイ）
+## コントロール借用 API（render への対等なアクセス）
 
-描画スレッドは最後に受け取った `SceneFrame` を **保持** します。`SetOverlay`（`RenderHost::submit_overlay()`）
-が届くと、UI スレッドに依頼せず、保持した UI シーン＋オーバーレイを再合成して `swap_buffers()` でプレゼントします。
-ウィンドウの `Resize` 時も同様に再合成するため、**UI スレッドがビジーでも描画を続行**できます。
+rendered tree のコントロールは、共有座標表（`coordinate_map()` が返す `Arc<Mutex<PublishedControls>>`）に
+矩形と状態として publish されます。UI スレッドも worker も同じ API で読めます。
 
-```rust
-// 任意のワーカースレッドから（RenderHost は Clone + Send + Sync）
-if let Some(host) = render_thread::host() {
-	host.submit_overlay(OverlayFrame { fonts: vec![], commands: vec![
-		DrawCommand::FillRoundedRect { /* 物理ピクセル座標で記述 */ .. },
-	] });
-}
-```
+| API | 意味 |
+|---|---|
+| `hit_test(x, y)` / `control_at(x, y)` | publish 済み geometry で最も特定度の高いコントロール id を得る |
+| `apply_control_state(id, hovered, pressed)` | hover / press 状態を要求（bindings が上流のとおり再計算される） |
+| `activate_control(id)` | クリック = press/release の組を tree に届ける。`clicked` の発火は tree の責務 |
+| `press_control` / `move_control` / `release_control` / `scroll_control` / `pinch_control` / `rotate_control` | drag・wheel・ピンチ・回転の動詞 |
+| `send_key_to_control(event)` | `InternalKeyEvent` をそのまま tree へ。解釈（カーソル移動・選択・IME・`accepted`）は item の仕事 |
+| `get_control_property(id, name)` / `set_control_property(id, name, value)` | 名前ベースのプロパティ読み書き（`text` / `color` / `checked` 等） |
+| `ComponentPropertyAccess::new(read, write)` | built-in item にない複合 component のプロパティは、app が貸す 2 つのクロージャで解決 |
+| `run_on_screen_tree(local_tree, task)` | window-rooted な callback / function 呼び出しを描画中の tree で実行し、戻り値を回収 |
 
-`OverlayFrame` の座標空間・列挙型は `SceneFrame` と同じです（物理ピクセル、同一 `DrawCommand`）。
-空の `commands` を送るとオーバーレイ解除になります。
+publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hover / press の状態と、`checked` のような
+トグルの値を tree が持つため、UI スレッドは自分の記憶で推測しません。
 
-### コントロール（テキスト入りウィジェット）の任意スレッド描画
+## 上流slintからの変更点
 
-オーバーレイは矩形・画像だけでなく、**テキスト入りのコントロール全体**を UI スレッド非依存で描画できます。
-コントロールの「描く」処理は render スレッドが完全に担当し、アプリ（ワーカー）スレッドは**状態と要求のみ**
-（テキスト文字列・矩形・スタイル）を送ります。ワーカー側はフォントやグリフ配置に一切触れません。
+| 領域 | 変更 |
+|---|---|
+| `internal/backends/winit/render_thread.rs` | **新規（本体）**。render スレッドの GL/software ドライバ。`RenderMessage` プロトコル・`RenderHost`（送信側）・mirror tree 生成（`AttachComponent`）・control 借用 API・`RunOnScreenTree` |
+| `internal/backends/winit/winitwindowadapter.rs` | `draw()` は描画しない（handover を開始するだけ）。入力イベントを publish geometry で解決して動詞化。`request_redraw()` のフィルタ |
+| `internal/backends/winit/lib.rs` | `pub mod render_thread`。デフォルトレンダラ選択を「render スレッドが描けるもの」（femtovg / software）に変更 |
+| `internal/backends/winit/renderer/sw.rs` | ソフトウェア描画の UI スレッド駆動を撤去し、render スレッドの present 経路へ |
+| `internal/backends/scene/` | **新規クレート**。control プロトコル型（`PublishedControls` / `ControlPropertyValue` / C ABI）と geometry のみのコントロール走査（`encode_window_controls`） |
+| `internal/backends/android-activity/` | 同思想の render スレッド（`SkiaRenderer` を `ANativeWindow` に束縛、CPU ラスタ含む） |
+| `internal/core/` | `WindowInner::render_factory`（生成コードが factory を残す場所）、`WindowAdapter::run_on_screen_tree()`、`render_handover`、`ComponentPropertyAccess` の土台 |
+| `internal/compiler/` | Rust/C++/LLR: window-rooted な `invoke_*` の screen tree へのルーティング、複合 component の public プロパティが unused-remove されないよう保持、no_std でも通る render factory 登録 |
+| `internal/interpreter/` | `CompilationUnit` を `Send + Sync` 化（`RwLock` / `AtomicUsize`）して render スレッドでも instance を生成可能に。window-rooted 呼び出しの screen tree ルーティング |
+| `api/rs/slint` / `api/cpp` / `api/node` / `api/python` | `slint::render_thread`（`request_redraw`・control 借用・`attach_component*`）の公開とバインディング |
 
-`DrawCommand::DrawText` は、文字列を render スレッド自身の parley コンテキスト（`TextShaper`、システム
-フォント DB、スレッドローカル 1 本）で整形し、既存のグリフ描画経路で描画します。`x`／`y` はベースライン原点、
-`font_size` は物理ピクセル、`max_width` は折り返し幅（`None` = 1 行）です。フォントは整形の結果初出のもの
-だけを、既存の femtoVg フォントキャッシュ（blob id ＋フォント index キー）へ自動登録します。
+## 追加された API（`slint::render_thread`）
 
-```rust
-// 任意のワーカースレッドから、UI スレッドに一切触れず「OK」ボタンを描く
-use i_slint_backend_winit::render_thread::{self, DrawCommand, OverlayFrame, PhysicalPoint,
-                                           PhysicalRect, PaintDesc};
-use euclid::Size2D;
-use i_slint_core::lengths::PhysicalBorderRadius;
+`winit` / `android-activity` バックエンドで `slint::render_thread` が公開されます。主な項目:
 
-let (x, y) = (10.0f32, 40.0f32);            // ボタン矩形（物理 px）
-let frame = OverlayFrame {
-    fonts: Vec::new(),                      // render 側で整形するため何も持たせない
-    commands: vec![
-        DrawCommand::FillRoundedRect {
-            rect: PhysicalRect::new(PhysicalPoint::new(x, y), Size2D::new(160.0, 40.0)),
-            paint: PaintDesc::Solid { r: 60, g: 90, b: 200, a: 255 },
-            radius: PhysicalBorderRadius::new(6.0, 6.0, 6.0, 6.0),
-            anti_alias: true,
-        },
-        DrawCommand::StrokeRoundedRect {
-            rect: PhysicalRect::new(PhysicalPoint::new(x, y), Size2D::new(160.0, 40.0)),
-            paint: PaintDesc::Solid { r: 255, g: 255, b: 255, a: 255 },
-            radius: PhysicalBorderRadius::new(6.0, 6.0, 6.0, 6.0),
-            line_width: 1.0,
-            anti_alias: true,
-        },
-        DrawCommand::DrawText {
-            x: 24.0, y: 40.0,               // ベースライン原点（物理 px）
-            text: "Hello World 12345".to_string(),
-            font_size: 20.0,
-            paint: PaintDesc::Solid { r: 255, g: 255, b: 255, a: 255 },
-            max_width: None,
-        },
-    ],
-};
-render_thread::host().map(|h| h.submit_overlay(frame));
-```
-
-これで「UI スレッド完全アイドルのまま、アプリスレッドが要求を送り続け、render スレッドがコントロール
-（テキスト整形・描画含む）を再描画し続ける」ことができます（`ovl-sample` で実証済み: 100ms 毎に文字列と
-矩形を送りつつボタン全体を移動させ、直接キャプチャで確認）。
-
-### 共有座標マップ（`coordinate_map`）
-
-UI スレッドはイベント処理時にマウスポインタ位置から「どのコントロール上か」を判定する必要があります。
-座標は render スレッドが合成した実値だけが正であり、その値を共有メモリ
-（`Arc<Mutex<CoordinateMap>>`、`render_thread::coordinate_map()` で取得）に公開します。
-
-- **書き手（render スレッド）**: `SceneFrame.controls` の `ControlRegion` を合成時に
-  `publish_control_coords` でマップへ反映。マップ内容＝「render が実際に描画した」座標の権威。
-- **読み手（UI スレッド・ワーカー）**: イベント処理時にマップを `lock()` して hit-test。
-  ロックはごく短いため render スレッドをブロックしません。
-
-```rust
-// UI スレッドのイベント処理: マウス位置 (mx, my) がどのコントロール上かを判定
-use i_slint_backend_winit::render_thread::{self, CoordinateMap, ControlCoord};
-
-if let Some(map) = render_thread::coordinate_map() {
-    let map = map.lock().unwrap();
-    let under_pointer: Vec<u64> = map
-        .iter()
-        .filter(|(_, c)| c.contains(mx, my))
-        .map(|(id, _)| *id)
-        .collect();
-    // under_pointer が空でなければ、そのコントロールへ hover 等のイベントを転送
-}
-```
-
-`CoordinateMap` は `HashMap<u64 /*widget id*/, ControlCoord>` で、`ControlCoord` は
-論理ピクセルの矩形（`x`/`y`/`width`/`height`）と現在のポインタ状態
-（`hovered`/`pressed`、render が状態を所有する段階で更新）を持ちます。
-`CoordinateMap`・`ControlCoord`・`ControlRegion` は公開 API です。
-
-### `SceneFrame` — シーン全体のスナップショット
-
-```rust
-pub struct SceneFrame {
-	pub width: u32, pub height: u32, pub scale_factor: f32,
-	pub background: Option<[u8; 4]>,        // ウィンドウ背景（単色）→ クリアカラー
-	pub commands: Vec<DrawCommand>,
-	pub controls: Vec<ControlRegion>,       // render が共有座標マップへ公開するコントロール矩形
-}
-```
-
-`DrawCommand` は状態操作（`Save`/`Restore`/`Translate`/`Rotate`/`Scale`/`SetGlobalAlpha`/`CombineClip`）と
-プリミティブ（`FillRect`/`FillRoundedRect`/`StrokePath`/`FillPath`/`DrawGlyphRun`/`Blit`/`RenderLayer`/
-`DrawBoxShadow` など）に分かれ、**すべての座標・長さは物理ピクセル** です。描画スレッドはスケーリングなしで
-そのまま femtovg に流し込みます（`Scale` は UI スレッド側でエンコード時に畳み込む）。
-
-- ウィンドウ背景が**単色**なら `SceneFrame.background` のクリアカラーとして送ります（オーバードローなし）。
-- **グラデーションやパス**なら全面を覆う `draw_rectangle` コマンドとして直列化します。
-
-### テキストの扱い
-
-テキストは UI スレッド上で sharedparley によりグリフ配置まで済ませ、`DrawGlyphRun` としてフォントの実バイト列
-（`Vec<u8>`）＋グリフ座標を送ります。描画スレッドは受信したバイト列を `get_or_create_font` でアトラスに登録し、
-キャッシュ済みなら再利用してグリフを描画します。
-
-## ワークフロー（1フレーム）
-
-1. アプリが状態を更新 → 再描画要求（描画スレッド経由 `render_thread::request_redraw()`）。
-2. winit が `RedrawRequested` を発火 → `WinitWindowAdapter::draw()` が `DualThreadRenderer::render()` を呼ぶ。
-3. `SnapshotEncoder` が item tree を巡回し、`SceneFrame` に直列化 → `RenderHost::submit_scene()`。
-4. 描画スレッドが `SceneFrame` をリプレイ（クリア → `DrawCommand` 列 → `overlay` → `flush_to_output` → `swap_buffers`）。
-5. 描画スレッドが `CustomEvent::RequestRedraw` を UI スレッドへ送り返し、次のフレームをスケジュール。
-
-上記は UI スレッド発のペーシングです。これとは別に、**任意スレッドからの `submit_overlay()`** でも
-描画スレッドは保持済み UI シーン＋オーバーレイをその場で合成・プレゼントします（ステップ 1〜3 を
-経由しない、UI スレッド非依存の描画パス）。
-
-## 追加された API
-
-`i-slint-backend-winit` に `render_thread` モジュール（`pub mod render_thread;`）が公開されます。
-シグネチャはフォーク開発の経緯で進化していますが、現時点（`main`）の主な公開項目は以下の通りです。
-
-| 項目 | シグネチャ | 説明 |
-|---|---|---|
-| `channel()` | `pub(crate) fn channel(proxy) -> (RenderHost, RenderCore, FrameQueue)` | 描画スレッドとのチャネルを生成 |
-| `ensure_render_thread()` | `pub(crate) fn ensure_render_thread(proxy)` | 初回呼び出しで描画スレッドを起動（冪等） |
-| `host()` | `pub fn host() -> Option<RenderHost>` | グローバルな送信側ハンドルを取得 |
-| `RenderHost` | `#[derive(Clone)]` `Send + Sync` | 送信側。`submit_scene()` / `submit_configure()` / `submit_resize()` / `submit_suspend()` / `send_user()` / `send_quit()` / `send_redraw()` を持ち、任意スレッドから描画スレッドへ要求を送れる |
-| `set_image_sink()` | `pub fn set_image_sink<F>(sink: F)` | レトゥインドモードのフレームを `Image` として外部へ渡すコールバックを登録（CPU ラスタフォールバック用に残置） |
-| `submit_overlay()` | `pub fn submit_overlay(&self, overlay: OverlayFrame)` | UI 非依存の描画パス。任意スレッドから UI シーン上に合成されるオーバーレイ層を差し替え、保持済み UI シーン＋オーバーレイを即座に再合成・プレゼント（`Resize` 時も自動再合成） |
-| `OverlayFrame` | `pub struct { fonts: Vec<SceneFont>, commands: Vec<DrawCommand> }` | オーバーレイ層。座標空間・`DrawCommand` は `SceneFrame` と同一（物理ピクセル） |
-| `hwnd()` | `pub fn hwnd() -> Option<isize>` | 起動中のネイティブウィンドウの HWND（Windows）を取得 |
-| 型別名 | `PhysicalLength` / `PhysicalPoint` / `PhysicalRect` | `DrawCommand` の座標空間（物理ピクセル）を表す `euclid` エイリアス |
-
-従来の CPU ラスタ API（`RenderThreadPlatform` 等）は設計の変遷で整理され、`render_thread::render_thread_legacy`
-に互換スタブ（`PixelTarget` など）として残っています。
+| 項目 | 説明 |
+|---|---|
+| `request_redraw()` | 任意スレッドから再描画を要求。`Window::request_redraw()` の置き換え |
+| `RenderHost::attach_component(_to)` / `attach_component_with(_to)` | mirror tree を明示的に生成（自動ハンドオーバーを使わない場合） |
+| `RenderHost::hit_test` / `control_at` / `apply_control_state` / `activate_control` / `press_control` / `move_control` / `release_control` / `scroll_control` / `pinch_control` / `rotate_control` / `send_key_to_control` | control 借用 API |
+| `RenderHost::get_control_property` / `set_control_property` | 名前ベースのプロパティ読み書き |
+| `RenderHost::has_attached_component` / `run_on_screen_tree` / `send_user` / `send_quit` | render スレッドの状態確認と同期呼び出し |
+| `coordinate_map()` / `active_host()` / `hosts()` / `hwnd()` | 共有座標表とホスト列挙（`hwnd` は Windows） |
 
 ## 上流 API との関係
 
 - **削除された公開 API:** `Window::request_redraw()`（Rust / C++ / Node）と FFI `slint_windowrc_request_redraw`。
-  描画の権威が描画スレッド（`RenderHost` / mirror 装着時は render 側コンポーネント）にあるため、
-  UI スレッドへの再描画要求は意味を成さず、mirror 装着時に silent no-op になるため削除しました。
-  再描画を求める場合は `slint::render_thread::request_redraw()`（C++: `slint::render_thread::request_redraw()`）を使用します。
-  この関数は winit バックエンドなら常に利用でき、winit 系 feature（`backend-winit` / `backend-winit-x11` /
-  `backend-winit-wayland` / `backend-default`）のいずれかで `slint::render_thread` が公開されます。
-- 再描画要求の経路: mirror を装着していない（= 描画スレッドが描画の権威でない）場合は、描画スレッドが
-  `RenderHost::send_redraw()` で UI スレッドへ要求を送り返し、UI 側の通常レンダラが再描画します。
-  そのため `render_thread::request_redraw()` は 2 スレッド GL パスに限らず全 winit レンダラで機能します。
+  描画の権威は render スレッド（mirror tree を所有する側）にあります。UI スレッドへ再描画要求しても
+  silent no-op になるため削除し、`slint::render_thread::request_redraw()` へ置き換えました。
 - その他の公開 API（`WinitWindowAdapter`・`Platform`・`Renderer`・`with_window_event_handler()` 等）は
   シグネチャを保ったまま動作します。
-- 動作差は以下のとおりです（いずれもシグネチャ不変）:
-  - `WinitWindowAdapter::request_redraw()` … スロットル/合流をやめ、毎回 winit へ直接転送
-  - デフォルトレンダラがフォーク版 `DualThreadRenderer` になる（`renderer-femtovg` 時）
-- `renderer-software` / `renderer-skia` のフォールバックは、上流のままの通常スレッドモデルで動作します。
-  2スレッド分離は `renderer-femtovg` の GL パスで有効です。
+- **描画できる renderer は femtovg（GL）と software です。** render スレッドが駆動できない
+  `renderer-skia` / `renderer-vello` / `renderer-femtovg-wgpu` を選択したビルドでは、UI スレッドは
+  描かないため window は blank になり、その旨を一度だけ報告します（Android は例外で、Skia を
+  render スレッド経由で使用）。
+- **複数 window は 1 つの render スレッドにつき 1 window** です。2 つ目以降の window は blank + 報告
+  になります。drag の一部（`MoveControl` は実装済み）など、未対応の動詞は「残る gap」として
+  レンダラの実装コメントに記録されています。
 
 ## アプリとの統合方法
 
@@ -277,16 +212,16 @@ slint = { git = "https://github.com/akenejie/dualslint", branch = "master", feat
 ```
 
 `dualslint` は slint の公開 API（`.slint` のコンパイル、`slint` 相当の各モジュール、`Image` 等の型）を
-そのまま提供し、内部の winit バックエンドだけを本フォーク版（`render_thread` モジュール入り）に
-差し替えています。**`slint` を使う既存コードは、Cargo.toml の依存指定を git 参照へ差し替えるだけでそのまま動きます。**
-アプリ側のコード変更は不要です。
+そのまま提供します。**`slint` を使う既存コードは、Cargo.toml の依存指定を git 参照へ差し替えるだけで
+そのまま動きます（`Window::request_redraw()` を使用している場合のみ置き換えが必要です）。**
+アプリ側のコード追加は不要です（ハンドオーバーは自動で行われます）。
 
 ```rust
 slint::slint! { /* 既存の .slint コードはそのまま */ }
 
 fn main() -> Result<(), slint::PlatformError> {
 	let ui = MainWindow::new()?;
-	ui.run()   // 内部で ensure_render_thread() が描画スレッドを起動する
+	ui.run()   // 初回描画時に render スレッドが自動起動し、mirror を引き継ぐ
 }
 ```
 
@@ -307,15 +242,7 @@ fn main() -> Result<(), slint::PlatformError> {
 | ベース | `master`（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`、2026-09-12、version `1.18.0`） |
 | 公開先 | https://github.com/akenejie/dualslint |
 | フォークブランチ | `master` |
-| 変更対象 | `internal/backends/winit`（`i-slint-backend-winit`） |
-
-モノレポ内パスとクレート名の対応:
-
-| モノレポ内パス | クレート名 |
-|---|---|
-| `internal/backends/winit` | `i-slint-backend-winit` |
-| `internal/renderers/femtovg` | `i-slint-renderer-femtovg` |
-| `internal/core` | `i-slint-core` |
+| 主な変更対象 | `internal/backends/winit`・`internal/backends/scene`・`internal/backends/android-activity`・`internal/core`・`internal/compiler`・`internal/interpreter`・`api/{rs,cpp,node,python}` |
 
 ---
 
@@ -323,9 +250,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
 本リポジトリは上流 [slint-ui/slint](https://github.com/slint-ui/slint) をもとにしています。
 
-- **上流のコード**（`render_thread.rs` / `snapshot.rs` / `renderer/dual.rs` 以外）は上流 slint のライセンス
+- **上流からそのまま来ているファイル**は上流 slint のライセンス
   （`GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0`）に従います。
   各ファイルの SPDX ヘッダーと各クレート内の `LICENSES/` ディレクトリを参照してください。
-- **本フォークで変更・追加した部分**（新規 `render_thread.rs` / `snapshot.rs` / `renderer/dual.rs`、
-  `lib.rs` / `winitwindowadapter.rs` / `event_loop.rs` / `Cargo.toml` の変更箇所）は
-  **GNU Affero General Public License v3.0 (AGPL-3.0)** です。
+- **本フォークで新規追加したファイル**（`internal/backends/winit/render_thread.rs`、
+  `internal/backends/scene/` 等）は **GNU Affero General Public License v3.0 (AGPL-3.0)** です。
+  各ファイルの SPDX ヘッダー（`Copyright © akenejie`）を参照してください。
