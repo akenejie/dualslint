@@ -244,6 +244,17 @@ fn main() -> Result<(), slint::PlatformError> {
 | フォークブランチ | `master` |
 | 主な変更対象 | `internal/backends/winit`・`internal/backends/scene`・`internal/backends/android-activity`・`internal/core`・`internal/compiler`・`internal/interpreter`・`api/{rs,cpp,node,python}` |
 
+### バージョン管理
+
+**dualslint のリリースバージョンは git タグ `v0.1.0`（`v0.1.0-slint-v1.18.0`）で、上流 slint `v1.18.0`
+（commit `8dce1c4265d7ade881d8b2d5ec6c8bc3c228868c`）と API 互換です。**
+
+- クレートの Cargo バージョン（`1.18.0`）は**上流 slint のバージョン**（互換の基盤）です。dualslint 自身の
+  リリースバージョンではありません。
+- fork 側の修正は基盤（上流 slint のバージョン）を固定したまま積まれ、互換性を保ちます。同じ基盤の上で
+  複数の fork リリースが生まれる可能性があるため、dualslint 側は独自のバージョン（`v0.1.0`、次は `v0.2.0` …）で
+  タグ付けします。タグ名の末尾（`slint-v1.18.0`）が互換する上流バージョンを示します。
+
 ---
 
 ## ライセンス
