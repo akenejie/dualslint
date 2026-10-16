@@ -141,6 +141,30 @@ fn separate_instances_agree_on_control_ids() {
     );
 }
 
+/// The id published for a control names an item of the tree it was walked from,
+/// and `find_item_by_stable_id` recovers that item.  That is the lookup the UI
+/// thread needs to hand a hit to its own tree by the id the render thread
+/// published.
+#[test]
+fn a_published_id_finds_its_item() {
+    let instance = show(LogicalSize::new(400.0, 300.0));
+    let window = instance.window();
+    let tree = i_slint_core::window::WindowInner::from_pub(window)
+        .try_component()
+        .expect("the window holds the component");
+    let ids = control_ids(window);
+    assert!(!ids.is_empty(), "there is something to find");
+    for id in ids {
+        let item = i_slint_core::item_tree::find_item_by_stable_id(&tree, id)
+            .unwrap_or_else(|| panic!("id {id} names an item"));
+        assert_eq!(item.stable_id(), id, "the lookup returns the item the id names");
+    }
+    assert!(
+        i_slint_core::item_tree::find_item_by_stable_id(&tree, 0xdead_beef_dead_beef).is_none(),
+        "an unknown id names nothing"
+    );
+}
+
 /// A `for` loop expands to several instances of one definition, and the id has
 /// to tell them apart even though they share element ids.
 #[test]

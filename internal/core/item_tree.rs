@@ -1442,6 +1442,37 @@ pub fn visit_items<State>(
     visit_internal(item_tree, order, &mut visitor, -1, &state)
 }
 
+/// Find, in `item_tree`, the item whose [`ItemRc::stable_id`] is `id`.
+///
+/// The render thread publishes the stable id of every control it draws so the
+/// UI thread can hit-test the published rectangles without a tree of its own.
+/// When the hit has to reach an item — to hand it an event, or to read the state
+/// the hit put it in — this is how the id finds that item in the tree the
+/// caller holds: two structurally identical trees, the UI-side and the
+/// render-side instance of one window component, answer the same id with their
+/// own copy of the same item.
+///
+/// The walk is the whole tree, not any subtree, because the id was computed
+/// against the tree's root.
+pub fn find_item_by_stable_id(item_tree: &ItemTreeRc, id: u64) -> Option<ItemRc> {
+    let mut found = None;
+    visit_items(
+        item_tree,
+        TraversalOrder::FrontToBack,
+        |component, _item, index, _state| {
+            let item = ItemRc::new(component.clone(), index);
+            if item.stable_id() == id {
+                found = Some(item);
+                ItemVisitorResult::Abort
+            } else {
+                ItemVisitorResult::Continue(())
+            }
+        },
+        (),
+    );
+    found
+}
+
 fn visit_internal<State>(
     item_tree: &ItemTreeRc,
     order: TraversalOrder,
