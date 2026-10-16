@@ -15,8 +15,6 @@
 // The draw methods below are therefore empty rather than absent — they are how
 // the walk visits an item at all.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::pin::Pin;
 
 use i_slint_core::item_rendering::{
@@ -33,14 +31,14 @@ use i_slint_core::window::WindowInner;
 
 use crate::ControlRegion;
 
-/// Unique u64 id from an ItemRc (component ptr + item index), used for
-/// cache keys and control regions.
+/// Stable u64 id for the item a control region points at, used for control
+/// regions and the map from the UI thread's id back to the render-side item.
+///
+/// The id is derived from the item's position in the tree rather than from the
+/// tree's address, so the UI-side and render-side instances of the same item
+/// compute the same id even though they are different objects.
 pub(crate) fn item_rc_as_id(item_rc: &ItemRc) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    let ptr = &**item_rc.item_tree() as *const _ as usize;
-    ptr.hash(&mut hasher);
-    item_rc.index().hash(&mut hasher);
-    hasher.finish()
+    item_rc.stable_id()
 }
 
 // ---------------------------------------------------------------------------

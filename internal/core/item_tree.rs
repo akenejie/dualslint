@@ -295,6 +295,24 @@ fn step_into_node(
     }
 }
 
+/// Find the instance index of `child` among the instances the dynamic node
+/// `dyn_index` of `parent` expands to. Used to tell two repeated instances of
+/// the same component apart when computing [`ItemRc::stable_id`].
+fn find_subtree_index(parent: &ItemTreeRc, dyn_index: u32, child: &ItemTreeRc) -> u32 {
+    let parent_pin = vtable::VRc::borrow_pin(parent);
+    let range = parent_pin.as_ref().get_subtree_range(dyn_index);
+    for subindex in range.start..range.end {
+        let mut subtree: VWeak<ItemTreeVTable, Dyn> = Default::default();
+        parent_pin.as_ref().get_subtree(dyn_index, subindex, &mut subtree);
+        if let Some(subtree) = subtree.upgrade() {
+            if vtable::VRc::ptr_eq(&subtree, child) {
+                return subindex as u32;
+            }
+        }
+    }
+    u32::MAX
+}
+
 pub enum ParentItemTraversalMode {
     FindAllParents,
     StopAtPopups,
@@ -371,6 +389,65 @@ impl ItemRc {
 
     pub fn downgrade(&self) -> ItemWeak {
         ItemWeak { item_tree: VRc::downgrade(&self.item_tree), index: self.index }
+    }
+
+    /// Return a stable identifier for this item.
+    ///
+    /// The identifier is the same when computed on two structurally identical
+    /// item trees — for example the UI-side and the render-side instance of the
+    /// same window component — and different for two distinct items, even when
+    /// they come from repeated instances of one component definition.
+    ///
+    /// The compiler assigns each element a constant `element_id` within its
+    /// component. The stable id is the chain of those ids from the root down to
+    /// the item, with the instance index inserted at every repeater boundary.
+    /// Only there can two distinct items share a definition and an element id.
+    pub fn stable_id(&self) -> u64 {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        fn mix(mut h: u64, v: u32) -> u64 {
+            h ^= v as u64;
+            h.wrapping_mul(PRIME)
+        }
+
+        let mut h = OFFSET;
+        let mut current = self.clone();
+        // Guard against a malformed tree that never reaches a root.
+        for _ in 0..4096 {
+            let tree = current.item_tree.clone();
+            let next = {
+                let comp_ref_pin = vtable::VRc::borrow_pin(&tree);
+                let node_array = ItemTreeNodeArray::new(&comp_ref_pin);
+                match node_array.get(current.index) {
+                    Some(ItemTreeNode::Item { element_id, .. }) => {
+                        h = mix(h, 1);
+                        h = mix(h, *element_id);
+                    }
+                    _ => break,
+                }
+                if let Some(parent) = node_array.parent(current.index) {
+                    (tree.clone(), parent)
+                } else {
+                    let mut parent_weak = ItemWeak::default();
+                    comp_ref_pin.as_ref().parent_node(&mut parent_weak);
+                    let Some(parent_node) = parent_weak.upgrade() else { break };
+                    let parent_tree_pin = vtable::VRc::borrow_pin(&parent_node.item_tree);
+                    let parent_array = ItemTreeNodeArray::new(&parent_tree_pin);
+                    match parent_array.get(parent_node.index()) {
+                        Some(ItemTreeNode::DynamicTree { index: dyn_index, parent_index }) => {
+                            let row = find_subtree_index(&parent_node.item_tree, *dyn_index, &tree);
+                            h = mix(h, 2);
+                            h = mix(h, *dyn_index);
+                            h = mix(h, row);
+                            (parent_node.item_tree.clone(), *parent_index)
+                        }
+                        _ => (parent_node.item_tree.clone(), parent_node.index()),
+                    }
+                }
+            };
+            current = ItemRc::new(next.0, next.1);
+        }
+        h
     }
 
     /// Return the parent Item in the item tree.
@@ -1193,6 +1270,9 @@ pub enum ItemTreeNode {
 
         /// The index in the extra item_array
         item_array_index: u32,
+
+        /// Compiler-assigned constant element id
+        element_id: u32,
     },
     /// A placeholder for many instance of item in their own ItemTree which
     /// are instantiated according to a model like repeaters
@@ -1904,6 +1984,7 @@ mod tests {
                 children_index: 1,
                 parent_index: 0,
                 item_array_index: 0,
+                element_id: 0,
             }],
             subtrees: std::cell::RefCell::new(Vec::new()),
             subtree_index: usize::MAX,
@@ -1957,6 +2038,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 0,
                     item_array_index: 0, // Index in this array
+                    element_id: 0,
                 },
                 // First child of the root
                 ItemTreeNode::Item {
@@ -1965,6 +2047,7 @@ mod tests {
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
                     item_array_index: 1, // Index in this array
+                    element_id: 0,
                 },
                 // Second child of the root
                 ItemTreeNode::Item {
@@ -1973,6 +2056,7 @@ mod tests {
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
                     item_array_index: 2,
+                    element_id: 0,
                 },
                 // Third child of the root
                 ItemTreeNode::Item {
@@ -1981,6 +2065,7 @@ mod tests {
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
                     item_array_index: 3,
+                    element_id: 0,
                 },
             ],
             subtrees: std::cell::RefCell::new(Vec::new()),
@@ -2093,6 +2178,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 ItemTreeNode::DynamicTree { index: 0, parent_index: 0 },
             ],
@@ -2155,6 +2241,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 // First child
                 ItemTreeNode::Item {
@@ -2163,6 +2250,7 @@ mod tests {
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 ItemTreeNode::DynamicTree { index: 0, parent_index: 0 },
                 ItemTreeNode::Item {
@@ -2171,6 +2259,7 @@ mod tests {
                     children_index: 4,
                     parent_index: 0, // Root as parent
                     item_array_index: 0,
+                    element_id: 0,
                 },
             ],
             subtrees: std::cell::RefCell::new(Vec::new()),
@@ -2188,6 +2277,7 @@ mod tests {
                 children_index: 1,
                 parent_index: 2,
                 item_array_index: 0,
+                element_id: 0,
             }],
             subtrees: std::cell::RefCell::new(Vec::new()),
             subtree_index: 0,
@@ -2296,6 +2386,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 // First child
                 ItemTreeNode::Item {
@@ -2304,6 +2395,7 @@ mod tests {
                     children_index: 4,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 // Second child
                 // Relates to the first subtree in this component (sub_component1, added below)
@@ -2315,6 +2407,7 @@ mod tests {
                     children_index: 4,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
             ],
             subtrees: std::cell::RefCell::new(Vec::new()),
@@ -2334,6 +2427,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 2,
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 // First child
                 // Relates to the first subtree in this component (sub_component2, added below)
@@ -2354,6 +2448,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 1,
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 ItemTreeNode::Item {
                     is_accessible: false,
@@ -2361,6 +2456,7 @@ mod tests {
                     children_index: 2,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
             ],
             subtrees: std::cell::RefCell::new(Vec::new()),
@@ -2500,6 +2596,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 ItemTreeNode::DynamicTree { index: 0, parent_index: 0 },
                 ItemTreeNode::Item {
@@ -2508,6 +2605,7 @@ mod tests {
                     children_index: 4,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
             ],
             subtrees: std::cell::RefCell::new(Vec::new()),
@@ -2526,6 +2624,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 1,
                     item_array_index: 0,
+                    element_id: 0,
                 }],
                 subtrees: std::cell::RefCell::new(Vec::new()),
                 subtree_index: 0,
@@ -2541,6 +2640,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 1,
                     item_array_index: 0,
+                    element_id: 0,
                 }],
                 subtrees: std::cell::RefCell::new(Vec::new()),
                 subtree_index: 1,
@@ -2556,6 +2656,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 1,
                     item_array_index: 0,
+                    element_id: 0,
                 }],
                 subtrees: std::cell::RefCell::new(Vec::new()),
                 subtree_index: 2,
@@ -2607,6 +2708,7 @@ mod tests {
             children_index: 1,
             parent_index: 0,
             item_array_index: 0,
+            element_id: 0,
         }];
 
         let tree: ItemTreeNodeArray = (nodes.as_slice()).into();
@@ -2627,6 +2729,7 @@ mod tests {
                 children_index: 1,
                 parent_index: 0,
                 item_array_index: 0,
+                element_id: 0,
             },
             ItemTreeNode::Item {
                 is_accessible: false,
@@ -2634,6 +2737,7 @@ mod tests {
                 children_index: 2,
                 parent_index: 0,
                 item_array_index: 0,
+                element_id: 0,
             },
         ];
 
@@ -2658,6 +2762,7 @@ mod tests {
                 children_index: 1,
                 parent_index: 0,
                 item_array_index: 0,
+                element_id: 0,
             },
             ItemTreeNode::Item {
                 is_accessible: false,
@@ -2665,6 +2770,7 @@ mod tests {
                 children_index: 4,
                 parent_index: 0,
                 item_array_index: 0,
+                element_id: 0,
             },
             ItemTreeNode::Item {
                 is_accessible: false,
@@ -2672,6 +2778,7 @@ mod tests {
                 children_index: 4,
                 parent_index: 0,
                 item_array_index: 0,
+                element_id: 0,
             },
             ItemTreeNode::Item {
                 is_accessible: false,
@@ -2679,6 +2786,7 @@ mod tests {
                 children_index: 4,
                 parent_index: 0,
                 item_array_index: 0,
+                element_id: 0,
             },
         ];
 
@@ -2723,6 +2831,7 @@ mod tests {
                         children_index: 1,
                         parent_index: 0,
                         item_array_index: 0,
+                        element_id: 0,
                     },
                     // First child
                     ItemTreeNode::Item {
@@ -2731,6 +2840,7 @@ mod tests {
                         children_index: 2, // Monotonic increasing
                         parent_index: 0,
                         item_array_index: 1,
+                        element_id: 0,
                     },
                     // First child of the first child of the root
                     ItemTreeNode::Item {
@@ -2739,6 +2849,7 @@ mod tests {
                         children_index: 3, // Not relevant because it has no children
                         parent_index: 1,
                         item_array_index: 2,
+                        element_id: 0,
                     },
                 ],
                 subtrees: std::cell::RefCell::new(Vec::new()),
@@ -2884,6 +2995,7 @@ mod tests {
                         children_index: 1,
                         parent_index: 0,
                         item_array_index: 0,
+                        element_id: 0,
                     },
                     ItemTreeNode::Item {
                         is_accessible: false,
@@ -2891,6 +3003,7 @@ mod tests {
                         children_index: 2,
                         parent_index: 0,
                         item_array_index: 1,
+                        element_id: 0,
                     },
                     ItemTreeNode::Item {
                         is_accessible: false,
@@ -2898,6 +3011,7 @@ mod tests {
                         children_index: 3,
                         parent_index: 1,
                         item_array_index: 2,
+                        element_id: 0,
                     },
                     ItemTreeNode::Item {
                         is_accessible: false,
@@ -2905,6 +3019,7 @@ mod tests {
                         children_index: 4,
                         parent_index: 2,
                         item_array_index: 3,
+                        element_id: 0,
                     },
                 ],
                 geometries: vec![
@@ -3130,6 +3245,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 0,
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 // First child
                 ItemTreeNode::DynamicTree { index: 0, parent_index: 0 },
@@ -3150,6 +3266,7 @@ mod tests {
                     children_index: 1,
                     parent_index: 1, // The index in the parent item tree
                     item_array_index: 0,
+                    element_id: 0,
                 },
                 // First child
                 ItemTreeNode::Item {
@@ -3158,6 +3275,7 @@ mod tests {
                     children_index: 0,
                     parent_index: 0,
                     item_array_index: 1,
+                    element_id: 0,
                 },
             ],
             subtrees: std::cell::RefCell::new(Vec::new()),

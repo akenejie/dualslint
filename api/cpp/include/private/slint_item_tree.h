@@ -21,11 +21,11 @@ using ItemArray = slint::cbindgen_private::Slice<ItemArrayEntry>;
 
 constexpr inline ItemTreeNode make_item_node(uint32_t child_count, uint32_t child_index,
                                              uint32_t parent_index, uint32_t item_array_index,
-                                             bool is_accessible)
+                                             bool is_accessible, uint32_t element_id)
 {
     return ItemTreeNode { ItemTreeNode::Item_Body { ItemTreeNode::Tag::Item, is_accessible,
                                                     child_count, child_index, parent_index,
-                                                    item_array_index } };
+                                                    item_array_index, element_id } };
 }
 
 constexpr inline ItemTreeNode make_dyn_node(std::uint32_t offset, std::uint32_t parent_index)

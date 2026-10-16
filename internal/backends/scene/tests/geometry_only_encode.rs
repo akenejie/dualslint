@@ -60,14 +60,19 @@ fn region(c: &ControlRegion) -> (u64, i32, i32, u32, u32) {
     )
 }
 
+/// Bring up the testing backend and show a freshly built instance at `size`.
+fn show(size: LogicalSize) -> ComponentInstance {
+    i_slint_backend_testing::init_no_event_loop();
+    build(size)
+}
+
 /// Compile [`SOURCE`] and show it at `size`.
 ///
 /// The instance is returned rather than the window because the window is a
 /// borrow of it, and a walk visits a tree that is only alive as long as the
 /// component is.  No layout pass is run here on purpose: the walk does it,
 /// which is what the second test is about.
-fn show(size: LogicalSize) -> ComponentInstance {
-    i_slint_backend_testing::init_no_event_loop();
+fn build(size: LogicalSize) -> ComponentInstance {
     let result =
         spin_on::spin_on(Compiler::default().build_from_source(SOURCE.into(), Default::default()));
     assert!(!result.has_errors(), "{:?}", result.diagnostics().collect::<Vec<_>>());
@@ -112,4 +117,37 @@ fn a_resize_reaches_the_published_geometry() {
     let after = regions(instance.window());
 
     assert_ne!(before, after, "a resize reaches the published geometry");
+}
+
+fn control_ids(window: &Window) -> Vec<u64> {
+    regions(window).into_iter().map(|r| r.0).collect()
+}
+
+/// The whole point of a stable id is that two trees built from the same
+/// component definition — the one the application holds and the one a backend
+/// builds to draw — name the same control the same way, so the UI thread can
+/// hand a click to its own tree by id.  Two instances of the same definition
+/// are exactly that situation, without the render thread.
+#[test]
+fn separate_instances_agree_on_control_ids() {
+    i_slint_backend_testing::init_no_event_loop();
+    let a = build(LogicalSize::new(400.0, 300.0));
+    let b = build(LogicalSize::new(400.0, 300.0));
+
+    assert_eq!(
+        control_ids(a.window()),
+        control_ids(b.window()),
+        "two trees from one definition name the same controls the same way"
+    );
+}
+
+/// A `for` loop expands to several instances of one definition, and the id has
+/// to tell them apart even though they share element ids.
+#[test]
+fn repeated_controls_get_distinct_ids() {
+    let instance = show(LogicalSize::new(400.0, 300.0));
+    let ids = control_ids(instance.window());
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+
+    assert_eq!(unique.len(), ids.len(), "every control has its own id: {ids:?}");
 }

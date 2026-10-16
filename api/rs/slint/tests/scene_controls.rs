@@ -65,6 +65,15 @@ component!(PositionedTouchArea {
     TouchArea { x: 10px; y: 20px; width: 80px; height: 40px; }
 });
 
+component!(TwoTouchAreas {
+    TouchArea { }
+    TouchArea { }
+});
+
+component!(RepeatedTouchAreas {
+    for i in 3: TouchArea { }
+});
+
 /// Show a freshly created component and return the control regions it
 /// publishes.  Creating the component has to happen after the platform is
 /// installed, hence the macro.
@@ -113,4 +122,27 @@ fn published_geometry_is_the_laid_out_rect() {
     let geometry = regions[0].geometry;
     assert_eq!((geometry.origin.x, geometry.origin.y), (10.0, 20.0));
     assert_eq!((geometry.size.width, geometry.size.height), (80.0, 40.0));
+}
+
+fn ids(regions: &[ControlRegion]) -> Vec<u64> {
+    regions.iter().map(|r| r.id).collect()
+}
+
+/// Two controls declared in the same component are different targets, so they
+/// must not share an id even though they are the same kind of item.
+#[test]
+fn sibling_touch_areas_get_distinct_ids() {
+    let regions = controls_of!(TwoTouchAreas);
+    assert_eq!(regions.len(), 2);
+    assert_ne!(regions[0].id, regions[1].id, "siblings are distinct controls");
+}
+
+/// A `for` loop expands to repeated instances of one definition.  The id has to
+/// tell them apart, which a compiler-assigned element id alone cannot do.
+#[test]
+fn repeated_touch_areas_get_distinct_ids() {
+    let regions = controls_of!(RepeatedTouchAreas);
+    assert_eq!(regions.len(), 3, "one control per row");
+    let unique: std::collections::HashSet<_> = ids(&regions).into_iter().collect();
+    assert_eq!(unique.len(), 3, "each row has its own id");
 }

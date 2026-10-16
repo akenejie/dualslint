@@ -1073,6 +1073,7 @@ fn build_tree_nodes(
                     // `item_array_index` is the flat tree index so
                     // `get_item_ref` can walk the item_table directly.
                     item_array_index: out.len() as u32,
+                    element_id: out.len() as u32,
                 },
                 None,
                 Some((node.sub_component_path.clone().into_boxed_slice(), item_idx)),
