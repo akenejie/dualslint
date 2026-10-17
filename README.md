@@ -197,9 +197,10 @@ publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hov
   `renderer-skia` / `renderer-vello` / `renderer-femtovg-wgpu` を選択したビルドでは、UI スレッドは
   描かないため window は blank になり、その旨を一度だけ報告します（Android は例外で、Skia を
   render スレッド経由で使用）。
-- **複数 window は 1 つの render スレッドにつき 1 window** です。2 つ目以降の window は blank + 報告
-  になります。drag の一部（`MoveControl` は実装済み）など、未対応の動詞は「残る gap」として
-  レンダラの実装コメントに記録されています。
+- **複数 window は 1 window につき 1 つの render スレッド** です。window ごとに別スレッドが
+  立ち上がり、それぞれが自分の mirror tree と描画コンテキストを所有します。drag の一部
+  （`MoveControl` は実装済み）など、未対応の動詞は「残る gap」としてレンダラの実装コメントに
+  記録されています。
 
 ## アプリとの統合方法
 
