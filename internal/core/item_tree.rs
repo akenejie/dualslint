@@ -174,6 +174,19 @@ pub type ItemTreeRc = vtable::VRc<ItemTreeVTable, Dyn>;
 /// Type alias to the commonly used VWeak<ItemTreeVTable, Dyn>>
 pub type ItemTreeWeak = vtable::VWeak<ItemTreeVTable, Dyn>;
 
+/// A number that names `tree` for as long as it lives.
+///
+/// Two trees of one program are the same program, and generated code has to be
+/// able to tell them apart without holding both: an `Rc` cannot be carried by a
+/// `Send` closure, and the work of handing a call to the other tree is exactly
+/// that kind of closure. This is the address of the tree, which is as stable as
+/// the tree itself, and which a closure may carry across a thread as a number.
+/// It only ever means something next to the same number taken from a tree that
+/// is still alive, so it is never stored beyond the call it serves.
+pub fn item_tree_identity(tree: &ItemTreeRc) -> usize {
+    (&**tree) as *const Dyn as *const () as usize
+}
+
 /// Ensure all repeaters and conditionals within the given item tree are
 /// instantiated. Call this before non-rendering tree walks that use
 /// `first_child` / `next_sibling`.

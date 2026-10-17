@@ -204,7 +204,8 @@ pub mod re_exports {
     };
     pub use i_slint_core::item_tree::{
         IndexRange, ItemTree, ItemTreeRc, ItemTreeRefPin, ItemTreeVTable, ItemTreeWeak,
-        ensure_item_tree_instantiated, register_item_tree, unregister_item_tree,
+        ensure_item_tree_instantiated, item_tree_identity, register_item_tree,
+        unregister_item_tree,
     };
     pub use i_slint_core::item_tree::{
         ItemTreeNode, ItemVisitorRefMut, ItemVisitorVTable, ItemWeak, TraversalOrder,

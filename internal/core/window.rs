@@ -28,6 +28,7 @@ use crate::properties::{ChangeTracker, Property, PropertyTracker};
 use crate::renderer::Renderer;
 use crate::{Callback, Coord, SharedString, SharedVector};
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::rc::{Rc, Weak};
 #[cfg(feature = "std")]
 use alloc::sync::Arc;
@@ -713,6 +714,14 @@ pub struct WindowInner {
     /// not have to cross a thread boundary and is not `Send`.
     #[cfg(feature = "std")]
     render_handover: RefCell<Option<Box<dyn Fn()>>>,
+
+    /// The callbacks of the root component whose handler the application replaced
+    /// with one of its own, as the number each one carries in generated code. The
+    /// tree a backend draws is built from the declaration and so starts with the
+    /// declared handler, which is not the one the application means: for these the
+    /// handover points the drawn tree back at the application.
+    #[cfg(feature = "std")]
+    host_handled_callbacks: RefCell<BTreeSet<u32>>,
 }
 
 impl Drop for WindowInner {
@@ -790,6 +799,8 @@ impl WindowInner {
             render_factory,
             #[cfg(feature = "std")]
             render_handover,
+            #[cfg(feature = "std")]
+            host_handled_callbacks: Default::default(),
         }
     }
 
@@ -1263,6 +1274,27 @@ impl WindowInner {
         if let Some(handover) = self.render_handover.borrow().as_ref() {
             handover();
         }
+    }
+
+    /// Record that the application replaced the declared handler of the root
+    /// component's callback number `index` with one of its own.
+    ///
+    /// The declared handler lives on the tree the application holds, while the
+    /// tree a backend draws was built from the declaration and still carries the
+    /// one that was there. A handover reads this to know which of the drawn
+    /// tree's callbacks have to be pointed back at the application instead.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn note_host_callback(&self, index: u32) {
+        self.host_handled_callbacks.borrow_mut().insert(index);
+    }
+
+    /// Whether [`Self::note_host_callback`] recorded a handler of the
+    /// application's own for the root component's callback number `index`.
+    #[cfg(feature = "std")]
+    #[doc(hidden)]
+    pub fn has_host_callback(&self, index: u32) -> bool {
+        self.host_handled_callbacks.borrow().contains(&index)
     }
 
     /// Report that the in-flight native drag finished with `action`.

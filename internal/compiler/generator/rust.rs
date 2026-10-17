@@ -385,12 +385,15 @@ fn generate_public_component(
     };
 
     // A tray has no window to hand over, and a window that neither carries a
-    // property a thread can share nor runs a timer has nothing a handover can
-    // do. A timer alone is enough: when a backend takes the window over this
-    // component's timers describe state nothing draws, so they have to go on the
-    // shelf too.
+    // property a thread can share, nor runs a timer, nor has a callback the
+    // application may take over has nothing a handover can do. A timer alone is
+    // enough: when a backend takes the window over this component's timers
+    // describe state nothing draws, so they have to go on the shelf too. A
+    // callback is the same: the application's own handler lives on this thread's
+    // tree, so the drawn tree has to be pointed back at it.
     let render_handover = if matches!(llr.top_level_type, llr::TopLevelComponentType::Window)
         && (has_portable_public_state(&llr.public_properties)
+            || has_traveling_public_callback(&llr.public_properties)
             || unit.sub_components.iter().any(|sc| !sc.timers.is_empty()))
     {
         let body = render_handover_state(&llr.public_properties, &inner_component_id, &ctx);
@@ -1245,7 +1248,76 @@ fn render_handover_state(
             }
         })
     });
-    quote!(#(#carries)*
+
+    // A callback the application replaced keeps the application's handler on the
+    // tree the application holds, while the tree the window draws -- built from
+    // the declaration -- still carries the declared one. Point the drawn tree's
+    // callback back at the application's handler, so the code the application
+    // wrote is the code that runs. The drawn tree lives on another thread, so the
+    // handler it is given carries only what can cross: a weak handle to the
+    // application's component, which crosses as a `Send` reference, and the values
+    // of the arguments. A call that arrives on this thread -- a backend that draws
+    // in this thread, as a test one does -- runs the handler here directly, which
+    // is also what keeps the round trip from needing an event loop that is not
+    // running.
+    let routes = public_properties.iter().enumerate().filter_map(|(index, (_, p))| {
+        let Type::Callback(callback) = &p.ty else { return None };
+        if !callback_travels_back(callback) {
+            return None;
+        }
+        let index = proc_macro2::Literal::u32_suffixed(index as u32);
+        let callback_access = access_member(&p.prop, ctx).unwrap();
+        let arg_names =
+            (0..callback.args.len()).map(|i| format_ident!("route_arg_{}", i)).collect::<Vec<_>>();
+        let arg_indices = (0..callback.args.len())
+            .map(proc_macro2::Literal::usize_unsuffixed)
+            .collect::<Vec<_>>();
+        // A callback with no arguments leaves the parameter unread, and the
+        // generated code has to say so for the visitor's warnings to stay quiet.
+        let args_param = if callback.args.is_empty() { quote!(_args) } else { quote!(args) };
+        Some(quote! {
+            {
+                let host_window = slint::ComponentHandle::window(&component);
+                if sp::WindowInner::from_pub(host_window).has_host_callback(#index) {
+                    let local_tree = sp::VRc::into_dyn(component.0.clone());
+                    let local_identity = sp::item_tree_identity(&local_tree);
+                    let ui_thread = std::thread::current().id();
+                    let app = weak.clone();
+                    host_window.call_on_screen_tree(local_tree, move |tree| {
+                        // A window with no tree of its own runs this against the tree
+                        // the application holds. Pointing that tree's callback back at
+                        // the application would have it call itself, so leave it: the
+                        // handler the application set is already the one it wants.
+                        if sp::item_tree_identity(tree) == local_identity {
+                            return;
+                        }
+                        let component = sp::VRc::map_dyn(tree.clone(), |tree| {
+                            sp::VRef::downcast_pin::<#inner_component_id>(tree).expect(
+                                "the tree on screen is not the component the handover belongs to",
+                            )
+                        });
+                        let _self = component.as_pin_ref();
+                        #callback_access.set_handler(move |#args_param| {
+                            #(let #arg_names = args.#arg_indices.clone();)*
+                            if std::thread::current().id() == ui_thread {
+                                if let Some(component) = app.upgrade() {
+                                    let _self = sp::VRc::as_pin_ref(&component.0);
+                                    #callback_access.call(&(#(#arg_names,)*));
+                                }
+                            } else {
+                                let _ = app.upgrade_in_event_loop(move |component| {
+                                    let _self = sp::VRc::as_pin_ref(&component.0);
+                                    #callback_access.call(&(#(#arg_names,)*));
+                                });
+                            }
+                        });
+                    });
+                }
+            }
+        })
+    });
+
+    quote!(#(#carries)* #(#routes)*
 
         // A backend drew a tree of its own for the window, so this component's
         // copy of the controls is a husk: the state it would compute is not what
@@ -1262,6 +1334,26 @@ fn has_portable_public_state(public_properties: &llr::PublicProperties) -> bool 
     public_properties
         .values()
         .any(|p| p.ty.is_property_type() && !p.read_only() && is_thread_portable_type(&p.ty))
+}
+
+/// Whether a component has a public callback [`render_handover_state`] can point
+/// back at the application's own handler.
+fn has_traveling_public_callback(public_properties: &llr::PublicProperties) -> bool {
+    public_properties
+        .values()
+        .any(|p| matches!(&p.ty, Type::Callback(callback) if callback_travels_back(callback)))
+}
+
+/// Whether an application's handler for a callback can be reached from the tree
+/// the window draws.
+///
+/// The handler stays on the thread the application lives on, and the drawn tree
+/// calls back to it with the argument values. A call that hands a value back
+/// cannot be answered that way -- the drawn tree needs the value now, not after
+/// the other thread runs -- and neither can one whose arguments cannot cross a
+/// thread. Both are left as they are.
+fn callback_travels_back(callback: &crate::langtype::Function) -> bool {
+    matches!(&callback.return_type, Type::Void) && callback.args.iter().all(is_thread_portable_type)
 }
 
 /// Which tree an exported component's calls run against.
@@ -1310,6 +1402,19 @@ impl CallTarget {
             && is_thread_portable_type(ret)
             && args.iter().all(is_thread_portable_type)
     }
+
+    /// The expression that reaches the window these calls belong to, when there is one.
+    ///
+    /// A component rooted in a window can ask that window which tree it shows;
+    /// a tray or a component with no window has nothing to ask, and the code
+    /// that tells the window something about the application's handlers needs
+    /// it for the same reason.
+    fn window_expr(&self) -> Option<&TokenStream> {
+        match self {
+            CallTarget::ScreenTree { window, .. } => Some(window),
+            CallTarget::OwnTree => None,
+        }
+    }
 }
 
 /// Public API for Global and root component
@@ -1321,7 +1426,7 @@ fn public_api(
     ctx: &EvaluationContext,
 ) -> TokenStream {
     let mut property_and_callback_accessors: Vec<TokenStream> = Vec::new();
-    for (name, p) in public_properties {
+    for (index, (name, p)) in public_properties.iter().enumerate() {
         let prop = access_member(&p.prop, ctx).unwrap();
 
         if let Type::Callback(callback) = &p.ty {
@@ -1350,6 +1455,13 @@ fn public_api(
             let args_index = (0..callback_args.len()).map(proc_macro2::Literal::usize_unsuffixed);
             let set_dirty = access_callback_tracker(&p.prop, ctx)
                 .map(|t| t.then(|t| quote!({ #t.mark_dirty(); })));
+            // The declared handler is the one on the tree the application holds, but the
+            // tree a backend draws was built from the declaration and still has that one.
+            // Telling the window lets the handover point the drawn tree back here.
+            let note_host = call_target.window_expr().map(|window| {
+                let index = proc_macro2::Literal::u32_suffixed(index as u32);
+                quote!(sp::WindowInner::from_pub(#window).note_host_callback(#index);)
+            });
             property_and_callback_accessors.push(quote!(
                 #[allow(dead_code)]
                 pub fn #on_ident(&self, mut f: impl FnMut(#(#callback_args),*) -> #return_type + 'static) {
@@ -1360,6 +1472,7 @@ fn public_api(
                         move |args| f(#(args.#args_index.clone()),*)
                     );
                     #set_dirty
+                    #note_host
                 }
             ));
         } else if let Type::Function(function) = &p.ty {

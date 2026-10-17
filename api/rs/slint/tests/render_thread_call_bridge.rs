@@ -315,6 +315,42 @@ fn a_call_that_cannot_travel_stays_with_the_caller() {
     assert_eq!(app.invoke_echo(Pt { x: 5 }), 5);
 }
 
+/// A handler the application registered runs on the thread the application
+/// lives on, even when the call that reaches it comes from the tree the window
+/// draws.
+#[test]
+fn a_host_handler_is_reached_from_the_tree_the_window_shows() {
+    let platform = PlatformShowingTree::install();
+    let app = BridgeApp::new().expect("the platform makes windows");
+    let adapter = platform.adapter_of_last_window();
+
+    let seen = Rc::new(RefCell::new(Vec::<(i32, String)>::new()));
+    app.on_add({
+        let seen = seen.clone();
+        move |amount, text| seen.borrow_mut().push((amount, text.to_string()))
+    });
+
+    // The handover: a second tree exists, and the window shows it from now on.
+    let mirror = second_tree(&app);
+    *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
+    WindowInner::from_pub(app.window()).run_render_handover();
+
+    // The call goes where the window draws, and the drawn tree reaches back to
+    // the handler the application registered.
+    app.invoke_add(3, SharedString::from("from the drawn tree"));
+
+    assert_eq!(
+        seen.borrow().as_slice(),
+        [(3, "from the drawn tree".to_string())],
+        "the drawn tree reached the application's own handler"
+    );
+    assert_eq!(
+        (mirror.get_count(), mirror.get_note().as_str()),
+        (1, ""),
+        "and the `.slint` body stayed out of the way, as a host handler replaces it"
+    );
+}
+
 /// What an application reads once a call has changed the tree that is drawn.
 #[test]
 fn a_read_comes_from_the_tree_the_window_shows() {
