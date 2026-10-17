@@ -676,11 +676,13 @@ impl Item for FocusScope {
             && matches!(event, MouseEvent::Pressed { .. })
             && !self.has_focus()
         {
-            WindowInner::from_pub(window_adapter.window()).set_focus_item(
-                self_rc,
-                true,
-                FocusReason::PointerClick,
-            );
+            if !window_adapter.focus_is_decided_by_ui() {
+                WindowInner::from_pub(window_adapter.window()).set_focus_item(
+                    self_rc,
+                    true,
+                    FocusReason::PointerClick,
+                );
+            }
             InputEventResult::EventAccepted
         } else {
             InputEventResult::EventIgnored

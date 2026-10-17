@@ -1525,6 +1525,15 @@ impl WinitWindowAdapter {
                 // the release that follows lands here is what makes a click.
                 if let Some(id) = target {
                     host.press_control(id, button, position);
+                    // The focus is this thread's to decide, and the press is
+                    // where it is decided: the render thread published whether
+                    // this control takes it on a click, and the press is sent
+                    // first so the tree dispatches it before the focus moves,
+                    // which is what keeps a `FocusScope` from accepting the
+                    // press differently just because it now has the focus.
+                    if host.control_coord(id).is_some_and(|coord| coord.focus_on_click) {
+                        host.set_control_focus(id);
+                    }
                 }
             }
             PointerAction::Moved { finger_id } => {

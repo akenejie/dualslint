@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use i_slint_core::api::PhysicalSize;
 use i_slint_core::api::Window as SlintApiWindow;
 use i_slint_core::graphics::Color;
-use i_slint_core::input::{BackendMouseEvent, InternalKeyEvent, PointerEventButton};
+use i_slint_core::input::{BackendMouseEvent, FocusReason, InternalKeyEvent, PointerEventButton};
 use i_slint_core::item_tree::{ItemRc, ItemTreeRc};
 use i_slint_core::lengths::LogicalPoint;
 #[cfg(render_thread_can_draw)]
@@ -205,6 +205,15 @@ impl WindowAdapter for RenderWindowAdapter {
         // let the thread that does not draw decide when the thread that does
         // paints.
         self.frame_request.set(true);
+    }
+
+    fn focus_is_decided_by_ui(&self) -> bool {
+        // The window's tree lives on this thread but the pointer that clicks it
+        // is heard on the UI thread, which owns the focus and applies it with
+        // `RenderMessage::SetControlFocus`.  Left to itself the core would move
+        // the focus to a clicked `FocusScope` before that message lands, and the
+        // UI thread's own record would then disagree with the tree.
+        true
     }
 }
 
@@ -424,6 +433,20 @@ pub enum RenderMessage {
         /// A click is a press and a release at one point, so where the release
         /// landed is what decides between the two.
         position: LogicalPoint,
+    },
+    /// The UI thread decided which control has the focus, and the tree here
+    /// applies it.
+    ///
+    /// The pointer is heard on the UI thread, so whether a press moves the focus
+    /// is decided there, from the `focus_on_click` the render thread published
+    /// with the control's geometry.  This message is the other half of that
+    /// decision: the focused item lives in the tree, so only this thread can
+    /// install it.  It arrives after the press it belongs to, so the press
+    /// dispatches with the tree's focus still where it was and no control
+    /// changes its answer because the focus moved under it.
+    SetControlFocus {
+        /// The control to focus, as published in the shared coordinate table.
+        id: u64,
     },
     /// The UI thread resolved a wheel event to a control: this control is the
     /// one under the pointer, so it is the one the wheel is for.
@@ -1055,6 +1078,32 @@ impl RenderHost {
         self.coords.lock().unwrap().control_at(x, y)
     }
 
+    /// What the render thread published about one control, by id.
+    ///
+    /// The id comes from [`Self::control_at`]; this is the rest of that answer,
+    /// which the UI thread needs before it can say what a press on the control
+    /// means.  In particular `focus_on_click` is the bit that decides whether
+    /// the press moves the focus, and it is a property of the item, so it is
+    /// read here on the thread that owns the tree and then read back by the UI
+    /// thread that owns the focus.
+    pub fn control_coord(&self, id: u64) -> Option<ControlCoord> {
+        if on_render_thread() {
+            if let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().by_id.get(&id).copied()) {
+                return r;
+            }
+        }
+        self.coords.lock().unwrap().by_id.get(&id).copied()
+    }
+
+    /// Move the tree's focus to a control the UI thread named.
+    ///
+    /// The UI thread owns the focus decision but not the item the focus lives
+    /// in, so it says which control and the render thread installs it.  Sent
+    /// after the press so the press is dispatched with the focus where it was.
+    pub fn set_control_focus(&self, id: u64) {
+        let _ = self.sender.send(RenderMessage::SetControlFocus { id });
+    }
+
     /// Send an arbitrary closure to execute on the render thread.
     pub fn send_user(&self, f: impl FnOnce() + Send + 'static) {
         let _ = self.sender.send(RenderMessage::User(Box::new(f)));
@@ -1682,6 +1731,23 @@ impl RenderCore {
                             button,
                             position,
                         );
+                    }
+                    RenderMessage::SetControlFocus { id } => {
+                        // The UI thread decided the focus; the item it names is
+                        // the one the id was published for, so the tree installs
+                        // it and every focus-dependent binding recomputes.  A
+                        // control that has since left the tree has no item and
+                        // nothing to focus.
+                        if let Some(adapter) = render_window_adapter.as_ref()
+                            && let Some(item_rc) = render_item_rcs.borrow().get(&id).cloned()
+                        {
+                            WindowInner::from_pub(adapter.window()).set_focus_item(
+                                &item_rc,
+                                true,
+                                FocusReason::PointerClick,
+                            );
+                            present = true;
+                        }
                     }
                     RenderMessage::ScrollControl { id, position, delta_x, delta_y } => {
                         present |= send_gesture_to_control(

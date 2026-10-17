@@ -2244,11 +2244,17 @@ impl TextInput {
         self_rc: &ItemRc,
     ) {
         if !self.has_focus() {
-            WindowInner::from_pub(window_adapter.window()).set_focus_item(
-                self_rc,
-                true,
-                FocusReason::PointerClick,
-            );
+            // When the focus is decided by a UI thread that owns the pointer,
+            // that thread has already moved the focus (or will); a `TextInput`
+            // must not also take it here.  Its `focus_event` enables the input
+            // method when the focus finally arrives.
+            if !window_adapter.focus_is_decided_by_ui() {
+                WindowInner::from_pub(window_adapter.window()).set_focus_item(
+                    self_rc,
+                    true,
+                    FocusReason::PointerClick,
+                );
+            }
         } else if !self.read_only()
             && let Some(w) = window_adapter.internal(crate::InternalToken)
         {

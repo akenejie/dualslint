@@ -92,6 +92,18 @@ slint::slint! {
             triggered => { root.ticks += 1; }
         }
     }
+
+    // A focus scope the window can be clicked on: whether the core moves the
+    // focus itself is the whole question here.
+    export component FocusApp inherits Window {
+        width: 320px;
+        height: 240px;
+        out property <bool> scope-focused: scope.has-focus;
+        scope := FocusScope {
+            width: 100%;
+            height: 100%;
+        }
+    }
 }
 
 /// The window adapter of a backend that drew a tree of its own.
@@ -106,6 +118,10 @@ struct ShowingTree {
     window: slint::Window,
     shown: RefCell<Option<ItemTreeRc>>,
     calls: Cell<usize>,
+    /// Whether the focus is decided on the UI thread, the way the render
+    /// thread's window does it.  Off by default, which is the single-threaded
+    /// case where the core focuses a clicked `FocusScope` itself.
+    focus_decided_by_ui: Cell<bool>,
 }
 
 impl WindowAdapter for ShowingTree {
@@ -123,6 +139,10 @@ impl WindowAdapter for ShowingTree {
             Some(tree) => task(&tree),
             None => task(&local_tree),
         }
+    }
+
+    fn focus_is_decided_by_ui(&self) -> bool {
+        self.focus_decided_by_ui.get()
     }
 
     fn size(&self) -> PhysicalSize {
@@ -195,6 +215,7 @@ impl Platform for PlatformHandle {
             window: slint::Window::new(weak.clone()),
             shown: RefCell::new(None),
             calls: Cell::new(0),
+            focus_decided_by_ui: Cell::new(false),
         });
         self.0.adapters.borrow_mut().push(Rc::downgrade(&adapter));
         Ok(adapter)
@@ -471,4 +492,33 @@ fn a_ticking_tree_hands_over_and_keeps_ticking_on_the_drawn_side() {
     let mirror_now = mirror.get_ticks();
     assert!(mirror_now > after_handover, "the drawn tree keeps ticking");
     assert_eq!(app.get_ticks(), mirror_now, "what the application reads is the drawn tree's count");
+}
+
+/// With no second thread, the core focuses a clicked `FocusScope` itself, which
+/// is the behaviour every single-threaded backend relies on.
+#[test]
+fn the_core_focuses_a_clicked_focus_scope_when_it_decides_the_focus() {
+    let platform = PlatformShowingTree::install();
+    let app = FocusApp::new().expect("the platform makes windows");
+    let _ = platform;
+
+    assert!(!app.get_scope_focused(), "nothing is focused to start with");
+    i_slint_backend_testing::send_mouse_click(&app, 160.0, 120.0);
+
+    assert!(app.get_scope_focused(), "the clicked focus scope took the focus");
+}
+
+/// A window that draws a tree of its own hands the focus decision to the UI
+/// thread, so the core must not move the focus to the clicked `FocusScope`.  The
+/// UI thread does that itself, with the id the render thread published.
+#[test]
+fn a_window_that_draws_its_own_tree_leaves_the_focus_to_the_ui_thread() {
+    let platform = PlatformShowingTree::install();
+    let app = FocusApp::new().expect("the platform makes windows");
+    let adapter = platform.adapter_of_last_window();
+    adapter.focus_decided_by_ui.set(true);
+
+    i_slint_backend_testing::send_mouse_click(&app, 160.0, 120.0);
+
+    assert!(!app.get_scope_focused(), "the core did not take the focus the UI thread is to decide");
 }

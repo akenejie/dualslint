@@ -197,6 +197,20 @@ pub trait WindowAdapter {
     ) -> Result<raw_window_handle_06::DisplayHandle<'_>, raw_window_handle_06::HandleError> {
         Err(raw_window_handle_06::HandleError::NotSupported)
     }
+
+    /// Whether the focused element is decided outside the core.
+    ///
+    /// A backend that keeps the item tree on a different thread from the one
+    /// that hears the pointer (the window driven by its own render thread)
+    /// decides the focus itself and applies it through
+    /// [`WindowInner::set_focus_item`], so a `FocusScope` or `TextInput` must
+    /// not move the focus to itself when it is clicked.  Every other backend
+    /// answers `false` and keeps focusing itself, which is what a
+    /// single-threaded event loop relies on.
+    #[doc(hidden)]
+    fn focus_is_decided_by_ui(&self) -> bool {
+        false
+    }
 }
 
 /// What a `DragArea` offers to start a native (OS-level) drag, passed to
