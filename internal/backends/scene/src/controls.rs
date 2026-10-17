@@ -41,6 +41,25 @@ pub(crate) fn item_rc_as_id(item_rc: &ItemRc) -> u64 {
     item_rc.stable_id()
 }
 
+/// Whether a pointer press on `item` should move the focus to it.
+///
+/// The focus is decided on the UI thread, which never sees the item's
+/// properties, so the `FocusScope` property and the `TextInput` behaviour are
+/// flattened into this one bit here, on the thread that owns the tree.
+fn focus_on_click(item: &ItemRc) -> bool {
+    if let Some(item) = item.downcast::<i_slint_core::items::FocusScope>() {
+        let item = item.as_pin_ref();
+        let enabled =
+            i_slint_core::items::FocusScope::FIELD_OFFSETS.enabled().apply_pin(item).get();
+        let focus_on_click =
+            i_slint_core::items::FocusScope::FIELD_OFFSETS.focus_on_click().apply_pin(item).get();
+        return enabled && focus_on_click;
+    }
+    // A TextInput takes the focus whenever it is pressed; there is no property
+    // to opt out of it.
+    item.downcast::<i_slint_core::items::TextInput>().is_some()
+}
+
 // ---------------------------------------------------------------------------
 // ControlEncoder
 // ---------------------------------------------------------------------------
@@ -81,8 +100,11 @@ impl<'a> ControlEncoder<'a> {
         // coordinates of the window the pointer is in.
         let window_origin = origin + item.map_to_window(geometry.origin).to_vector();
         let id = item_rc_as_id(item);
-        self.controls
-            .push(ControlRegion { id, geometry: LogicalRect::new(window_origin, geometry.size) });
+        self.controls.push(ControlRegion {
+            id,
+            geometry: LogicalRect::new(window_origin, geometry.size),
+            focus_on_click: focus_on_click(item),
+        });
         self.item_refs.push((id, item.clone()));
     }
 

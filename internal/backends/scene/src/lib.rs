@@ -182,6 +182,10 @@ pub struct ControlRegion {
     /// Opaque handle combining component pointer + item index.
     pub id: u64,
     pub geometry: LogicalRect,
+    /// Whether a pointer press on this control moves the focus to it.  The
+    /// focus is decided on the UI thread, which does not see the property, so
+    /// the render thread — which does — tells it here.
+    pub focus_on_click: bool,
 }
 
 /// Logical-coordinate entry in the shared coordinate table.  Published by the
@@ -199,6 +203,9 @@ pub struct ControlCoord {
     /// it owns the widget state (see the event-protocol design).
     pub hovered: bool,
     pub pressed: bool,
+    /// Whether a pointer press here moves the focus, a property of the control
+    /// that only the render thread can read.
+    pub focus_on_click: bool,
 }
 
 impl ControlCoord {

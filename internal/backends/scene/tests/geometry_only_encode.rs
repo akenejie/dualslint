@@ -73,13 +73,17 @@ fn show(size: LogicalSize) -> ComponentInstance {
 /// component is.  No layout pass is run here on purpose: the walk does it,
 /// which is what the second test is about.
 fn build(size: LogicalSize) -> ComponentInstance {
+    build_source(SOURCE, size)
+}
+
+fn build_source(source: &str, size: LogicalSize) -> ComponentInstance {
     let result =
-        spin_on::spin_on(Compiler::default().build_from_source(SOURCE.into(), Default::default()));
+        spin_on::spin_on(Compiler::default().build_from_source(source.into(), Default::default()));
     assert!(!result.has_errors(), "{:?}", result.diagnostics().collect::<Vec<_>>());
     let instance: ComponentInstance =
         result.component("Controls").expect("compiles").create().expect("instantiable");
     instance.window().set_size(size);
-    instance.window().show();
+    let _ = instance.window().show();
     instance
 }
 
@@ -174,4 +178,76 @@ fn repeated_controls_get_distinct_ids() {
     let unique: std::collections::HashSet<_> = ids.iter().collect();
 
     assert_eq!(unique.len(), ids.len(), "every control has its own id: {ids:?}");
+}
+
+/// The focus is decided on the UI thread, which never sees the items, so the
+/// walk flattens each control's "does a press take the focus" into one bit the
+/// UI can read.  A `TextInput` takes it whenever it is pressed.
+#[test]
+fn a_text_input_is_published_as_taking_the_focus_on_click() {
+    i_slint_backend_testing::init_no_event_loop();
+    let instance = build_source(
+        r#"
+        export component Controls {
+            VerticalLayout {
+                TextInput { text: "hello"; width: 100px; height: 20px; }
+            }
+        }
+        "#,
+        LogicalSize::new(400.0, 300.0),
+    );
+    let controls = encode_window_controls(instance.window()).expect("walks").controls;
+
+    assert!(!controls.is_empty(), "the tree offers controls to point at");
+    assert!(
+        controls.iter().all(|c| c.focus_on_click),
+        "every control here is a text input, so every press takes the focus: {controls:?}"
+    );
+}
+
+/// A `TouchArea` can be pointed at but is not something you can give the focus
+/// to, and it must not be published as if it were.
+#[test]
+fn a_touch_area_is_not_published_as_taking_the_focus_on_click() {
+    i_slint_backend_testing::init_no_event_loop();
+    let instance = build_source(
+        r#"
+        export component Controls {
+            VerticalLayout {
+                TouchArea { width: 100px; height: 20px; }
+            }
+        }
+        "#,
+        LogicalSize::new(400.0, 300.0),
+    );
+    let controls = encode_window_controls(instance.window()).expect("walks").controls;
+
+    assert!(!controls.is_empty(), "the tree offers controls to point at");
+    assert!(
+        controls.iter().all(|c| !c.focus_on_click),
+        "a touch area takes no focus on press: {controls:?}"
+    );
+}
+
+/// A `FocusScope` says so itself with `focus-on-click`, and the walk passes the
+/// property through rather than guessing from the item's type.
+#[test]
+fn a_focus_scope_publishes_its_focus_on_click_property() {
+    i_slint_backend_testing::init_no_event_loop();
+    let instance = build_source(
+        r#"
+        export component Controls {
+            VerticalLayout {
+                FocusScope { width: 100px; height: 20px; }
+                FocusScope { focus-on-click: false; width: 100px; height: 20px; }
+            }
+        }
+        "#,
+        LogicalSize::new(400.0, 300.0),
+    );
+    let controls = encode_window_controls(instance.window()).expect("walks").controls;
+    let flags: Vec<bool> = controls.iter().map(|c| c.focus_on_click).collect();
+
+    assert!(flags.iter().any(|f| *f), "the default focus scope takes the focus: {flags:?}");
+    assert!(flags.iter().any(|f| !*f), "the opt-out focus scope does not: {flags:?}");
 }

@@ -775,6 +775,7 @@ impl RenderHost {
                             LogicalPoint::new(c.x, c.y),
                             i_slint_core::lengths::LogicalSize::new(c.width, c.height),
                         ),
+                        focus_on_click: c.focus_on_click,
                     })
                 };
                 let adapter = tl.adapter.borrow().clone();
@@ -2990,6 +2991,7 @@ fn publish_control_coords(
                 height: c.geometry.size.height,
                 hovered: interaction.is_hovered(c.id),
                 pressed: interaction.is_pressed(c.id),
+                focus_on_click: c.focus_on_click,
             },
         );
     }
