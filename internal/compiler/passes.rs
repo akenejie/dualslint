@@ -24,6 +24,7 @@ mod embed_glyphs;
 mod embed_images;
 mod flickable;
 mod focus_handling;
+mod focus_render_dependency;
 pub mod generate_item_indices;
 pub mod infer_aliases_types;
 mod inject_debug_hooks;
@@ -246,6 +247,11 @@ pub async fn run_passes(
 
     remove_aliases::remove_aliases(doc, diag);
     remove_return::remove_return(doc, &symbol_counters);
+
+    // After the aliases and returns are settled but before
+    // `resolve_native_classes` rewrites the builtin base types the analysis
+    // recognizes focus-carrying elements by.
+    focus_render_dependency::focus_affects_rendering(doc);
 
     doc.visit_all_used_components(|component| {
         if !diag.has_errors() {

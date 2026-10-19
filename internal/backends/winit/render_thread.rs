@@ -1741,12 +1741,16 @@ impl RenderCore {
                         if let Some(adapter) = render_window_adapter.as_ref()
                             && let Some(item_rc) = render_item_rcs.borrow().get(&id).cloned()
                         {
-                            WindowInner::from_pub(adapter.window()).set_focus_item(
+                            let window = adapter.window();
+                            WindowInner::from_pub(window).set_focus_item(
                                 &item_rc,
                                 true,
                                 FocusReason::PointerClick,
                             );
-                            present = true;
+                            // The compiler found out whether anything on screen
+                            // reacts to focus. When nothing does, this redraw
+                            // would draw the same pixels again.
+                            present |= WindowInner::from_pub(window).focus_affects_rendering();
                         }
                     }
                     RenderMessage::ScrollControl { id, position, delta_x, delta_y } => {

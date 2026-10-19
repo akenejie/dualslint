@@ -77,6 +77,14 @@ pub struct Document {
 
     /// The popup_menu_impl
     pub popup_menu_impl: Option<Rc<Component>>,
+
+    /// Whether moving keyboard focus can change what a window draws, as decided
+    /// from the elements of this document by the `focus_render_dependency` pass.
+    ///
+    /// `None` means the answer is not known: code generators then treat focus as
+    /// drawing-relevant, so a drawing thread that never hears otherwise redraws
+    /// on every focus change.
+    pub focus_affects_rendering: std::cell::Cell<Option<bool>>,
 }
 
 impl Document {
@@ -308,6 +316,7 @@ impl Document {
             translation_builder: None,
             used_types: Default::default(),
             popup_menu_impl: None,
+            focus_affects_rendering: Default::default(),
         }
     }
 

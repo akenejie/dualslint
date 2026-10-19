@@ -736,6 +736,11 @@ pub struct WindowInner {
     /// handover points the drawn tree back at the application.
     #[cfg(feature = "std")]
     host_handled_callbacks: RefCell<BTreeSet<u32>>,
+
+    /// What the compiler decided about focus and drawing, set from generated
+    /// code. `true` until a generator states otherwise, so a backend that is
+    /// never told the answer still redraws when focus moves.
+    focus_affects_rendering: Cell<bool>,
 }
 
 impl Drop for WindowInner {
@@ -815,6 +820,7 @@ impl WindowInner {
             render_handover,
             #[cfg(feature = "std")]
             host_handled_callbacks: Default::default(),
+            focus_affects_rendering: Cell::new(true),
         }
     }
 
@@ -1309,6 +1315,25 @@ impl WindowInner {
     #[doc(hidden)]
     pub fn has_host_callback(&self, index: u32) -> bool {
         self.host_handled_callbacks.borrow().contains(&index)
+    }
+
+    /// Record whether moving focus can change what this window draws.
+    ///
+    /// The compiler decides this from the elements and generated code passes it
+    /// on. A drawing thread reads it to leave the screen alone when nothing on it
+    /// depends on focus. Left at its default of `true`, a change of focus always
+    /// asks for a redraw.
+    #[doc(hidden)]
+    pub fn set_focus_affects_rendering(&self, affects: bool) {
+        self.focus_affects_rendering.set(affects);
+    }
+
+    /// Whether moving focus can change what this window draws, as recorded by
+    /// [`Self::set_focus_affects_rendering`]. `true` when no generator said
+    /// otherwise.
+    #[doc(hidden)]
+    pub fn focus_affects_rendering(&self) -> bool {
+        self.focus_affects_rendering.get()
     }
 
     /// Report that the in-flight native drag finished with `action`.

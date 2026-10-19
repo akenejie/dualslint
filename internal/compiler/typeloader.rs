@@ -319,6 +319,7 @@ impl Snapshotter {
                 Weak::upgrade(&self.use_component(p))
                     .expect("Components can get upgraded at this point")
             }),
+            focus_affects_rendering: Default::default(),
         }
     }
 

@@ -224,8 +224,12 @@ pub fn generate(
         .iter()
         .map(|sub_compo| generate_sub_component(*sub_compo, &llr, None, None, false))
         .collect::<Vec<_>>();
-    let public_components =
-        llr.public_components.iter().map(|p| generate_public_component(p, &llr, compiler_config));
+    let focus_affects_rendering = doc.focus_affects_rendering.get().unwrap_or(true);
+
+    let public_components = llr
+        .public_components
+        .iter()
+        .map(|p| generate_public_component(p, &llr, compiler_config, focus_affects_rendering));
 
     let popup_menu =
         llr.popup_menu.as_ref().map(|p| generate_item_tree(&p.item_tree, &llr, None, None, true));
@@ -360,6 +364,7 @@ fn generate_public_component(
     llr: &llr::PublicComponent,
     unit: &llr::CompilationUnit,
     compiler_config: &CompilerConfiguration,
+    focus_affects_rendering: bool,
 ) -> TokenStream {
     let public_component_id = ident(&llr.name);
     let inner_component_id = inner_component_id(&unit.sub_components[llr.item_tree.root]);
@@ -447,6 +452,11 @@ fn generate_public_component(
             Some(quote!(
                 let window = inner.globals.get().unwrap().window_adapter_ref()?;
                 sp::WindowInner::from_pub(window.window()).ensure_tree_instantiated();
+                // Whether focus is worth a redraw was decided from the elements
+                // while this document compiled. A drawing thread that is never
+                // told otherwise has to assume it is.
+                sp::WindowInner::from_pub(window.window())
+                    .set_focus_affects_rendering(#focus_affects_rendering);
                 // Only this code knows how to build another instance of this
                 // component, so leave that behind for a backend that needs one.
                 slint::private_unstable_api::register_render_factory(
