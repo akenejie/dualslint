@@ -251,3 +251,26 @@ fn a_focus_scope_publishes_its_focus_on_click_property() {
     assert!(flags.iter().any(|f| *f), "the default focus scope takes the focus: {flags:?}");
     assert!(flags.iter().any(|f| !*f), "the opt-out focus scope does not: {flags:?}");
 }
+
+/// Tab moves the focus through the controls that join the traversal, and the
+/// walk publishes that set so the UI thread can build the order itself.
+#[test]
+fn a_focus_scope_publishes_its_focus_on_tab_navigation_property() {
+    i_slint_backend_testing::init_no_event_loop();
+    let instance = build_source(
+        r#"
+        export component Controls {
+            VerticalLayout {
+                FocusScope { width: 100px; height: 20px; }
+                FocusScope { focus-on-tab-navigation: false; width: 100px; height: 20px; }
+            }
+        }
+        "#,
+        LogicalSize::new(400.0, 300.0),
+    );
+    let controls = encode_window_controls(instance.window()).expect("walks").controls;
+    let flags: Vec<bool> = controls.iter().map(|c| c.focus_on_tab).collect();
+
+    assert!(flags.iter().any(|f| *f), "the default focus scope is tabbable: {flags:?}");
+    assert!(flags.iter().any(|f| !*f), "the opt-out focus scope is not: {flags:?}");
+}

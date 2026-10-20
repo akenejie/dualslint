@@ -186,6 +186,10 @@ pub struct ControlRegion {
     /// focus is decided on the UI thread, which does not see the property, so
     /// the render thread — which does — tells it here.
     pub focus_on_click: bool,
+    /// Whether this control joins the Tab traversal.  The UI thread owns which
+    /// control has the focus, so it also owns what Tab moves through, and the
+    /// render thread — which sees the property — publishes the set here.
+    pub focus_on_tab: bool,
 }
 
 /// Logical-coordinate entry in the shared coordinate table.  Published by the
@@ -206,6 +210,9 @@ pub struct ControlCoord {
     /// Whether a pointer press here moves the focus, a property of the control
     /// that only the render thread can read.
     pub focus_on_click: bool,
+    /// Whether Tab moves the focus through this control, a property of the
+    /// control that only the render thread can read.
+    pub focus_on_tab: bool,
 }
 
 impl ControlCoord {
@@ -258,6 +265,21 @@ impl PublishedControls {
     /// The ids in paint order, back to front.
     pub fn ids(&self) -> &[u64] {
         &self.order
+    }
+
+    /// The controls Tab moves through, in paint order.
+    ///
+    /// The UI thread owns the focus, so it also owns what Tab goes to next, and
+    /// that order is the reverse of how the controls are painted: the last one
+    /// drawn is the first a Tab reaches, the same way it is on top for a
+    /// pointer.
+    pub fn focus_order(&self) -> Vec<u64> {
+        self.order
+            .iter()
+            .rev()
+            .filter(|id| self.by_id.get(id).is_some_and(|c| c.focus_on_tab))
+            .copied()
+            .collect()
     }
 }
 

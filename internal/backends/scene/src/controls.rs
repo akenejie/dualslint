@@ -60,6 +60,27 @@ fn focus_on_click(item: &ItemRc) -> bool {
     item.downcast::<i_slint_core::items::TextInput>().is_some()
 }
 
+/// Whether Tab moves the focus through `item`.
+///
+/// Same flattening as [`focus_on_click`], for the traversal property instead:
+/// the UI thread decides which control Tab goes to next, and it can only do
+/// that with the set the render thread publishes here.
+fn focus_on_tab(item: &ItemRc) -> bool {
+    if let Some(item) = item.downcast::<i_slint_core::items::FocusScope>() {
+        let item = item.as_pin_ref();
+        let enabled =
+            i_slint_core::items::FocusScope::FIELD_OFFSETS.enabled().apply_pin(item).get();
+        let focus_on_tab = i_slint_core::items::FocusScope::FIELD_OFFSETS
+            .focus_on_tab_navigation()
+            .apply_pin(item)
+            .get();
+        return enabled && focus_on_tab;
+    }
+    // A TextInput joins the traversal whenever it is enabled.
+    item.downcast::<i_slint_core::items::TextInput>()
+        .is_some_and(|item| item.as_pin_ref().enabled())
+}
+
 // ---------------------------------------------------------------------------
 // ControlEncoder
 // ---------------------------------------------------------------------------
@@ -104,6 +125,7 @@ impl<'a> ControlEncoder<'a> {
             id,
             geometry: LogicalRect::new(window_origin, geometry.size),
             focus_on_click: focus_on_click(item),
+            focus_on_tab: focus_on_tab(item),
         });
         self.item_refs.push((id, item.clone()));
     }

@@ -33,7 +33,7 @@ use crate::renderer::WinitCompatibleRenderer;
 use crate::winit_compat::WindowSurfaceSizeExt;
 
 use corelib::SharedString;
-use corelib::input::{BackendMouseEvent, InternalKeyEvent, KeyEvent, KeyEventType};
+use corelib::input::{BackendMouseEvent, InternalKeyEvent, KeyEvent, KeyEventType, key_codes};
 use corelib::item_tree::ItemTreeRc;
 #[cfg(enable_accesskit)]
 use corelib::item_tree::{ItemTreeRef, ItemTreeRefPin};
@@ -468,6 +468,14 @@ pub struct WinitWindowAdapter {
     /// render thread is told the result as two property assignments.
     render_hovered: Cell<Option<u64>>,
     render_pressed: Cell<Option<u64>>,
+    /// The render-thread control that has the focus, as this thread decided it.
+    ///
+    /// The focus is this thread's to move and to keep: it is what decides which
+    /// control a key is routed to, and Tab moves it.  The render thread is told
+    /// the result so that a control that draws its focus state draws it, but the
+    /// answer here is the one the routing uses, so that a control that draws
+    /// nothing for the focus is still the one keys go to.
+    render_focused: Cell<Option<u64>>,
     /// The button that is down, for as long as a press is held.
     ///
     /// Kept for the one release that arrives without a button of its own: the
@@ -540,6 +548,7 @@ impl WinitWindowAdapter {
             render_host: Default::default(),
             render_hovered: Default::default(),
             render_pressed: Default::default(),
+            render_focused: Default::default(),
             render_pressed_button: Default::default(),
             current_resize_direction: Default::default(),
             #[cfg(target_os = "ios")]
@@ -1533,6 +1542,7 @@ impl WinitWindowAdapter {
                     // press differently just because it now has the focus.
                     if host.control_coord(id).is_some_and(|coord| coord.focus_on_click) {
                         host.set_control_focus(id);
+                        self.render_focused.set(Some(id));
                     }
                 }
             }
@@ -1651,11 +1661,72 @@ impl WinitWindowAdapter {
     /// focus to put it in.
     fn dispatch_key_event_to_render_controls(&self, event: &InternalKeyEvent) {
         if self.render_owns_controls()
-            && self.render_host().is_some_and(|host| host.send_key_to_control(event))
+            && let Some(host) = self.render_host()
         {
-            return;
+            // Tab moves the focus, and the focus is this thread's: it is decided
+            // here, from the controls the render thread published, rather than
+            // left to the tree whose focus only decides what is drawn.  A Tab
+            // the tree would otherwise traverse is consumed here so the two do
+            // not move the focus twice.
+            if self.move_focus_by_tab(&host, event) {
+                return;
+            }
+            let target = self.render_focused.get();
+            if host.send_key_to_control(event, target) {
+                return;
+            }
         }
         self.dispatch_internal_event(event.clone());
+    }
+
+    /// Move the focus for a Tab or Shift-Tab press, and report whether the key
+    /// was one.
+    ///
+    /// The set of controls Tab reaches and the order between them come from the
+    /// render thread, which is the side that can read the property and sees the
+    /// laid-out tree; the position in that order is this thread's, because the
+    /// focus is.  The chosen control is told to render as focused, and becomes
+    /// the one later keys are routed to.
+    fn move_focus_by_tab(
+        &self,
+        host: &crate::render_thread::RenderHost,
+        event: &InternalKeyEvent,
+    ) -> bool {
+        if event.event_type != KeyEventType::KeyPressed {
+            return false;
+        }
+        let text = event.key_event.text.as_str();
+        let backwards = text.starts_with(key_codes::Backtab)
+            || (text.starts_with(key_codes::Tab) && event.key_event.modifiers.shift);
+        let forwards = text.starts_with(key_codes::Tab) && !event.key_event.modifiers.shift;
+        if !forwards && !backwards {
+            return false;
+        }
+        // Tab with a modifier is a shortcut for someone else, not a traversal.
+        if event.key_event.modifiers.control
+            || event.key_event.modifiers.meta
+            || event.key_event.modifiers.alt
+        {
+            return false;
+        }
+
+        let order = host.focus_order();
+        if order.is_empty() {
+            // Nothing to move through: still consumed, so the tree does not run
+            // a traversal of its own that would move a focus this thread keeps.
+            return true;
+        }
+        let current = self.render_focused.get();
+        let next = match current.and_then(|id| order.iter().position(|&i| i == id)) {
+            Some(pos) if backwards => order[(pos + order.len() - 1) % order.len()],
+            Some(pos) => order[(pos + 1) % order.len()],
+            // Nothing focused yet, or the focused control left: enter the order.
+            None if backwards => *order.last().unwrap(),
+            None => order[0],
+        };
+        host.set_control_focus(next);
+        self.render_focused.set(Some(next));
+        true
     }
 
     /// Handles a winit window event for this window: applies the window event filter, feeds

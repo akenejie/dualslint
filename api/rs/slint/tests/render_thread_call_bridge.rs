@@ -104,6 +104,27 @@ slint::slint! {
             height: 100%;
         }
     }
+
+    // Two focus scopes that each count the keys they are handed, so a key's
+    // route can be told apart by which counter it moved.
+    export component TwoScopes inherits Window {
+        width: 320px;
+        height: 240px;
+        in-out property <int> left-keys: 0;
+        in-out property <int> right-keys: 0;
+        left := FocusScope {
+            x: 0px;
+            width: 160px;
+            height: 240px;
+            key-pressed(event) => { root.left-keys += 1; EventResult.accept }
+        }
+        right := FocusScope {
+            x: 160px;
+            width: 160px;
+            height: 240px;
+            key-pressed(event) => { root.right-keys += 1; EventResult.accept }
+        }
+    }
 }
 
 /// The window adapter of a backend that drew a tree of its own.
@@ -521,4 +542,51 @@ fn a_window_that_draws_its_own_tree_leaves_the_focus_to_the_ui_thread() {
     i_slint_backend_testing::send_mouse_click(&app, 160.0, 120.0);
 
     assert!(!app.get_scope_focused(), "the core did not take the focus the UI thread is to decide");
+}
+
+/// Keys go to the control the UI thread names, not to whatever the tree renders
+/// as focused.
+///
+/// This is the seam the UI-owned focus needs: the focus a control draws from and
+/// the control a key is routed to are two different answers, and only the UI
+/// thread holds the second. A key with no target still follows the focus, so the
+/// single-threaded path is unchanged.
+#[test]
+fn a_named_control_receives_the_key_whatever_the_focus_is() {
+    let platform = PlatformShowingTree::install();
+    let app = TwoScopes::new().expect("the platform makes windows");
+    let _ = platform;
+
+    let left = i_slint_backend_testing::stable_id_at(&app, 80.0, 120.0)
+        .expect("the left scope covers the left half");
+    let right = i_slint_backend_testing::stable_id_at(&app, 240.0, 120.0)
+        .expect("the right scope covers the right half");
+    assert_ne!(left, right, "the two scopes are different items");
+
+    // Nothing focused yet, so a key follows nothing and reaches no scope.
+    i_slint_backend_testing::send_keyboard_string_sequence(&app, "a");
+    assert_eq!((app.get_left_keys(), app.get_right_keys()), (0, 0));
+
+    // Naming the right scope routes the key there, without moving any focus.
+    i_slint_backend_testing::set_key_target(&app, Some(right));
+    i_slint_backend_testing::send_keyboard_string_sequence(&app, "b");
+    assert_eq!(
+        (app.get_left_keys(), app.get_right_keys()),
+        (0, 1),
+        "the named control is the one the key reached"
+    );
+
+    // Naming the left scope routes the next key the other way.
+    i_slint_backend_testing::set_key_target(&app, Some(left));
+    i_slint_backend_testing::send_keyboard_string_sequence(&app, "c");
+    assert_eq!((app.get_left_keys(), app.get_right_keys()), (1, 1));
+
+    // Clearing the target hands routing back to the tree's own focus.
+    i_slint_backend_testing::set_key_target(&app, None);
+    i_slint_backend_testing::send_keyboard_string_sequence(&app, "d");
+    assert_eq!(
+        (app.get_left_keys(), app.get_right_keys()),
+        (1, 1),
+        "with no target and no focused scope, the key reaches neither"
+    );
 }

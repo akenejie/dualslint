@@ -692,6 +692,13 @@ pub struct WindowInner {
 
     /// ItemRC that currently have the focus (possibly an instance of TextInput)
     pub focus_item: RefCell<crate::item_tree::ItemWeak>,
+    /// The item keys are routed to, decided by the UI thread and set by
+    /// [`Self::set_key_target`], as a stable id. `None` means the tree decides
+    /// from `focus_item`. When set, the item it names is the one whose
+    /// `key_event` runs, even if it is not the focused item — which is how the
+    /// UI thread routes input while leaving the focus for appearance to this
+    /// tree.
+    key_target: Cell<Option<u64>>,
     focus_item_visibility_tracker: ChangeTracker,
     focus_item_position_tracker: ChangeTracker,
     /// The last text that was sent to the input method
@@ -801,6 +808,7 @@ impl WindowInner {
                 ),
             }),
             focus_item: Default::default(),
+            key_target: Cell::new(None),
             focus_item_visibility_tracker: Default::default(),
             focus_item_position_tracker: Default::default(),
             last_ime_text: Default::default(),
@@ -1336,6 +1344,25 @@ impl WindowInner {
         self.focus_affects_rendering.get()
     }
 
+    /// Route keys to the item with this stable id, or leave it to the focused
+    /// item when `None`.
+    ///
+    /// The UI thread owns which item receives keys, so it names that item here
+    /// rather than leaving the tree to find it from `focus_item`. The two are
+    /// kept apart on purpose: `focus_item` decides which item renders as
+    /// focused, while this decides which one gets the key.
+    #[doc(hidden)]
+    pub fn set_key_target(&self, id: Option<u64>) {
+        self.key_target.set(id);
+    }
+
+    /// The stable id [`Self::set_key_target`] recorded, or `None` when the tree
+    /// routes keys from its focused item.
+    #[doc(hidden)]
+    pub fn key_target(&self) -> Option<u64> {
+        self.key_target.get()
+    }
+
     /// Report that the in-flight native drag finished with `action`.
     ///
     /// Backends call this when the OS drag completes (`DragAction::None` if cancelled); the
@@ -1475,6 +1502,14 @@ impl WindowInner {
 
         let mut item = self.focus_item.borrow().clone().upgrade();
 
+        // The UI thread may name the item that receives keys, which is not
+        // necessarily the focused one: it owns the routing while the focus is
+        // only what an item renders from. When it does, that item is where the
+        // delivery starts and where the capture walk ends.
+        if let Some(target) = self.key_target.get() {
+            item = crate::item_tree::find_item_by_stable_id(&self.component(), target);
+        }
+
         if item.as_ref().is_some_and(|i| !i.is_visible()) {
             // Reset the focus... not great, but better than keeping it.
             self.take_focus_item(&FocusEvent::FocusOut(FocusReason::TabNavigation));
@@ -1519,11 +1554,15 @@ impl WindowInner {
             item = focus_item.parent_item(ParentItemTraversalMode::StopAtPopups);
         }
 
-        // Make Tab/Backtab handle keyboard focus
+        // Make Tab/Backtab handle keyboard focus. A window whose focus the UI
+        // thread decides moves the focus itself, so the tree leaves Tab to it
+        // rather than moving a focus it does not own.
         let extra_mod = internal_key_event.key_event.modifiers.control
             || internal_key_event.key_event.modifiers.meta
             || internal_key_event.key_event.modifiers.alt;
-        if internal_key_event.key_event.text.starts_with(key_codes::Tab)
+        let tab_decided_here = !self.window_adapter().focus_is_decided_by_ui();
+        if tab_decided_here
+            && internal_key_event.key_event.text.starts_with(key_codes::Tab)
             && !internal_key_event.key_event.modifiers.shift
             && !extra_mod
             && internal_key_event.event_type == KeyEventType::KeyPressed
@@ -1531,9 +1570,10 @@ impl WindowInner {
             self.focus_next_item();
             self.ensure_tree_instantiated();
             return crate::input::KeyEventResult::EventAccepted;
-        } else if (internal_key_event.key_event.text.starts_with(key_codes::Backtab)
-            || (internal_key_event.key_event.text.starts_with(key_codes::Tab)
-                && internal_key_event.key_event.modifiers.shift))
+        } else if tab_decided_here
+            && (internal_key_event.key_event.text.starts_with(key_codes::Backtab)
+                || (internal_key_event.key_event.text.starts_with(key_codes::Tab)
+                    && internal_key_event.key_event.modifiers.shift))
             && internal_key_event.event_type == KeyEventType::KeyPressed
             && !extra_mod
         {

@@ -391,6 +391,11 @@ pub enum RenderMessage {
     KeyToRenderControl {
         /// The key, already in the runtime's own representation.
         event: InternalKeyEvent,
+        /// The control the UI thread routed the key to, as published in the
+        /// shared coordinate table, or `None` to let the tree route it from its
+        /// focused item.  The UI thread owns which control receives keys, so it
+        /// names one here; the tree only finds the item behind the id.
+        target: Option<u64>,
         /// Reply channel: `true` when an item consumed the key.
         response: std::sync::mpsc::SyncSender<bool>,
     },
@@ -799,6 +804,7 @@ impl RenderHost {
                             i_slint_core::lengths::LogicalSize::new(c.width, c.height),
                         ),
                         focus_on_click: c.focus_on_click,
+                        focus_on_tab: c.focus_on_tab,
                     })
                 };
                 let adapter = tl.adapter.borrow().clone();
@@ -824,7 +830,7 @@ impl RenderHost {
     /// decides what it means. A field, a `Flickable`, a widget with a
     /// `key-pressed` handler and a `TextInput` are then all answered by the
     /// same code that answers them when the pointer does reach the tree.
-    pub fn send_key_to_control(&self, event: &InternalKeyEvent) -> bool {
+    pub fn send_key_to_control(&self, event: &InternalKeyEvent, target: Option<u64>) -> bool {
         // In-thread callers hand the key to the tree here; there is no channel
         // round-trip to wait on.
         if self.is_own_render_thread()
@@ -832,16 +838,18 @@ impl RenderHost {
                 tl.adapter
                     .borrow()
                     .clone()
-                    .map(|adapter| send_key_to_tree(&adapter, event))
+                    .map(|adapter| send_key_to_tree(&adapter, event, target))
                     .unwrap_or(false)
             })
         {
             return result;
         }
         let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
-        let _ = self
-            .sender
-            .send(RenderMessage::KeyToRenderControl { event: event.clone(), response: tx });
+        let _ = self.sender.send(RenderMessage::KeyToRenderControl {
+            event: event.clone(),
+            target,
+            response: tx,
+        });
         rx.recv().unwrap_or(false)
     }
 
@@ -1102,6 +1110,21 @@ impl RenderHost {
     /// after the press so the press is dispatched with the focus where it was.
     pub fn set_control_focus(&self, id: u64) {
         let _ = self.sender.send(RenderMessage::SetControlFocus { id });
+    }
+
+    /// The controls Tab moves through, in the order the UI thread should visit,
+    /// with the control that is focused now given first so the walk can resume.
+    ///
+    /// The UI thread owns which control has the focus and therefore what Tab
+    /// goes to; the set of controls and their order only exist on the render
+    /// side, so it is read from the geometry there and used here.
+    pub fn focus_order(&self) -> Vec<u64> {
+        if on_render_thread() {
+            if let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().focus_order()) {
+                return r;
+            }
+        }
+        self.coords.lock().unwrap().focus_order()
     }
 
     /// Send an arbitrary closure to execute on the render thread.
@@ -1789,10 +1812,10 @@ impl RenderCore {
                         // handler may have changed anything at all.
                         present |= activated;
                     }
-                    RenderMessage::KeyToRenderControl { event, response } => {
+                    RenderMessage::KeyToRenderControl { event, target, response } => {
                         let used = render_window_adapter
                             .as_ref()
-                            .is_some_and(|adapter| send_key_to_tree(adapter, &event));
+                            .is_some_and(|adapter| send_key_to_tree(adapter, &event, target));
                         let _ = response.send(used);
                         // A key that a `TextInput` took changed its text, and the
                         // `accepted` handler that goes with it may have changed the
@@ -2548,13 +2571,26 @@ fn send_pointer_move_to_tree(
 /// same code that answers it when the window has the pointer, so a `TextInput`
 /// keeps its cursor, its selection and its IME, and the application's
 /// `accepted(text) =>` runs with the value the user actually typed.
-fn send_key_to_tree(adapter: &Rc<dyn WindowAdapter>, event: &InternalKeyEvent) -> bool {
-    matches!(
+fn send_key_to_tree(
+    adapter: &Rc<dyn WindowAdapter>,
+    event: &InternalKeyEvent,
+    target: Option<u64>,
+) -> bool {
+    let window = WindowInner::from_pub(adapter.window());
+    // The UI thread routed the key to a control, so the tree is told to deliver
+    // there instead of routing from its own focus.  The id names an item of this
+    // tree, so this is where it turns back into one; routing it in the tree's
+    // own `process_key_input` keeps capture, delivery and the menubar shortcuts
+    // on the same path as a key with no target.
+    window.set_key_target(target);
+    let result = matches!(
         adapter.window().dispatch_event_with_result(WindowEvent::internal(
             i_slint_core::platform::InternalEvent::Key(event.clone()),
         )),
         Ok(i_slint_core::platform::WindowEventDispatchResult::Accepted)
-    )
+    );
+    window.set_key_target(None);
+    result
 }
 
 /// Create the render-thread channel pair.
@@ -3062,6 +3098,7 @@ fn publish_control_coords(
                 hovered: interaction.is_hovered(c.id),
                 pressed: interaction.is_pressed(c.id),
                 focus_on_click: c.focus_on_click,
+                focus_on_tab: c.focus_on_tab,
             },
         );
     }

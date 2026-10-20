@@ -206,3 +206,52 @@ pub fn block_on<R>(future: impl Future<Output = R>) -> R {
         crate::testing_backend::mock_elapsed_time(duration.as_millis() as u64);
     }
 }
+
+/// The stable id of the item at `(x, y)` in the window's own tree, as the UI
+/// thread would name it after a hit-test.
+///
+/// The id is structural, so a component and the tree a backend draws from it
+/// answer the same id with their own copy of the same item. Tests use it to name
+/// a control the way the UI thread does when it routes a key.
+pub fn stable_id_at<
+    X: vtable::HasStaticVTable<ItemTreeVTable> + 'static,
+    Component: Into<vtable::VRc<ItemTreeVTable, X>> + ComponentHandle,
+>(
+    component: &Component,
+    x: f32,
+    y: f32,
+) -> Option<u64> {
+    let inner = WindowInner::from_pub(component.window());
+    let tree = inner.try_component()?;
+    let point = i_slint_core::lengths::LogicalPoint::new(x, y);
+    // Every ancestor contains the point, so the control is the smallest one
+    // that does: the walk visits parents before children, so the last match is
+    // the deepest item, which is the one a hit-test would resolve to.
+    let mut found = None;
+    i_slint_core::item_tree::visit_items(
+        &tree,
+        i_slint_core::item_tree::TraversalOrder::FrontToBack,
+        |component, _item, index, _state| {
+            let item = i_slint_core::item_tree::ItemRc::new(component.clone(), index);
+            let geometry = item.geometry();
+            if geometry.contains(point) && !geometry.size.is_empty() {
+                found = Some(item.stable_id());
+            }
+            i_slint_core::item_tree::ItemVisitorResult::Continue(())
+        },
+        (),
+    );
+    found
+}
+
+/// Route keys to the item with this stable id, or let the tree route from its
+/// focused item when `None`.
+pub fn set_key_target<
+    X: vtable::HasStaticVTable<ItemTreeVTable> + 'static,
+    Component: Into<vtable::VRc<ItemTreeVTable, X>> + ComponentHandle,
+>(
+    component: &Component,
+    id: Option<u64>,
+) {
+    WindowInner::from_pub(component.window()).set_key_target(id);
+}
