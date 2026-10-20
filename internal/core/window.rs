@@ -748,6 +748,12 @@ pub struct WindowInner {
     /// code. `true` until a generator states otherwise, so a backend that is
     /// never told the answer still redraws when focus moves.
     focus_affects_rendering: Cell<bool>,
+
+    /// Whether this window has an input-method value only the UI thread needs,
+    /// as decided by the compiler and set from generated code.  `true` until a
+    /// generator states otherwise, so a backend that is never told the answer
+    /// still treats the input method as its business.
+    ime_affects_rendering: Cell<bool>,
 }
 
 impl Drop for WindowInner {
@@ -829,6 +835,7 @@ impl WindowInner {
             #[cfg(feature = "std")]
             host_handled_callbacks: Default::default(),
             focus_affects_rendering: Cell::new(true),
+            ime_affects_rendering: Cell::new(true),
         }
     }
 
@@ -1342,6 +1349,28 @@ impl WindowInner {
     #[doc(hidden)]
     pub fn focus_affects_rendering(&self) -> bool {
         self.focus_affects_rendering.get()
+    }
+
+    /// Record whether this window has an input-method value that only the UI
+    /// thread needs.
+    ///
+    /// The compiler decides this from the elements and generated code passes it
+    /// on.  Most properties decide what is drawn and stay with the render
+    /// thread; a few are told only to the platform's input method and drawn by
+    /// nothing, and those belong to the thread that owns input.  `true` means
+    /// such a value is present.  Left at its default of `true`, a backend
+    /// assumes the input method is its business.
+    #[doc(hidden)]
+    pub fn set_ime_affects_rendering(&self, affects: bool) {
+        self.ime_affects_rendering.set(affects);
+    }
+
+    /// Whether this window has an input-method value that only the UI thread
+    /// needs, as recorded by [`Self::set_ime_affects_rendering`].  `true` when
+    /// no generator said otherwise.
+    #[doc(hidden)]
+    pub fn ime_affects_rendering(&self) -> bool {
+        self.ime_affects_rendering.get()
     }
 
     /// Route keys to the item with this stable id, or leave it to the focused

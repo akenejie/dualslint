@@ -364,6 +364,23 @@ pub enum RenderMessage {
         /// Reply channel carrying the current value.
         response: std::sync::mpsc::SyncSender<Option<ControlPropertyValue>>,
     },
+    /// Ask for the geometry of a text control's caret, measured off the font
+    /// the render thread shaped.
+    ///
+    /// The caret is drawn by this thread, but its rectangle is also what the
+    /// platform's input method is told so that a soft keyboard can sit near the
+    /// cursor.  Only this thread shaped the text, so only it can answer where a
+    /// byte offset lands; the answer is a plain rectangle, the same kind of
+    /// geometry the control table already lends out.
+    CursorGeometry {
+        /// The control id (as published in the shared coordinate table).
+        id: u64,
+        /// Which measurements to take.
+        query: CursorQuery,
+        /// Reply channel carrying the measurement, or `None` when the id is not
+        /// a text control.
+        response: std::sync::mpsc::SyncSender<Option<CursorGeometry>>,
+    },
     /// A click landed on a render-owned control.
     ///
     /// The UI thread resolved the pointer against the composited geometry and
@@ -1112,6 +1129,19 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::SetControlFocus { id });
     }
 
+    /// Measure a text control's caret, off the font the render thread shaped.
+    ///
+    /// The caret is drawn here, but the platform's input method is told where it
+    /// is so a soft keyboard can sit near the cursor, and that is a question
+    /// about input rather than about drawing.  The answer is offered like the
+    /// rest of the control geometry: any thread that owns input may ask, and it
+    /// gets a rectangle rather than the render thread's font.
+    pub fn cursor_geometry(&self, id: u64, query: CursorQuery) -> Option<CursorGeometry> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<CursorGeometry>>(1);
+        let _ = self.sender.send(RenderMessage::CursorGeometry { id, query, response: tx });
+        rx.recv().unwrap_or(None)
+    }
+
     /// The controls Tab moves through, in the order the UI thread should visit,
     /// with the control that is focused now given first so the walk can resume.
     ///
@@ -1728,6 +1758,18 @@ impl RenderCore {
                                     &property,
                                 )
                             });
+                        let _ = response.send(value);
+                    }
+                    RenderMessage::CursorGeometry { id, query, response } => {
+                        // Measuring the caret changes nothing on screen either:
+                        // the caller is asking where the caret is, not moving it.
+                        let value = render_window_adapter.as_ref().and_then(|adapter| {
+                            render_item_rcs
+                                .borrow()
+                                .get(&id)
+                                .cloned()
+                                .and_then(|item_rc| measure_cursor(adapter, &item_rc, query))
+                        });
                         let _ = response.send(value);
                     }
                     RenderMessage::PressControl { id, button, position } => {
@@ -2362,6 +2404,63 @@ fn apply_control_property(
         }
         _ => with_control_property(item_rc, property, |property| property.set(value))
             .unwrap_or(false),
+    }
+}
+
+/// Measure a text control's caret, off the font this thread shaped.
+///
+/// The caret rectangle is a layout result, so only the thread that ran the font
+/// shaper can produce it; the point-to-offset direction is the same knowledge
+/// reversed.  Both are answered as plain geometry in window coordinates, which
+/// is the same space the control table uses, so a caller that owns input can
+/// hand the answer to the platform without knowing anything about the tree.
+fn measure_cursor(
+    adapter: &Rc<dyn WindowAdapter>,
+    item_rc: &ItemRc,
+    query: CursorQuery,
+) -> Option<CursorGeometry> {
+    let text_input = item_rc.downcast::<i_slint_core::items::TextInput>()?;
+    let text_input = text_input.as_pin_ref();
+
+    // Where this item's own coordinate system starts in the window, so a
+    // rectangle measured within the item can be moved into window coordinates
+    // and a window point can be moved back into the item.
+    let geometry = item_rc.geometry();
+    let window_origin = item_rc.map_to_native_window(geometry.origin);
+    let to_window = window_origin - geometry.origin.to_vector();
+
+    match query {
+        CursorQuery::CursorRect => {
+            let text = text_input.text();
+            let byte_offset = text_input.cursor_position(&text);
+            let affinity = text_input.cursor_position_affinity();
+            let rect =
+                text_input.cursor_rect_for_byte_offset(byte_offset, affinity, adapter, item_rc);
+            Some(CursorGeometry {
+                rect: Some(rect.translate(to_window.to_vector())),
+                byte_offset: None,
+            })
+        }
+        CursorQuery::RectAtByteOffset { byte_offset } => {
+            let text = text_input.text();
+            let byte_offset = byte_offset.min(text.len());
+            let rect = text_input.cursor_rect_for_byte_offset(
+                byte_offset,
+                i_slint_core::items::TextCursorAffinity::NextCharacter,
+                adapter,
+                item_rc,
+            );
+            Some(CursorGeometry {
+                rect: Some(rect.translate(to_window.to_vector())),
+                byte_offset: None,
+            })
+        }
+        CursorQuery::ByteOffsetAt { x, y } => {
+            let local = LogicalPoint::new(x, y) - to_window.to_vector();
+            let (byte_offset, _affinity) =
+                text_input.byte_offset_for_position(local, adapter, item_rc);
+            Some(CursorGeometry { rect: None, byte_offset: Some(byte_offset) })
+        }
     }
 }
 

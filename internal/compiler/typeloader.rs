@@ -320,6 +320,7 @@ impl Snapshotter {
                     .expect("Components can get upgraded at this point")
             }),
             focus_affects_rendering: Default::default(),
+            ime_affects_rendering: Default::default(),
         }
     }
 

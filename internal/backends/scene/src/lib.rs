@@ -33,6 +33,8 @@ pub enum ControlPropertyValue {
     Bool(bool),
     /// For numeric properties (`opacity`, `width`, ...).
     Number(f32),
+    /// For integer properties (`TextInput.cursor-position-byte-offset`, ...).
+    Int(i32),
 }
 
 /// Tag of [`CSlintControlPropertyValue`], so the other end of the C ABI knows
@@ -45,6 +47,8 @@ pub const SLINT_CONTROL_PROPERTY_NUMBER: u32 = 1;
 pub const SLINT_CONTROL_PROPERTY_TEXT: u32 = 2;
 /// Tag for the color case; see [`SLINT_CONTROL_PROPERTY_BOOL`].
 pub const SLINT_CONTROL_PROPERTY_COLOR: u32 = 3;
+/// Tag for the integer case; see [`SLINT_CONTROL_PROPERTY_BOOL`].
+pub const SLINT_CONTROL_PROPERTY_INT: u32 = 4;
 
 /// [`ControlPropertyValue`] in the shape a C caller can pass it: a fixed-size
 /// tagged struct that crosses by value, so the only pointer in it is the one the
@@ -93,6 +97,7 @@ impl CSlintControlPropertyValue {
                 unsafe { std::ffi::CStr::from_ptr(self.text) }.to_string_lossy().into_owned()
             }),
             SLINT_CONTROL_PROPERTY_COLOR => ControlPropertyValue::Color { r, g, b, a },
+            SLINT_CONTROL_PROPERTY_INT => ControlPropertyValue::Int(self.number as i32),
             _ => return None,
         })
     }
@@ -115,6 +120,7 @@ impl CSlintControlPropertyValue {
             // for the string; an empty text still needs a non-null pointer,
             // which is what an empty CString gives.
             ControlPropertyValue::Text(_) => (SLINT_CONTROL_PROPERTY_TEXT, 0., false, [0; 4]),
+            ControlPropertyValue::Int(i) => (SLINT_CONTROL_PROPERTY_INT, *i as f32, false, [0; 4]),
         };
         let text =
             if matches!(value, ControlPropertyValue::Text(_)) { text } else { std::ptr::null() };
@@ -227,6 +233,42 @@ impl ControlCoord {
 /// via the backend's `coordinate_map()` accessor.
 pub type CoordinateMap = std::collections::HashMap<u64, ControlCoord>;
 
+/// Which measurement of a text control's caret to take.
+///
+/// The caret rectangle is drawn by the render thread, but its position is also
+/// what the platform's input method is told, so the measuring is offered to any
+/// thread that owns input rather than kept for the draw.  The offsets are in
+/// bytes and are clamped to the text by the render thread, so a query from a UI
+/// thread that does not know the text length cannot land out of bounds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CursorQuery {
+    /// The caret's own rectangle, at the text control's current cursor.
+    CursorRect,
+    /// The caret rectangle at a given byte offset, used to describe the other
+    /// end of a selection.
+    RectAtByteOffset {
+        /// The offset within the text, in bytes.
+        byte_offset: usize,
+    },
+    /// The byte offset nearest a point in window coordinates, the reverse of
+    /// [`Self::RectAtByteOffset`], for turning a pointer into a caret position.
+    ByteOffsetAt {
+        /// The x coordinate in window logical pixels.
+        x: f32,
+        /// The y coordinate in window logical pixels.
+        y: f32,
+    },
+}
+
+/// The answer to a [`CursorQuery`].
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct CursorGeometry {
+    /// For the rectangle queries: origin and size, in window logical pixels.
+    pub rect: Option<LogicalRect>,
+    /// For [`CursorQuery::ByteOffsetAt`]: the offset within the text, in bytes.
+    pub byte_offset: Option<usize>,
+}
+
 /// The control geometry and interaction state that the render thread published
 /// for the frame it last composited.
 ///
@@ -287,7 +329,8 @@ impl PublishedControls {
 mod c_abi_tests {
     use super::{
         CSlintControlPropertyValue, ControlPropertyValue, SLINT_CONTROL_PROPERTY_BOOL,
-        SLINT_CONTROL_PROPERTY_COLOR, SLINT_CONTROL_PROPERTY_NUMBER, SLINT_CONTROL_PROPERTY_TEXT,
+        SLINT_CONTROL_PROPERTY_COLOR, SLINT_CONTROL_PROPERTY_INT, SLINT_CONTROL_PROPERTY_NUMBER,
+        SLINT_CONTROL_PROPERTY_TEXT,
     };
     use std::mem::{align_of, offset_of, size_of};
 
@@ -312,7 +355,8 @@ mod c_abi_tests {
     }
 
     /// The tags are ABI, and the C++ `PropertyValue::Kind` enum lists the same
-    /// four cases in the same order, so a bool must not be read as a number.
+    /// five cases in the same order, so a bool must not be read as a number, nor
+    /// an integer as one.
     #[test]
     fn the_tags_are_the_ones_the_cpp_enum_lists() {
         assert_eq!(
@@ -321,9 +365,23 @@ mod c_abi_tests {
                 SLINT_CONTROL_PROPERTY_NUMBER,
                 SLINT_CONTROL_PROPERTY_TEXT,
                 SLINT_CONTROL_PROPERTY_COLOR,
+                SLINT_CONTROL_PROPERTY_INT,
             ],
-            [0, 1, 2, 3]
+            [0, 1, 2, 3, 4]
         );
+    }
+
+    /// An integer travels in the number field and comes back whole, since the
+    /// int range is inside the exactly-representable range of the float it rides
+    /// in.
+    #[test]
+    fn an_integer_survives_the_round_trip() {
+        let value = CSlintControlPropertyValue::from_value(
+            &ControlPropertyValue::Int(-1234),
+            std::ptr::null(),
+        );
+        // SAFETY: the tag this wrote is the integer case, which reads no string.
+        assert!(matches!(unsafe { value.to_value() }, Some(ControlPropertyValue::Int(-1234))));
     }
 
     /// Only the field the tag names may reach the value, so a caller that leaves

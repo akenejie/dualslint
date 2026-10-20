@@ -225,11 +225,17 @@ pub fn generate(
         .map(|sub_compo| generate_sub_component(*sub_compo, &llr, None, None, false))
         .collect::<Vec<_>>();
     let focus_affects_rendering = doc.focus_affects_rendering.get().unwrap_or(true);
+    let ime_affects_rendering = doc.ime_affects_rendering.get().unwrap_or(true);
 
-    let public_components = llr
-        .public_components
-        .iter()
-        .map(|p| generate_public_component(p, &llr, compiler_config, focus_affects_rendering));
+    let public_components = llr.public_components.iter().map(|p| {
+        generate_public_component(
+            p,
+            &llr,
+            compiler_config,
+            focus_affects_rendering,
+            ime_affects_rendering,
+        )
+    });
 
     let popup_menu =
         llr.popup_menu.as_ref().map(|p| generate_item_tree(&p.item_tree, &llr, None, None, true));
@@ -365,6 +371,7 @@ fn generate_public_component(
     unit: &llr::CompilationUnit,
     compiler_config: &CompilerConfiguration,
     focus_affects_rendering: bool,
+    ime_affects_rendering: bool,
 ) -> TokenStream {
     let public_component_id = ident(&llr.name);
     let inner_component_id = inner_component_id(&unit.sub_components[llr.item_tree.root]);
@@ -457,6 +464,13 @@ fn generate_public_component(
                 // told otherwise has to assume it is.
                 sp::WindowInner::from_pub(window.window())
                     .set_focus_affects_rendering(#focus_affects_rendering);
+                // Whether a value the input method is told belongs on the UI
+                // thread was decided from the elements too.  The input method
+                // talks to the platform, which is a UI thread's business, so the
+                // drawing thread should not send those values; a UI thread reads
+                // this to know there is one to own.
+                sp::WindowInner::from_pub(window.window())
+                    .set_ime_affects_rendering(#ime_affects_rendering);
                 // Only this code knows how to build another instance of this
                 // component, so leave that behind for a backend that needs one.
                 slint::private_unstable_api::register_render_factory(

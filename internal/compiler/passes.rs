@@ -26,6 +26,7 @@ mod flickable;
 mod focus_handling;
 mod focus_render_dependency;
 pub mod generate_item_indices;
+mod ime_render_dependency;
 pub mod infer_aliases_types;
 mod inject_debug_hooks;
 pub use inject_debug_hooks::property_id;
@@ -252,6 +253,7 @@ pub async fn run_passes(
     // `resolve_native_classes` rewrites the builtin base types the analysis
     // recognizes focus-carrying elements by.
     focus_render_dependency::focus_affects_rendering(doc);
+    ime_render_dependency::ime_affects_rendering(doc);
 
     doc.visit_all_used_components(|component| {
         if !diag.has_errors() {

@@ -85,6 +85,18 @@ pub struct Document {
     /// drawing-relevant, so a drawing thread that never hears otherwise redraws
     /// on every focus change.
     pub focus_affects_rendering: std::cell::Cell<Option<bool>>,
+
+    /// Whether this document has an input-method value that belongs to the UI
+    /// thread, as decided from the elements by the `ime_render_dependency` pass.
+    ///
+    /// Most of a control's properties decide what is drawn and so stay with the
+    /// render thread.  A few are told only to the platform's input method and
+    /// drawn by nothing; those belong to the thread that owns input.  This
+    /// records whether any such value is present, so the code generators can
+    /// keep them off the drawing side and leave the input method to the UI
+    /// thread.  `None` means the answer is not known, and a drawing thread then
+    /// assumes it is on the safe side and keeps the input method itself.
+    pub ime_affects_rendering: std::cell::Cell<Option<bool>>,
 }
 
 impl Document {
@@ -317,6 +329,7 @@ impl Document {
             used_types: Default::default(),
             popup_menu_impl: None,
             focus_affects_rendering: Default::default(),
+            ime_affects_rendering: Default::default(),
         }
     }
 

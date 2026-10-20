@@ -1290,16 +1290,10 @@ impl Item for TextInput {
         self_rc: &ItemRc,
         size: LogicalSize,
     ) -> RenderingResult {
-        crate::properties::evaluate_no_tracking(|| {
-            if self.has_focus() && self.text() != *backend.window().last_ime_text.borrow() {
-                let window_adapter = &backend.window().window_adapter();
-                if let Some(w) = window_adapter.internal(crate::InternalToken) {
-                    w.input_method_request(InputMethodRequest::Update(
-                        self.ime_properties(window_adapter, self_rc),
-                    ));
-                }
-            }
-        });
+        // Drawing the input method's state is not this item's business: talking
+        // to the platform about it belongs to the thread that owns input, which
+        // reads what it needs through the item rather than being told here on
+        // every frame.  What is left is the drawing.
         (*backend).draw_text_input(self, self_rc, size);
         RenderingResult::ContinueRenderingChildren
     }
@@ -2198,7 +2192,14 @@ impl TextInput {
         repr
     }
 
-    fn cursor_rect_for_byte_offset(
+    /// The caret's rectangle at a given byte offset and affinity, measured off
+    /// the shaped text.
+    ///
+    /// Offered to the caller because the caret is drawn on the thread that
+    /// shaped the text, while the position it sits at is also what the
+    /// platform's input method is told; a backend that owns input on another
+    /// thread measures it here rather than keeping a second copy of the font.
+    pub fn cursor_rect_for_byte_offset(
         self: Pin<&Self>,
         byte_offset: usize,
         affinity: TextCursorAffinity,

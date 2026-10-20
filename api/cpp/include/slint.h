@@ -50,6 +50,7 @@ extern "C" bool slint_render_thread_attach_component(SlintRenderThreadFactory fa
 #define SLINT_CONTROL_PROPERTY_NUMBER 1u
 #define SLINT_CONTROL_PROPERTY_TEXT 2u
 #define SLINT_CONTROL_PROPERTY_COLOR 3u
+#define SLINT_CONTROL_PROPERTY_INT 4u
 
 /// A property value to assign to a borrowed control, as a tagged struct; see
 /// `slint::render_thread::PropertyValue`.
@@ -1027,6 +1028,7 @@ inline namespace render_thread {
             Number,
             Text,
             Color,
+            Integer,
         };
 
         Kind kind = Kind::Boolean;
@@ -1074,6 +1076,17 @@ inline namespace render_thread {
             p.color[1] = g;
             p.color[2] = b;
             p.color[3] = a;
+            return p;
+        }
+
+        /// An integer property, such as a `TextInput`'s cursor position in
+        /// bytes. The value rides in `number`, so it is carried exactly for the
+        /// range an `int` covers.
+        static PropertyValue from_int(int v) noexcept
+        {
+            PropertyValue p;
+            p.kind = Kind::Integer;
+            p.number = static_cast<float>(v);
             return p;
         }
     };
