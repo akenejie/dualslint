@@ -1508,7 +1508,7 @@ impl WinitWindowAdapter {
                 if let (Some(pressed), Some(button)) =
                     (self.render_pressed.replace(None), self.render_pressed_button.take())
                 {
-                    host.release_control(pressed, button, self.cursor_pos.get());
+                    host.release_control(button, self.cursor_pos.get());
                     host.apply_control_state(pressed, false, false);
                 }
                 self.set_render_hover(host, None);
@@ -1531,7 +1531,7 @@ impl WinitWindowAdapter {
                     if let (Some(pressed), Some(button)) =
                         (self.render_pressed.replace(None), self.render_pressed_button.take())
                     {
-                        host.release_control(pressed, button, *position);
+                        host.release_control(button, *position);
                         host.apply_control_state(pressed, false, false);
                     }
                     self.set_render_pressed(host, None);
@@ -1546,23 +1546,38 @@ impl WinitWindowAdapter {
             // is also the one the pointer is on.
             PointerAction::Pressed(button) => {
                 self.set_render_hover(host, target);
-                self.set_render_pressed(host, target);
+                // The tree hands the press to the item under the pointer and,
+                // when that item lets the press through, to the items below
+                // it.  This resolves which item ends up with it, and whether a
+                // press there can change anything on screen.
+                let Some(press_target) = self.render_press_target(host, position) else {
+                    // Nothing under the pointer takes a press, so the tree
+                    // would only walk its items to find that out.
+                    return true;
+                };
+                if !press_target.pointer_reacts {
+                    // The compiler found that no pointer event here reaches the
+                    // screen; sending one would make the tree run through the
+                    // application's handlers for an answer that cannot change a
+                    // pixel.  A press already being held is left alone: it is
+                    // another finger's, and its release still has to arrive.
+                    return true;
+                }
+                self.set_render_pressed(host, Some(press_target.id));
                 self.render_pressed_button.set(Some(button));
                 // The press is the grab and the focus, and nothing else: whether
                 // the release that follows lands here is what makes a click.
-                if let Some(id) = target {
-                    // The press travels with the focus this thread already had:
-                    // a control whose focus state draws nothing never got it in
-                    // the tree, so the tree cannot answer `has-focus` for it, and
-                    // the press is where that question is asked. It goes first so
-                    // the tree dispatches it before the focus moves, which is
-                    // what keeps a `FocusScope` from accepting the press
-                    // differently just because it now has the focus.
-                    host.press_control(id, button, position, self.render_focused.get());
-                    if host.control_coord(id).is_some_and(|c| c.focus_on_click) {
-                        self.decide_focus(host, id);
-                        self.sync_render_ime(host);
-                    }
+                // The press travels with the focus this thread already had: a
+                // control whose focus state draws nothing never got it in the
+                // tree, so the tree cannot answer `has-focus` for it, and the
+                // press is where that question is asked. It goes first so the
+                // tree dispatches it before the focus moves, which is what keeps
+                // a `FocusScope` from accepting the press differently just
+                // because it now has the focus.
+                host.press_control(button, position, self.render_focused.get());
+                if press_target.focus_on_click {
+                    self.decide_focus(host, press_target.id);
+                    self.sync_render_ime(host);
                 }
             }
             PointerAction::Moved { finger_id } => {
@@ -1584,7 +1599,7 @@ impl WinitWindowAdapter {
                 // the application's own code.
                 if let Some(pressed) = self.render_pressed.replace(None) {
                     self.render_pressed_button.set(None);
-                    host.release_control(pressed, button, position);
+                    host.release_control(button, position);
                     host.apply_control_state(
                         pressed,
                         self.render_hovered.get() == Some(pressed),
@@ -1595,6 +1610,26 @@ impl WinitWindowAdapter {
             }
         }
         true
+    }
+
+    /// Resolve a press to the item that takes it.
+    ///
+    /// The tree hands the press to the item under the pointer and, when that
+    /// item lets the press through, to the items below it.  A focus scope is
+    /// the one item that lets it through: it takes the press only when it takes
+    /// the focus, so its answer depends on the focus this thread has already
+    /// decided.  Every other item that can take a press takes it outright.
+    fn render_press_target(
+        &self,
+        host: &crate::render_thread::RenderHost,
+        position: corelib::lengths::LogicalPoint,
+    ) -> Option<i_slint_backend_scene::PressTarget> {
+        host.press_target_at(
+            position.x,
+            position.y,
+            host.focused_control(),
+            self.render_focused.get(),
+        )
     }
 
     /// Move the hover, which is a property on the control that had it and on the
@@ -1633,10 +1668,7 @@ impl WinitWindowAdapter {
         delta_x: f32,
         delta_y: f32,
     ) -> bool {
-        match host.control_at(position.x, position.y) {
-            Some(id) => host.scroll_control(id, position, delta_x, delta_y),
-            None => true,
-        }
+        host.scroll_control(position, delta_x, delta_y)
     }
 
     fn pinch_render_control(
@@ -1645,10 +1677,7 @@ impl WinitWindowAdapter {
         position: LogicalPoint,
         delta: f32,
     ) -> bool {
-        match host.control_at(position.x, position.y) {
-            Some(id) => host.pinch_control(id, position, delta),
-            None => true,
-        }
+        host.pinch_control(position, delta)
     }
 
     fn rotate_render_control(
@@ -1657,10 +1686,7 @@ impl WinitWindowAdapter {
         position: LogicalPoint,
         delta: f32,
     ) -> bool {
-        match host.control_at(position.x, position.y) {
-            Some(id) => host.rotate_control(id, position, delta),
-            None => true,
-        }
+        host.rotate_control(position, delta)
     }
 
     /// Hand a key to the tree on the render thread, when it owns the controls.

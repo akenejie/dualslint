@@ -274,3 +274,168 @@ fn a_focus_scope_publishes_its_focus_on_tab_navigation_property() {
     assert!(flags.iter().any(|f| *f), "the default focus scope is tabbable: {flags:?}");
     assert!(flags.iter().any(|f| !*f), "the opt-out focus scope is not: {flags:?}");
 }
+
+/// The press does not necessarily land on the topmost item: the tree hands it
+/// down to the items below until one takes it.  So what the UI thread needs is
+/// published per item — which items take a press, and which take it only by
+/// taking the focus — rather than inferred from the controls.
+#[test]
+fn the_items_that_take_a_press_are_published_in_paint_order() {
+    i_slint_backend_testing::init_no_event_loop();
+    let instance = build_source(
+        r#"
+        export component Controls {
+            VerticalLayout {
+                TouchArea { width: 100px; height: 20px; }
+                Flickable { width: 100px; height: 20px; interactive: true; }
+                FocusScope { width: 100px; height: 20px; }
+            }
+        }
+        "#,
+        LogicalSize::new(400.0, 300.0),
+    );
+    let targets = encode_window_controls(instance.window()).expect("walks").press_targets;
+    let behaviors: Vec<i_slint_backend_scene::PressBehavior> =
+        targets.iter().map(|t| t.behavior).collect();
+
+    assert_eq!(
+        behaviors,
+        vec![
+            i_slint_backend_scene::PressBehavior::Takes,
+            i_slint_backend_scene::PressBehavior::Takes,
+            i_slint_backend_scene::PressBehavior::Focus,
+        ],
+        "a touch area and a flickable take the press, a focus scope takes it with the focus"
+    );
+    assert!(
+        targets.iter().all(|t| !t.geometry.size.is_empty()),
+        "only items with something to point at are published: {targets:?}"
+    );
+}
+
+/// An item that is disabled lets the press through, so it is not where the
+/// press lands and publishing it would make the UI thread stop on it.
+#[test]
+fn a_disabled_item_takes_no_press() {
+    i_slint_backend_testing::init_no_event_loop();
+    let instance = build_source(
+        r#"
+        export component Controls {
+            VerticalLayout {
+                TouchArea { enabled: false; width: 100px; height: 20px; }
+                TouchArea { width: 100px; height: 20px; }
+                Flickable { width: 100px; height: 20px; interactive: false; }
+            }
+        }
+        "#,
+        LogicalSize::new(400.0, 300.0),
+    );
+    let targets = encode_window_controls(instance.window()).expect("walks").press_targets;
+
+    assert_eq!(targets.len(), 1, "only the enabled touch area takes a press: {targets:?}");
+}
+
+/// What the press would change is the compiler's answer, carried through the
+/// tree to the render thread and published with the item.  The UI thread reads
+/// it to skip a press that cannot change a pixel.
+#[test]
+fn a_press_target_carries_whether_a_press_can_change_the_screen() {
+    i_slint_backend_testing::init_no_event_loop();
+    let instance = build_source(
+        r#"
+        export component Controls {
+            VerticalLayout {
+                TouchArea { width: 100px; height: 20px; clicked => { self.width += 1px; } }
+                TouchArea { width: 100px; height: 20px; }
+            }
+        }
+        "#,
+        LogicalSize::new(400.0, 300.0),
+    );
+    let targets = encode_window_controls(instance.window()).expect("walks").press_targets;
+    let reacts: Vec<bool> = targets.iter().map(|t| t.pointer_reacts).collect();
+
+    assert_eq!(
+        reacts,
+        vec![true, false],
+        "the touch area with a click handler reacts, the bare one does not"
+    );
+}
+
+/// Two overlapping touch areas and a focus scope in front of both: enough to
+/// tell front-to-back order apart from the order the tree paints them in.
+const OVERLAPPING: &str = r#"
+    export component Controls {
+        back := TouchArea { x: 0; y: 0; width: 100px; height: 100px; }
+        mid := TouchArea { x: 50px; y: 50px; width: 100px; height: 100px; }
+        front := FocusScope { x: 60px; y: 60px; width: 100px; height: 100px; }
+    }
+"#;
+
+fn published(source: &str) -> i_slint_backend_scene::PublishedControls {
+    i_slint_backend_testing::init_no_event_loop();
+    let instance = build_source(source, LogicalSize::new(400.0, 300.0));
+    let table = encode_window_controls(instance.window()).expect("walks");
+    let mut published = i_slint_backend_scene::PublishedControls::default();
+    published.set_press_targets(table.press_targets);
+    published
+}
+
+/// A press goes to the frontmost item that takes it.  Three items overlap at
+/// `(70, 70)`; the focus scope is drawn last, so it is where the press lands.
+#[test]
+fn a_press_lands_on_the_frontmost_item_that_takes_it() {
+    let table = published(OVERLAPPING);
+    let targets = table.press_targets();
+    assert_eq!(targets.len(), 3, "all three items are published: {targets:?}");
+    let front = targets[2].id;
+
+    let landed = table.press_target_at(70.0, 70.0, None, None);
+    assert_eq!(landed.map(|t| t.id), Some(front), "the frontmost item takes the press");
+}
+
+/// A focus scope that already has the focus has nothing to do with the press,
+/// so it lets it through to the items behind it.  The tree and the UI thread
+/// keep separate focus answers, and either one saying "already focused" is
+/// enough.
+#[test]
+fn a_focus_scope_that_has_the_focus_lets_the_press_through() {
+    let table = published(OVERLAPPING);
+    let targets = table.press_targets();
+    let (mid, front) = (targets[1].id, targets[2].id);
+
+    assert_eq!(
+        table.press_target_at(70.0, 70.0, Some(front), None).map(|t| t.id),
+        Some(mid),
+        "the tree already focused the scope, so the press falls through"
+    );
+    assert_eq!(
+        table.press_target_at(70.0, 70.0, None, Some(front)).map(|t| t.id),
+        Some(mid),
+        "the UI thread already focused the scope, so the press falls through"
+    );
+    assert_eq!(
+        table.press_target_at(70.0, 70.0, Some(mid), None).map(|t| t.id),
+        Some(front),
+        "a different item having the focus does not make the scope let the press through"
+    );
+}
+
+/// A touch area takes the press outright, so what is behind it never sees one,
+/// whatever the focus is.
+#[test]
+fn a_touch_area_takes_the_press_whatever_the_focus_is() {
+    let table = published(OVERLAPPING);
+    let targets = table.press_targets();
+    let mid = targets[1].id;
+
+    assert_eq!(
+        table.press_target_at(55.0, 55.0, Some(mid), Some(mid)).map(|t| t.id),
+        Some(mid),
+        "the press lands on the touch area even though it already has the focus"
+    );
+    assert!(
+        table.press_target_at(250.0, 250.0, None, None).is_none(),
+        "nothing is under the pointer there, so nothing takes the press"
+    );
+}

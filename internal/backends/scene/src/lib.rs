@@ -211,12 +211,40 @@ pub struct ControlRegion {
     /// platform's input method is told and nothing draws has it read from the
     /// UI thread's own tree rather than being handed it from here.
     pub ime_ui_owned: bool,
-    /// Whether the application reacts to a pointer event on this control.
+}
+
+/// What an item does with a pointer press.
+///
+/// The tree hands a press to the item under the pointer, and to the items
+/// below it when that item lets the press through.  The UI thread owns the
+/// pointer, so it has to know which item the press lands on; the render thread
+/// owns the items, so it publishes what they do with a press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PressBehavior {
+    /// The item takes the press: the event ends there.
+    Takes,
+    /// The item takes the press only by taking the focus.  A press that does
+    /// not move the focus falls through to the items below it.
+    Focus,
+}
+
+/// An item that can take a pointer press.
+#[derive(Clone, Copy, Debug)]
+pub struct PressTarget {
+    /// The id of the item, the same id the control regions use.
+    pub id: u64,
+    /// The item's rectangle in window-space logical pixels.
+    pub geometry: LogicalRect,
+    /// What the item does with the press.
+    pub behavior: PressBehavior,
+    /// Whether the item takes the focus when it is pressed.
+    pub focus_on_click: bool,
+    /// Whether a pointer event on this item, or on something inside it, can
+    /// change what is on screen.
     ///
-    /// The compiler worked this out per element from the `.slint` source and
-    /// stored it in the item tree; the render thread is only publishing it.  A
-    /// pointer event on a control the application does not react to changes
-    /// nothing on screen, so the UI thread need not send it on.
+    /// The compiler worked this out per element and the render thread only
+    /// publishes it.  A press on an item that changes nothing on screen needs
+    /// not be sent on at all.
     pub pointer_reacts: bool,
 }
 
@@ -249,11 +277,6 @@ pub struct ControlCoord {
     /// Whether this control has an input-method value the UI thread owns, so the
     /// UI thread reads it from its own tree rather than from the drawing side.
     pub ime_ui_owned: bool,
-    /// Whether the application reacts to a pointer event on this control.
-    ///
-    /// Published so the UI thread — which owns the pointer — can tell whether a
-    /// pointer event on this control has to reach the drawing thread at all.
-    pub pointer_reacts: bool,
 }
 
 impl ControlCoord {
@@ -315,6 +338,11 @@ pub struct PublishedControls {
     /// Geometry and state by control id.
     pub by_id: CoordinateMap,
     order: Vec<u64>,
+    /// The items that can take a pointer press, in paint order.
+    ///
+    /// Back to front, like the controls: the last one drawn is the first a
+    /// press reaches.
+    press_targets: Vec<PressTarget>,
     /// The item the tree held the focus on when this table was written.
     ///
     /// The UI thread owns which control keys go to, but a `.slint` file can move
@@ -328,6 +356,7 @@ impl PublishedControls {
     pub fn clear(&mut self) {
         self.by_id.clear();
         self.order.clear();
+        self.press_targets.clear();
         self.focused = None;
     }
 
@@ -360,6 +389,47 @@ impl PublishedControls {
     /// The ids in paint order, back to front.
     pub fn ids(&self) -> &[u64] {
         &self.order
+    }
+
+    /// The items that can take a pointer press, in paint order: back to front.
+    pub fn press_targets(&self) -> &[PressTarget] {
+        &self.press_targets
+    }
+
+    /// Record the items that can take a pointer press.
+    pub fn set_press_targets(&mut self, press_targets: Vec<PressTarget>) {
+        self.press_targets = press_targets;
+    }
+
+    /// The item a press at the logical point lands on, front to back.
+    ///
+    /// The tree hands the press to the item under the pointer and, when that
+    /// item lets the press through, to the items below it.  A focus scope is
+    /// the one item that lets it through: it takes the press only by taking the
+    /// focus, and only while neither focus answer names it.  The two answers
+    /// are separate because a control whose focus state draws nothing has only
+    /// the UI thread's.
+    pub fn press_target_at(
+        &self,
+        x: f32,
+        y: f32,
+        tree_focused: Option<u64>,
+        ui_focused: Option<u64>,
+    ) -> Option<&PressTarget> {
+        self.press_targets.iter().rev().find(|target| {
+            let g = &target.geometry;
+            let inside = x >= g.origin.x
+                && x < g.origin.x + g.size.width
+                && y >= g.origin.y
+                && y < g.origin.y + g.size.height;
+            inside
+                && match target.behavior {
+                    PressBehavior::Takes => true,
+                    PressBehavior::Focus => {
+                        tree_focused != Some(target.id) && ui_focused != Some(target.id)
+                    }
+                }
+        })
     }
 
     /// The controls Tab moves through, in paint order.

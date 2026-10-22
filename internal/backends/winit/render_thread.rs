@@ -429,11 +429,13 @@ pub enum RenderMessage {
         /// Reply channel: `true` when an item consumed the key.
         response: std::sync::mpsc::SyncSender<bool>,
     },
-    /// The UI thread resolved a press to a control: this control is held, and
-    /// with the press it also has the focus.  A release is what makes it a click.
+    /// The UI thread resolved a press: the hold has begun.
+    ///
+    /// No item is named.  The UI thread decided *whether* the press is worth
+    /// sending, from what the render thread published about the items under the
+    /// pointer; the tree then hit-tests the position with its own items and
+    /// hands the press to the one there, which is the tree's answer to give.
     PressControl {
-        /// The control the pointer went down on.
-        id: u64,
         /// Which button went down, so that a right press stays a right press.
         button: PointerEventButton,
         /// Where the pointer went down, in the window's logical coordinates.
@@ -466,10 +468,11 @@ pub enum RenderMessage {
         /// tells two fingers apart by this.
         finger_id: i32,
     },
-    /// The UI thread resolved a release to a control: the hold is over.
+    /// The UI thread resolved a release: the hold is over.
+    ///
+    /// The tree's own grab decides which item the release belongs to, as it
+    /// does for the moves of a drag that leaves the item it started on.
     ReleaseControl {
-        /// The control the pointer came up on.
-        id: u64,
         /// Which button came up, to end the press it began.
         button: PointerEventButton,
         /// Where the pointer came up, in the window's logical coordinates.
@@ -504,11 +507,13 @@ pub enum RenderMessage {
         /// The control the UI thread believes holds the focus.
         id: u64,
     },
-    /// The UI thread resolved a wheel event to a control: this control is the
-    /// one under the pointer, so it is the one the wheel is for.
+    /// A wheel event, which is never held back.
+    ///
+    /// Scrolling changes what is on screen wherever it lands -- a `Flickable`,
+    /// a scroll bar, a widget with its own handler -- so the UI thread does not
+    /// decide whether it is worth sending; the tree hit-tests it and the item
+    /// there answers.
     ScrollControl {
-        /// The control the wheel belongs to.
-        id: u64,
         /// Where the wheel was turned, in the window's logical coordinates.
         position: LogicalPoint,
         /// Horizontal wheel movement, in logical pixels.
@@ -519,8 +524,6 @@ pub enum RenderMessage {
     /// The same for a trackpad pinch, which a zoomable area answers and
     /// everything else ignores.
     PinchControl {
-        /// The control under the pointer.
-        id: u64,
         /// Where the fingers were, in the window's logical coordinates.
         position: LogicalPoint,
         /// How far the fingers moved apart.
@@ -528,8 +531,6 @@ pub enum RenderMessage {
     },
     /// The same for a trackpad rotation.
     RotateControl {
-        /// The control under the pointer.
-        id: u64,
         /// Where the fingers were, in the window's logical coordinates.
         position: LogicalPoint,
         /// How far the fingers rotated, in radians.
@@ -858,7 +859,6 @@ impl RenderHost {
                         focus_on_tab: c.focus_on_tab,
                         focus_draws: c.focus_draws,
                         ime_ui_owned: c.ime_ui_owned,
-                        pointer_reacts: c.pointer_reacts,
                     })
                 };
                 let adapter = tl.adapter.borrow().clone();
@@ -914,12 +914,11 @@ impl RenderHost {
     /// what knows whether the pointer moved away in the meantime.
     pub fn press_control(
         &self,
-        id: u64,
         button: PointerEventButton,
         position: LogicalPoint,
         ui_focused: Option<u64>,
     ) -> bool {
-        self.sender.send(RenderMessage::PressControl { id, button, position, ui_focused }).is_ok()
+        self.sender.send(RenderMessage::PressControl { button, position, ui_focused }).is_ok()
     }
 
     /// Tell the tree that the pointer moved while the press was held.
@@ -933,13 +932,8 @@ impl RenderHost {
     }
 
     /// Tell the tree that the press on this control is over.
-    pub fn release_control(
-        &self,
-        id: u64,
-        button: PointerEventButton,
-        position: LogicalPoint,
-    ) -> bool {
-        self.sender.send(RenderMessage::ReleaseControl { id, button, position }).is_ok()
+    pub fn release_control(&self, button: PointerEventButton, position: LogicalPoint) -> bool {
+        self.sender.send(RenderMessage::ReleaseControl { button, position }).is_ok()
     }
 
     /// Tell the tree that the wheel belongs to this control.
@@ -947,24 +941,18 @@ impl RenderHost {
     /// Which control it is, the UI thread decided from the published geometry;
     /// what scrolling it means is the tree's, because that is a property of the
     /// control rather than of the event.
-    pub fn scroll_control(
-        &self,
-        id: u64,
-        position: LogicalPoint,
-        delta_x: f32,
-        delta_y: f32,
-    ) -> bool {
-        self.sender.send(RenderMessage::ScrollControl { id, position, delta_x, delta_y }).is_ok()
+    pub fn scroll_control(&self, position: LogicalPoint, delta_x: f32, delta_y: f32) -> bool {
+        self.sender.send(RenderMessage::ScrollControl { position, delta_x, delta_y }).is_ok()
     }
 
     /// Tell the tree that a pinch belongs to this control.
-    pub fn pinch_control(&self, id: u64, position: LogicalPoint, delta: f32) -> bool {
-        self.sender.send(RenderMessage::PinchControl { id, position, delta }).is_ok()
+    pub fn pinch_control(&self, position: LogicalPoint, delta: f32) -> bool {
+        self.sender.send(RenderMessage::PinchControl { position, delta }).is_ok()
     }
 
     /// Tell the tree that a rotation belongs to this control.
-    pub fn rotate_control(&self, id: u64, position: LogicalPoint, delta: f32) -> bool {
-        self.sender.send(RenderMessage::RotateControl { id, position, delta }).is_ok()
+    pub fn rotate_control(&self, position: LogicalPoint, delta: f32) -> bool {
+        self.sender.send(RenderMessage::RotateControl { position, delta }).is_ok()
     }
 
     /// Run a call against the tree this thread draws, and wait for it.
@@ -1141,6 +1129,43 @@ impl RenderHost {
         self.coords.lock().unwrap().control_at(x, y)
     }
 
+    /// The items that can take a pointer press, in paint order: back to front.
+    ///
+    /// The tree hands a press to the item under the pointer, and to the items
+    /// below it when that item lets the press through.  The UI thread owns the
+    /// pointer, so it walks this list to find the item the press lands on.
+    pub fn press_targets(&self) -> Vec<PressTarget> {
+        if on_render_thread() {
+            if let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().press_targets().to_vec()) {
+                return r;
+            }
+        }
+        self.coords.lock().unwrap().press_targets().to_vec()
+    }
+
+    /// The item a press at the logical point lands on, front to back.
+    ///
+    /// The tree hands the press to the item under the pointer and, when that
+    /// item lets the press through, to the items below it; the published press
+    /// targets know which items do what, and this resolves the one the press
+    /// ends up with.
+    pub fn press_target_at(
+        &self,
+        x: f32,
+        y: f32,
+        tree_focused: Option<u64>,
+        ui_focused: Option<u64>,
+    ) -> Option<PressTarget> {
+        if on_render_thread() {
+            if let Some(r) = with_tl_access(|a| {
+                a.coords.lock().unwrap().press_target_at(x, y, tree_focused, ui_focused).copied()
+            }) {
+                return r;
+            }
+        }
+        self.coords.lock().unwrap().press_target_at(x, y, tree_focused, ui_focused).copied()
+    }
+
     /// What the render thread published about one control, by id.
     ///
     /// The id comes from [`Self::control_at`]; this is the rest of that answer,
@@ -1195,10 +1220,6 @@ impl RenderHost {
     /// The compiler worked this out per element and the render thread
     /// publishes it; the UI thread reads it to decide whether a pointer event
     /// has to be sent on at all.
-    pub fn pointer_reacts(&self, id: u64) -> bool {
-        self.control_coord(id).is_some_and(|c| c.pointer_reacts)
-    }
-
     /// The control the drawing tree last published as having the focus.
     ///
     /// A `.slint` file can move the focus without the UI thread asking, so the
@@ -1888,7 +1909,7 @@ impl RenderCore {
                         });
                         let _ = response.send(value);
                     }
-                    RenderMessage::PressControl { id, button, position, ui_focused } => {
+                    RenderMessage::PressControl { button, position, ui_focused } => {
                         // The press handler in the tree asks whether the control
                         // already has the focus, and for one whose focus state is
                         // not drawn here the answer only exists on the UI thread.
@@ -1898,9 +1919,8 @@ impl RenderCore {
                         if let Some(window) = window {
                             WindowInner::from_pub(window).set_ui_focused_id(ui_focused);
                         }
-                        present |= send_pointer_event_to_control(
+                        present |= send_pointer_event_to_tree(
                             render_window_adapter.as_ref(),
-                            render_controls.get(&id),
                             MouseEventKind::Pressed,
                             button,
                             position,
@@ -1916,10 +1936,9 @@ impl RenderCore {
                             finger_id,
                         );
                     }
-                    RenderMessage::ReleaseControl { id, button, position } => {
-                        present |= send_pointer_event_to_control(
+                    RenderMessage::ReleaseControl { button, position } => {
+                        present |= send_pointer_event_to_tree(
                             render_window_adapter.as_ref(),
-                            render_controls.get(&id),
                             MouseEventKind::Released,
                             button,
                             position,
@@ -1966,26 +1985,23 @@ impl RenderCore {
                             present = true;
                         }
                     }
-                    RenderMessage::ScrollControl { id, position, delta_x, delta_y } => {
-                        present |= send_gesture_to_control(
+                    RenderMessage::ScrollControl { position, delta_x, delta_y } => {
+                        present |= send_gesture_to_tree(
                             render_window_adapter.as_ref(),
-                            render_controls.get(&id),
                             Gesture::Wheel { delta_x, delta_y },
                             position,
                         );
                     }
-                    RenderMessage::PinchControl { id, position, delta } => {
-                        present |= send_gesture_to_control(
+                    RenderMessage::PinchControl { position, delta } => {
+                        present |= send_gesture_to_tree(
                             render_window_adapter.as_ref(),
-                            render_controls.get(&id),
                             Gesture::Pinch { delta },
                             position,
                         );
                     }
-                    RenderMessage::RotateControl { id, position, delta } => {
-                        present |= send_gesture_to_control(
+                    RenderMessage::RotateControl { position, delta } => {
+                        present |= send_gesture_to_tree(
                             render_window_adapter.as_ref(),
-                            render_controls.get(&id),
                             Gesture::Rotation { delta },
                             position,
                         );
@@ -2142,7 +2158,13 @@ fn publish_mirror_controls(
     // side effect of compositing an encoded frame, does not run there, and
     // without this the UI thread would hit-test an empty table and no pointer
     // event would ever reach a control.
-    publish_control_coords(coords, &table.controls, interaction, table.focused);
+    publish_control_coords(
+        coords,
+        &table.controls,
+        &table.press_targets,
+        interaction,
+        table.focused,
+    );
     true
 }
 
@@ -2704,13 +2726,12 @@ enum Gesture {
 /// The event is placed at the control's centre because the tree hit-tests the
 /// point it is given, and the control the UI thread picked is the one that has
 /// to be under it.
-fn send_gesture_to_control(
+fn send_gesture_to_tree(
     adapter: Option<&Rc<dyn WindowAdapter>>,
-    region: Option<&ControlRegion>,
     gesture: Gesture,
     position: LogicalPoint,
 ) -> bool {
-    let Some((adapter, _region)) = adapter.zip(region) else {
+    let Some(adapter) = adapter else {
         return false;
     };
     let event = i_slint_core::platform::InternalEvent::Mouse(match gesture {
@@ -2762,17 +2783,21 @@ fn control_centre(region: &ControlRegion) -> LogicalPoint {
 /// The control is only asked for as a check that it is still there: the frame
 /// that published it and the frame that dispatches to it are frames apart, and a
 /// control that has since gone should not be given an event.
-fn send_pointer_event_to_control(
+/// Hand a press or a release to the tree.
+///
+/// No control is named: the tree hit-tests the position with its own item tree
+/// and hands the press to the item there, and to the items below it when that
+/// item lets it through.  The UI thread only decides *whether* to send the
+/// event, not which item answers it.
+fn send_pointer_event_to_tree(
     adapter: Option<&Rc<dyn WindowAdapter>>,
-    region: Option<&ControlRegion>,
     kind: MouseEventKind,
     button: PointerEventButton,
     position: LogicalPoint,
 ) -> bool {
-    if adapter.is_none() || region.is_none() {
+    let Some(adapter) = adapter else {
         return false;
-    }
-    let adapter = adapter.expect("checked above");
+    };
 
     let event = i_slint_core::platform::InternalEvent::Mouse(match kind {
         MouseEventKind::Pressed => {
@@ -3331,12 +3356,14 @@ impl ControlInteraction {
 fn publish_control_coords(
     map: &Arc<Mutex<PublishedControls>>,
     controls: &[ControlRegion],
+    press_targets: &[PressTarget],
     interaction: &ControlInteraction,
     focused: Option<u64>,
 ) {
     let mut map = map.lock().unwrap();
     map.clear();
     map.set_focused(focused);
+    map.set_press_targets(press_targets.to_vec());
     for c in controls {
         map.insert(
             c.id,
@@ -3351,7 +3378,6 @@ fn publish_control_coords(
                 focus_on_tab: c.focus_on_tab,
                 focus_draws: c.focus_draws,
                 ime_ui_owned: c.ime_ui_owned,
-                pointer_reacts: c.pointer_reacts,
             },
         );
     }

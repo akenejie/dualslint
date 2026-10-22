@@ -29,7 +29,7 @@ use i_slint_core::lengths::{
 use i_slint_core::platform::PlatformError;
 use i_slint_core::window::WindowInner;
 
-use crate::ControlRegion;
+use crate::{ControlRegion, PressBehavior, PressTarget};
 
 /// Stable u64 id for the item a control region points at, used for control
 /// regions and the map from the UI thread's id back to the render-side item.
@@ -81,6 +81,68 @@ fn focus_on_tab(item: &ItemRc) -> bool {
         .is_some_and(|item| item.as_pin_ref().enabled())
 }
 
+/// What an item does with a pointer press, if anything.
+///
+/// The tree hands a press to the item under the pointer, and to the items
+/// below it when that item lets the press through.  An item that takes the
+/// press ends it there; a focus scope takes it only by taking the focus, and
+/// lets it through otherwise.  The item that ends up with the press is the
+/// one the UI thread has to look for, because that is the one whose answer
+/// decides whether the press is worth sending on.
+fn press_behavior(item: &ItemRc) -> Option<PressBehavior> {
+    if let Some(item) = item.downcast::<i_slint_core::items::TouchArea>() {
+        let enabled = i_slint_core::items::TouchArea::FIELD_OFFSETS
+            .enabled()
+            .apply_pin(item.as_pin_ref())
+            .get();
+        return enabled.then_some(PressBehavior::Takes);
+    }
+    if let Some(item) = item.downcast::<i_slint_core::items::TextInput>() {
+        let enabled = i_slint_core::items::TextInput::FIELD_OFFSETS
+            .enabled()
+            .apply_pin(item.as_pin_ref())
+            .get();
+        return enabled.then_some(PressBehavior::Takes);
+    }
+    if let Some(item) = item.downcast::<i_slint_core::items::FocusScope>() {
+        let item = item.as_pin_ref();
+        let enabled =
+            i_slint_core::items::FocusScope::FIELD_OFFSETS.enabled().apply_pin(item).get();
+        let focus_on_click =
+            i_slint_core::items::FocusScope::FIELD_OFFSETS.focus_on_click().apply_pin(item).get();
+        return (enabled && focus_on_click).then_some(PressBehavior::Focus);
+    }
+    if let Some(item) = item.downcast::<i_slint_core::items::Flickable>() {
+        let item = item.as_pin_ref();
+        // A flickable that cannot be panned lets the press through to the
+        // items below it.
+        return (item.interactive() && item.mouse_drag_pan_enabled())
+            .then_some(PressBehavior::Takes);
+    }
+    if let Some(item) = item.downcast::<i_slint_core::items::DragArea>() {
+        let enabled = i_slint_core::items::DragArea::FIELD_OFFSETS
+            .enabled()
+            .apply_pin(item.as_pin_ref())
+            .get();
+        return enabled.then_some(PressBehavior::Takes);
+    }
+    if let Some(item) = item.downcast::<i_slint_core::items::ContextMenu>() {
+        let enabled = i_slint_core::items::ContextMenu::FIELD_OFFSETS
+            .enabled()
+            .apply_pin(item.as_pin_ref())
+            .get();
+        return enabled.then_some(PressBehavior::Takes);
+    }
+    if let Some(item) = item.downcast::<i_slint_core::items::WindowMoveArea>() {
+        let enabled = i_slint_core::items::WindowMoveArea::FIELD_OFFSETS
+            .enabled()
+            .apply_pin(item.as_pin_ref())
+            .get();
+        return enabled.then_some(PressBehavior::Takes);
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // ControlEncoder
 // ---------------------------------------------------------------------------
@@ -96,6 +158,8 @@ pub struct ControlEncoder<'a> {
     /// which owns the tree — can loan out its properties.  The `ItemRc`s are
     /// not `Send` and stay on the thread that encoded them.
     item_refs: Vec<(u64, ItemRc)>,
+    /// The items that can take a pointer press, in paint order.
+    press_targets: Vec<PressTarget>,
     /// The id of the item this tree has the focus on, read when the walk starts.
     focused: Option<u64>,
     scale_factor: ScaleFactor,
@@ -107,7 +171,14 @@ impl<'a> ControlEncoder<'a> {
         // A `.slint` file can move the focus on its own, so the answer is read
         // from the tree rather than taken from the UI thread's last decision.
         let focused = window_inner.focus_item.borrow().upgrade().map(|item| item.stable_id());
-        Self { window_inner, controls: Vec::new(), item_refs: Vec::new(), focused, scale_factor }
+        Self {
+            window_inner,
+            controls: Vec::new(),
+            item_refs: Vec::new(),
+            press_targets: Vec::new(),
+            focused,
+            scale_factor,
+        }
     }
 
     /// Publish this item as a control region: a target for hit-testing and for
@@ -133,9 +204,31 @@ impl<'a> ControlEncoder<'a> {
             focus_on_tab: focus_on_tab(item),
             focus_draws: item.focus_draws(),
             ime_ui_owned: item.ime_ui_owned(),
-            pointer_reacts: item.pointer_reacts(),
         });
         self.item_refs.push((id, item.clone()));
+    }
+
+    /// Publish an item that can take a pointer press.
+    ///
+    /// The press is not necessarily taken by the topmost item under the
+    /// pointer: an item that lets the press through hands it to the items
+    /// below it.  So the items that take a press are published on their own,
+    /// in paint order, and the UI thread walks them to find the one the press
+    /// lands on.
+    fn push_press_target(&mut self, item: &ItemRc, origin: LogicalPoint) {
+        let Some(behavior) = press_behavior(item) else { return };
+        let geometry = item.geometry();
+        if geometry.size.is_empty() {
+            return;
+        }
+        let window_origin = origin + item.map_to_window(geometry.origin).to_vector();
+        self.press_targets.push(PressTarget {
+            id: item_rc_as_id(item),
+            geometry: LogicalRect::new(window_origin, geometry.size),
+            behavior,
+            focus_on_click: focus_on_click(item),
+            pointer_reacts: item.pointer_reacts(),
+        });
     }
 
     /// Publish the interactive items of `component` as control regions.
@@ -168,6 +261,7 @@ impl<'a> ControlEncoder<'a> {
                 if interactive {
                     self.push_control(&item_rc, origin);
                 }
+                self.push_press_target(&item_rc, origin);
                 i_slint_core::item_tree::ItemVisitorResult::Continue(())
             },
             (),
@@ -175,7 +269,12 @@ impl<'a> ControlEncoder<'a> {
     }
 
     fn finish(self) -> ControlTable {
-        ControlTable { controls: self.controls, item_refs: self.item_refs, focused: self.focused }
+        ControlTable {
+            controls: self.controls,
+            item_refs: self.item_refs,
+            press_targets: self.press_targets,
+            focused: self.focused,
+        }
     }
 }
 
@@ -354,6 +453,8 @@ pub struct ControlTable {
     /// The `ItemRc` behind each id in `controls`. Not `Send`, so this stays on
     /// the thread that encoded it.
     pub item_refs: Vec<(u64, ItemRc)>,
+    /// The items that can take a pointer press, in paint order.
+    pub press_targets: Vec<PressTarget>,
     /// The id of the item the tree has the focus on, if it is a published
     /// control. A `.slint` file can move the focus on its own, so the UI thread
     /// reads the answer here instead of trusting its own last decision.
@@ -372,7 +473,12 @@ pub fn encode_window_controls(
     let window_adapter = window_inner.window_adapter();
     let size = window_adapter.size();
     if size.width == 0 || size.height == 0 {
-        return Ok(ControlTable { controls: Vec::new(), item_refs: Vec::new(), focused: None });
+        return Ok(ControlTable {
+            controls: Vec::new(),
+            item_refs: Vec::new(),
+            press_targets: Vec::new(),
+            focused: None,
+        });
     }
 
     let mut encoder = ControlEncoder::new(window_inner);
