@@ -654,12 +654,6 @@ impl ItemRc {
         }
     }
 
-    /// Whether this item has an input-method value the UI thread owns.
-    ///
-    /// The compiler decided this per element and stored it in the tree node, so
-    /// the thread that owns the input method can tell, from a control id alone,
-    /// whether the value it reads from its own copy of the tree is one it owns
-    /// rather than one the drawing side holds.
     /// Whether the application reacts to a pointer event on this item.
     ///
     /// The compiler decided this per element and stored it in the tree node, so
@@ -680,6 +674,12 @@ impl ItemRc {
         }
     }
 
+    /// Whether this item has an input-method value the UI thread owns.
+    ///
+    /// The compiler decided this per element and stored it in the tree node, so
+    /// the thread that owns the input method can tell, from a control id alone,
+    /// whether the value it reads from its own copy of the tree is one it owns
+    /// rather than one the drawing side holds.
     pub fn ime_ui_owned(&self) -> bool {
         let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
         let item_tree = crate::item_tree::ItemTreeNodeArray::new(&comp_ref_pin);
