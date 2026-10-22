@@ -90,6 +90,28 @@ fn reading_where_the_pointer_is_leaves_the_other_control_alone() {
 }
 
 #[test]
+fn a_text_input_answers_the_pointer_by_itself() {
+    // The caret follows the pointer, which shows, so the event has to reach
+    // the tree that draws it even when the application says nothing.
+    let bits = pointer_reacts_bits(&window("TextInput { }"));
+    assert!(bits.contains(&true), "the caret follows the pointer: {bits:?}");
+}
+
+#[test]
+fn a_control_reaches_the_item_inside_it() {
+    // A press on the outer control reaches the inner one, so the outer control
+    // carries the answer of the inner one too.
+    let bits = pointer_reacts_bits(&window("TouchArea { Rectangle { } TextInput { } }"));
+    assert!(bits.contains(&true), "the inner input answers the pointer: {bits:?}");
+}
+
+#[test]
+fn a_control_that_only_holds_a_rectangle_answers_nothing() {
+    let bits = pointer_reacts_bits(&window("TouchArea { Rectangle { } }"));
+    assert!(bits.iter().all(|b| !*b), "nothing inside answers the pointer: {bits:?}");
+}
+
+#[test]
 fn a_cursor_the_application_sets_says_nothing_about_the_pointer() {
     // The application tells the cursor, it does not read where the pointer is,
     // so a press changes nothing on screen.

@@ -1353,13 +1353,14 @@ pub enum ItemTreeNode {
         /// know, from a control id alone, whether there is one to read.
         ime_ui_owned: bool,
 
-        /// True when the application reacts to a pointer event on this item.
+        /// True when a pointer event on this item, or on something inside it,
+        /// can change what is on screen.
         ///
         /// The compiler decides this from the element the item comes from: a
-        /// bound `clicked` handler, or a binding that reads where the pointer
-        /// is.  A pointer event on a control the application does not react to
-        /// changes nothing on screen, so the UI thread can leave the drawing
-        /// thread alone for it.
+        /// bound `clicked` handler, a binding that reads where the pointer is,
+        /// or an item that answers the pointer by itself.  A pointer event on a
+        /// control that changes nothing on screen needs not be sent on, so the
+        /// UI thread can leave the drawing thread alone for it.
         pointer_reacts: bool,
 
         /// number of children

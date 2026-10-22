@@ -16,6 +16,7 @@
 //! and the published control metadata tells the UI thread what a control needs
 //! instead of leaving it to guess.
 
+use crate::langtype::ElementType;
 use crate::object_tree::{
     Document, Element, ElementRc, PropertyOwnership,
     recurse_elem_including_sub_components_no_borrow,
@@ -118,11 +119,54 @@ pub fn property_ownership(doc: &Document) {
         });
     });
 
+    // The answer so far is about the element itself.  A pointer event on a
+    // control reaches the items inside it as well, so the answer a control
+    // carries is the answer of everything under it.  This runs after the walk
+    // above, so that every element already holds its own answer.
+    doc.visit_all_used_components(|component| {
+        aggregate_pointer_reacts(&component.root_element);
+        component.popup_windows.borrow().iter().for_each(|popup| {
+            aggregate_pointer_reacts(&popup.component.root_element);
+        });
+        component.menu_item_tree.borrow().iter().for_each(|menu| {
+            aggregate_pointer_reacts(&menu.root_element);
+        });
+    });
+
     // The document-wide answers are what the code generators pass on to a
     // window that asks about them.  The per-control answers are what the
     // runtime uses; these stay as the window's fallback.
     doc.focus_affects_rendering.set(Some(focus_affects));
     doc.ime_affects_rendering.set(Some(ime_affects));
+}
+
+/// Whether a pointer event on this element, or on something inside it, can
+/// change what is on screen.
+///
+/// The tree hands a press to the item under the pointer, and to the items below
+/// it when that item lets it through, so an event that reaches an inner item
+/// is an event on the outer one as well.  The answer therefore grows from the
+/// inside out.
+fn aggregate_pointer_reacts(elem: &ElementRc) -> bool {
+    let (own, base_root, children) = {
+        let e = elem.borrow();
+        let base_root = match &e.base_type {
+            ElementType::Component(base) => Some(base.root_element.clone()),
+            _ => None,
+        };
+        (e.pointer_reacts, base_root, e.children.clone())
+    };
+
+    let mut reacts = own;
+    if let Some(base_root) = base_root {
+        reacts |= aggregate_pointer_reacts(&base_root);
+    }
+    for child in &children {
+        reacts |= aggregate_pointer_reacts(child);
+    }
+
+    elem.borrow_mut().pointer_reacts = reacts;
+    reacts
 }
 
 /// Which thread holds the value of each of this element's properties.
@@ -202,6 +246,29 @@ fn application_sets(elem: &Element, name: &str) -> bool {
         || elem.property_analysis.borrow().get(name).is_some_and(|a| a.is_set)
 }
 
+/// Whether the item itself answers a pointer event, whatever the application
+/// does.
+///
+/// A text input puts the caret where the pointer is, a flickable follows the
+/// pointer while it is held, a drag area starts a drag: these change what is
+/// on screen without the application asking for it, so the event has to reach
+/// the tree that draws them.
+fn item_reacts_to_pointer(item_name: &str) -> bool {
+    matches!(
+        item_name,
+        "TextInput"
+            | "Flickable"
+            | "SwipeGestureHandler"
+            | "ScaleRotateGestureHandler"
+            | "DragArea"
+            | "DropArea"
+            | "ContextMenu"
+            | "MenuItem"
+            | "WindowMoveArea"
+            | "TooltipArea"
+    )
+}
+
 /// Whether the item draws the property's value.
 ///
 /// An item that carries focus paints its own focus state, the way a text
@@ -252,7 +319,12 @@ fn derived_answers(
         .iter()
         .any(|name| matches!(ownership.get(*name), Some(PropertyOwnership::Shared)));
 
-    let pointer_reacts = pointer_callback_bound || pointer_state_read;
+    // An item that answers the pointer by itself needs the event as much as one
+    // the application asked about.
+    let item_reacts =
+        elem_ref.builtin_type().is_some_and(|builtin| item_reacts_to_pointer(&builtin.name));
+
+    let pointer_reacts = pointer_callback_bound || pointer_state_read || item_reacts;
 
     DerivedAnswers { focus_draws, ime_ui_owned, pointer_reacts }
 }

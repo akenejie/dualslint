@@ -1357,11 +1357,15 @@ pub struct Element {
     /// instead of being handed it from the drawing side.
     pub ime_ui_owned: bool,
 
-    /// Whether the application reacts to a pointer event on this element.
+    /// Whether a pointer event on this element, or on something inside it, can
+    /// change what is on screen.
     ///
-    /// Set by the `property_ownership` pass.  A bound `clicked` handler, or a
-    /// binding that reads where the pointer is, means a press on this element
-    /// has to reach the drawing thread, which is where the application lives.
+    /// Set by the `property_ownership` pass.  A bound `clicked` handler, a
+    /// binding that reads where the pointer is, or an item that answers the
+    /// pointer by itself -- a text input putting the caret where the pointer
+    /// is -- means the event has to reach the drawing thread, which is where
+    /// the application lives.  The answer covers the elements inside this one
+    /// as well, because a press reaches them too.
     pub pointer_reacts: bool,
 
     /// Which thread holds the value of each of this element's properties.
