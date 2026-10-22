@@ -1357,19 +1357,12 @@ pub struct Element {
     /// instead of being handed it from the drawing side.
     pub ime_ui_owned: bool,
 
-    /// Whether this element's pointer state shows on screen.
-    ///
-    /// Set by the `property_ownership` pass.  A control whose pressed and
-    /// hovered states nothing reads draws the same whether it is pressed or
-    /// not, so the UI thread has no reason to tell the drawing thread about it.
-    pub pointer_draws: bool,
-
     /// Whether the application reacts to a pointer event on this element.
     ///
     /// Set by the `property_ownership` pass.  A bound `clicked` handler, or a
     /// binding that reads where the pointer is, means a press on this element
     /// has to reach the drawing thread, which is where the application lives.
-    pub pointer_handled: bool,
+    pub pointer_reacts: bool,
 
     /// Which thread holds the value of each of this element's properties.
     ///

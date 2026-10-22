@@ -76,8 +76,7 @@ pub fn ensure_window(
         // state it drew there; the Window that replaces it draws none.
         focus_draws: std::mem::replace(&mut win_elem_mut.focus_draws, false),
         ime_ui_owned: std::mem::replace(&mut win_elem_mut.ime_ui_owned, false),
-        pointer_draws: std::mem::replace(&mut win_elem_mut.pointer_draws, false),
-        pointer_handled: std::mem::replace(&mut win_elem_mut.pointer_handled, false),
+        pointer_reacts: std::mem::replace(&mut win_elem_mut.pointer_reacts, false),
         property_ownership: std::mem::take(&mut win_elem_mut.property_ownership),
 
         inline_depth: 0,

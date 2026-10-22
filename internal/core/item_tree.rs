@@ -660,6 +660,26 @@ impl ItemRc {
     /// the thread that owns the input method can tell, from a control id alone,
     /// whether the value it reads from its own copy of the tree is one it owns
     /// rather than one the drawing side holds.
+    /// Whether the application reacts to a pointer event on this item.
+    ///
+    /// The compiler decided this per element and stored it in the tree node, so
+    /// the thread that owns the pointer can tell, from a control id alone,
+    /// whether a pointer event on this control has to reach the drawing thread
+    /// at all.
+    pub fn pointer_reacts(&self) -> bool {
+        let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
+        let item_tree = crate::item_tree::ItemTreeNodeArray::new(&comp_ref_pin);
+
+        if let Some(n) = &item_tree.get(self.index) {
+            match n {
+                ItemTreeNode::Item { pointer_reacts, .. } => *pointer_reacts,
+                ItemTreeNode::DynamicTree { .. } => false,
+            }
+        } else {
+            false
+        }
+    }
+
     pub fn ime_ui_owned(&self) -> bool {
         let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
         let item_tree = crate::item_tree::ItemTreeNodeArray::new(&comp_ref_pin);
@@ -1332,6 +1352,15 @@ pub enum ItemTreeNode {
         /// rather than being handed it from the drawing side, so it needs to
         /// know, from a control id alone, whether there is one to read.
         ime_ui_owned: bool,
+
+        /// True when the application reacts to a pointer event on this item.
+        ///
+        /// The compiler decides this from the element the item comes from: a
+        /// bound `clicked` handler, or a binding that reads where the pointer
+        /// is.  A pointer event on a control the application does not react to
+        /// changes nothing on screen, so the UI thread can leave the drawing
+        /// thread alone for it.
+        pointer_reacts: bool,
 
         /// number of children
         children_count: u32,
@@ -2087,6 +2116,7 @@ mod tests {
                 is_accessible: false,
                 focus_draws: false,
                 ime_ui_owned: false,
+                pointer_reacts: false,
                 children_count: 0,
                 children_index: 1,
                 parent_index: 0,
@@ -2143,6 +2173,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 3,
                     children_index: 1,
                     parent_index: 0,
@@ -2154,6 +2185,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
@@ -2165,6 +2197,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
@@ -2176,6 +2209,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
@@ -2291,6 +2325,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 0,
@@ -2356,6 +2391,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 3,
                     children_index: 1,
                     parent_index: 0,
@@ -2367,6 +2403,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
@@ -2378,6 +2415,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 4,
                     parent_index: 0, // Root as parent
@@ -2398,6 +2436,7 @@ mod tests {
                 is_accessible: false,
                 focus_draws: false,
                 ime_ui_owned: false,
+                pointer_reacts: false,
                 children_count: 0,
                 children_index: 1,
                 parent_index: 2,
@@ -2509,6 +2548,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 3,
                     children_index: 1,
                     parent_index: 0,
@@ -2520,6 +2560,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 4,
                     parent_index: 0,
@@ -2534,6 +2575,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 4,
                     parent_index: 0,
@@ -2556,6 +2598,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 2,
@@ -2579,6 +2622,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 1,
@@ -2589,6 +2633,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 2,
                     parent_index: 0,
@@ -2731,6 +2776,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 2,
                     children_index: 1,
                     parent_index: 0,
@@ -2742,6 +2788,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 4,
                     parent_index: 0,
@@ -2763,6 +2810,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 1,
                     parent_index: 1,
@@ -2781,6 +2829,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 1,
                     parent_index: 1,
@@ -2799,6 +2848,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 1,
                     parent_index: 1,
@@ -2853,6 +2903,7 @@ mod tests {
             is_accessible: false,
             focus_draws: false,
             ime_ui_owned: false,
+            pointer_reacts: false,
             children_count: 0,
             children_index: 1,
             parent_index: 0,
@@ -2876,6 +2927,7 @@ mod tests {
                 is_accessible: false,
                 focus_draws: false,
                 ime_ui_owned: false,
+                pointer_reacts: false,
                 children_count: 1,
                 children_index: 1,
                 parent_index: 0,
@@ -2886,6 +2938,7 @@ mod tests {
                 is_accessible: false,
                 focus_draws: false,
                 ime_ui_owned: false,
+                pointer_reacts: false,
                 children_count: 0,
                 children_index: 2,
                 parent_index: 0,
@@ -2913,6 +2966,7 @@ mod tests {
                 is_accessible: false,
                 focus_draws: false,
                 ime_ui_owned: false,
+                pointer_reacts: false,
                 children_count: 3,
                 children_index: 1,
                 parent_index: 0,
@@ -2923,6 +2977,7 @@ mod tests {
                 is_accessible: false,
                 focus_draws: false,
                 ime_ui_owned: false,
+                pointer_reacts: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -2933,6 +2988,7 @@ mod tests {
                 is_accessible: false,
                 focus_draws: false,
                 ime_ui_owned: false,
+                pointer_reacts: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -2943,6 +2999,7 @@ mod tests {
                 is_accessible: false,
                 focus_draws: false,
                 ime_ui_owned: false,
+                pointer_reacts: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -2990,6 +3047,7 @@ mod tests {
                         is_accessible: false,
                         focus_draws: false,
                         ime_ui_owned: false,
+                        pointer_reacts: false,
                         children_count: 1,
                         children_index: 1,
                         parent_index: 0,
@@ -3001,6 +3059,7 @@ mod tests {
                         is_accessible: false,
                         focus_draws: false,
                         ime_ui_owned: false,
+                        pointer_reacts: false,
                         children_count: 1,
                         children_index: 2, // Monotonic increasing
                         parent_index: 0,
@@ -3012,6 +3071,7 @@ mod tests {
                         is_accessible: false,
                         focus_draws: false,
                         ime_ui_owned: false,
+                        pointer_reacts: false,
                         children_count: 0,
                         children_index: 3, // Not relevant because it has no children
                         parent_index: 1,
@@ -3160,6 +3220,7 @@ mod tests {
                         is_accessible: false,
                         focus_draws: false,
                         ime_ui_owned: false,
+                        pointer_reacts: false,
                         children_count: 1,
                         children_index: 1,
                         parent_index: 0,
@@ -3170,6 +3231,7 @@ mod tests {
                         is_accessible: false,
                         focus_draws: false,
                         ime_ui_owned: false,
+                        pointer_reacts: false,
                         children_count: 1,
                         children_index: 2,
                         parent_index: 0,
@@ -3180,6 +3242,7 @@ mod tests {
                         is_accessible: false,
                         focus_draws: false,
                         ime_ui_owned: false,
+                        pointer_reacts: false,
                         children_count: 1,
                         children_index: 3,
                         parent_index: 1,
@@ -3190,6 +3253,7 @@ mod tests {
                         is_accessible: false,
                         focus_draws: false,
                         ime_ui_owned: false,
+                        pointer_reacts: false,
                         children_count: 0,
                         children_index: 4,
                         parent_index: 2,
@@ -3418,6 +3482,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 0,
@@ -3441,6 +3506,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 1, // The index in the parent item tree
@@ -3452,6 +3518,7 @@ mod tests {
                     is_accessible: false,
                     focus_draws: false,
                     ime_ui_owned: false,
+                    pointer_reacts: false,
                     children_count: 0,
                     children_index: 0,
                     parent_index: 0,

@@ -858,6 +858,7 @@ impl RenderHost {
                         focus_on_tab: c.focus_on_tab,
                         focus_draws: c.focus_draws,
                         ime_ui_owned: c.ime_ui_owned,
+                        pointer_reacts: c.pointer_reacts,
                     })
                 };
                 let adapter = tl.adapter.borrow().clone();
@@ -1186,6 +1187,16 @@ impl RenderHost {
     /// value the drawing side holds.
     pub fn ime_ui_owned(&self, id: u64) -> bool {
         self.control_coord(id).is_some_and(|c| c.ime_ui_owned)
+    }
+
+    /// Whether the application reacts to a pointer event on the control with
+    /// this id.
+    ///
+    /// The compiler worked this out per element and the render thread
+    /// publishes it; the UI thread reads it to decide whether a pointer event
+    /// has to be sent on at all.
+    pub fn pointer_reacts(&self, id: u64) -> bool {
+        self.control_coord(id).is_some_and(|c| c.pointer_reacts)
     }
 
     /// The control the drawing tree last published as having the focus.
@@ -3340,6 +3351,7 @@ fn publish_control_coords(
                 focus_on_tab: c.focus_on_tab,
                 focus_draws: c.focus_draws,
                 ime_ui_owned: c.ime_ui_owned,
+                pointer_reacts: c.pointer_reacts,
             },
         );
     }

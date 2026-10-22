@@ -516,6 +516,13 @@ pub struct TreeNode {
     /// alone, whether the value it reads from its own tree is the one the input
     /// method is told.
     pub ime_ui_owned: bool,
+    /// Whether the application reacts to a pointer event on this node's item.
+    ///
+    /// Decided per element by the `property_ownership` pass before the
+    /// lowering, and carried into the item tree so the UI thread can tell, from
+    /// a control id alone, whether a pointer event on this control has to reach
+    /// the drawing thread at all.
+    pub pointer_reacts: bool,
     /// If set, this node's children have dynamic z-ordering.
     /// Each entry corresponds to a child (by index) and gives its z value.
     /// The code generator will evaluate these on every children visit and sort the

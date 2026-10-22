@@ -71,11 +71,13 @@ const RUNTIME_PROPERTIES: &[(&str, Drawing, Input)] = &[
 ];
 
 /// The pointer properties, as the set the pointer answers are derived from.
-const POINTER_PROPERTIES: [&str; 7] =
-    ["pressed", "has-hover", "mouse-x", "mouse-y", "pressed-x", "pressed-y", "mouse-cursor"];
-
-/// The pointer state that shows on screen when the application binds it.
-const VISIBLE_POINTER_PROPERTIES: [&str; 2] = ["pressed", "has-hover"];
+///
+/// These are the values a pointer leaves on a control: where it is and what it
+/// does there.  The cursor is not among them: the application sets it rather
+/// than reads it, so it says nothing about whether the application cares
+/// about the pointer.
+const POINTER_PROPERTIES: [&str; 6] =
+    ["pressed", "has-hover", "mouse-x", "mouse-y", "pressed-x", "pressed-y"];
 
 /// The callbacks an application can bind that a pointer event runs.
 ///
@@ -112,8 +114,7 @@ pub fn property_ownership(doc: &Document) {
             elem.property_ownership = ownership.into();
             elem.focus_draws = answers.focus_draws;
             elem.ime_ui_owned = answers.ime_ui_owned;
-            elem.pointer_draws = answers.pointer_draws;
-            elem.pointer_handled = answers.pointer_handled;
+            elem.pointer_reacts = answers.pointer_reacts;
         });
     });
 
@@ -220,10 +221,8 @@ struct DerivedAnswers {
     focus_draws: bool,
     /// Whether this element has an input-method value the UI thread owns.
     ime_ui_owned: bool,
-    /// Whether this element's pointer state shows on screen.
-    pointer_draws: bool,
     /// Whether the application reacts to a pointer event on this element.
-    pointer_handled: bool,
+    pointer_reacts: bool,
 }
 
 /// Derive the answers the runtime asks about a control from the ownership of
@@ -236,8 +235,6 @@ fn derived_answers(
 
     // A pointer callback bound by the application runs in the tree, which is
     // the drawing side's, so a pointer event on this element has to reach it.
-    // The pointer values themselves stay where they are: the handler gets the
-    // event, not the state.
     let pointer_callback_bound =
         POINTER_CALLBACKS.iter().any(|name| elem_ref.binding(name).is_some());
 
@@ -247,14 +244,15 @@ fn derived_answers(
         .get("input-method-hints")
         .is_some_and(|owner| matches!(owner, PropertyOwnership::Ui));
 
-    let pointer_draws = VISIBLE_POINTER_PROPERTIES
+    // The pointer state the application reads belongs to both threads, so the
+    // drawing side has to be told what the pointer is doing.  A handler the
+    // application bound says the same from the other end: the event has to
+    // reach the code that answers it.
+    let pointer_state_read = POINTER_PROPERTIES
         .iter()
-        .any(|name| ownership.get(*name).is_some_and(|owner| owner.render_holds()));
+        .any(|name| matches!(ownership.get(*name), Some(PropertyOwnership::Shared)));
 
-    let pointer_handled = pointer_callback_bound
-        || POINTER_PROPERTIES
-            .iter()
-            .any(|name| ownership.get(*name).is_some_and(|owner| owner.render_holds()));
+    let pointer_reacts = pointer_callback_bound || pointer_state_read;
 
-    DerivedAnswers { focus_draws, ime_ui_owned, pointer_draws, pointer_handled }
+    DerivedAnswers { focus_draws, ime_ui_owned, pointer_reacts }
 }

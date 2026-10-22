@@ -211,6 +211,13 @@ pub struct ControlRegion {
     /// platform's input method is told and nothing draws has it read from the
     /// UI thread's own tree rather than being handed it from here.
     pub ime_ui_owned: bool,
+    /// Whether the application reacts to a pointer event on this control.
+    ///
+    /// The compiler worked this out per element from the `.slint` source and
+    /// stored it in the item tree; the render thread is only publishing it.  A
+    /// pointer event on a control the application does not react to changes
+    /// nothing on screen, so the UI thread need not send it on.
+    pub pointer_reacts: bool,
 }
 
 /// Logical-coordinate entry in the shared coordinate table.  Published by the
@@ -242,6 +249,11 @@ pub struct ControlCoord {
     /// Whether this control has an input-method value the UI thread owns, so the
     /// UI thread reads it from its own tree rather than from the drawing side.
     pub ime_ui_owned: bool,
+    /// Whether the application reacts to a pointer event on this control.
+    ///
+    /// Published so the UI thread — which owns the pointer — can tell whether a
+    /// pointer event on this control has to reach the drawing thread at all.
+    pub pointer_reacts: bool,
 }
 
 impl ControlCoord {
