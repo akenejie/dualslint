@@ -1236,7 +1236,7 @@ impl Item for TextInput {
                 if !self.read_only() {
                     if let Some(w) = window_adapter.internal(crate::InternalToken) {
                         w.input_method_request(InputMethodRequest::Enable(
-                            self.ime_properties(window_adapter, self_rc),
+                            self.input_method_properties(window_adapter, self_rc),
                         ));
                     }
 
@@ -1774,7 +1774,7 @@ impl TextInput {
         }
         if let Some(w) = window_adapter.internal(crate::InternalToken) {
             w.input_method_request(InputMethodRequest::Update(
-                self.ime_properties(window_adapter, self_rc),
+                self.input_method_properties(window_adapter, self_rc),
             ));
         }
     }
@@ -1866,7 +1866,15 @@ impl TextInput {
         self.cursor_affinity.get()
     }
 
-    fn ime_properties(
+    /// The values the platform's input method is told about this control.
+    ///
+    /// The values come from the item's own properties and from the geometry the
+    /// font shaper produced, so they can only be assembled where the item lives.
+    /// That is the render thread, but talking to the platform's input method is
+    /// the UI thread's business, so this is offered as an equal API: the UI
+    /// thread asks for these values when it decides to, rather than being
+    /// handed them on a frame it did not ask about.
+    pub fn input_method_properties(
         self: Pin<&Self>,
         window_adapter: &Rc<dyn WindowAdapter>,
         self_rc: &ItemRc,
@@ -2260,7 +2268,7 @@ impl TextInput {
             && let Some(w) = window_adapter.internal(crate::InternalToken)
         {
             w.input_method_request(InputMethodRequest::Enable(
-                self.ime_properties(window_adapter, self_rc),
+                self.input_method_properties(window_adapter, self_rc),
             ));
         }
     }

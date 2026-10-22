@@ -31,6 +31,26 @@ pub fn send_mouse_click<
     );
 }
 
+/// Simulate a press and release at `(x, y)`, carrying the UI thread's focus
+/// choice on the press. Backends that decide the focus use this seam; here it
+/// stands in for one, without a second tree.
+pub fn send_mouse_click_with_ui_focus<
+    X: vtable::HasStaticVTable<ItemTreeVTable> + 'static,
+    Component: Into<vtable::VRc<ItemTreeVTable, X>> + ComponentHandle,
+>(
+    component: &Component,
+    x: f32,
+    y: f32,
+    ui_focused: Option<u64>,
+) {
+    crate::testing_backend::send_mouse_click_with_ui_focus(
+        x,
+        y,
+        ui_focused,
+        &WindowInner::from_pub(component.window()).window_adapter(),
+    );
+}
+
 /// Simulate entering a sequence of ascii characters key by key.
 pub fn send_keyboard_string_sequence<
     X: vtable::HasStaticVTable<ItemTreeVTable>,
@@ -254,4 +274,63 @@ pub fn set_key_target<
     id: Option<u64>,
 ) {
     WindowInner::from_pub(component.window()).set_key_target(id);
+}
+
+/// Carry the UI thread's focus answer for the duration of one event, the way a
+/// backend does when it sends a press whose `has-focus` only the UI thread knows.
+pub fn set_ui_focused_id<
+    X: vtable::HasStaticVTable<ItemTreeVTable> + 'static,
+    Component: Into<vtable::VRc<ItemTreeVTable, X>> + ComponentHandle,
+>(
+    component: &Component,
+    id: Option<u64>,
+) {
+    WindowInner::from_pub(component.window()).set_ui_focused_id(id);
+}
+
+/// The item the tree itself has the focus on, as a stable id. Used to say what
+/// the core-focused path does when a backend is not deciding the focus.
+pub fn focused_item_id<
+    X: vtable::HasStaticVTable<ItemTreeVTable> + 'static,
+    Component: Into<vtable::VRc<ItemTreeVTable, X>> + ComponentHandle,
+>(
+    component: &Component,
+) -> Option<u64> {
+    WindowInner::from_pub(component.window())
+        .focus_item
+        .borrow()
+        .upgrade()
+        .map(|item| item.stable_id())
+}
+
+/// The stable id of the `FocusScope` at `(x, y)` in the window's tree, so a test
+/// can name the control a press would focus without going through the backend.
+pub fn focus_scope_id_at<
+    X: vtable::HasStaticVTable<ItemTreeVTable> + 'static,
+    Component: Into<vtable::VRc<ItemTreeVTable, X>> + ComponentHandle,
+>(
+    component: &Component,
+    x: f32,
+    y: f32,
+) -> Option<u64> {
+    let inner = WindowInner::from_pub(component.window());
+    let tree = inner.try_component()?;
+    let point = i_slint_core::lengths::LogicalPoint::new(x, y);
+    let mut found = None;
+    i_slint_core::item_tree::visit_items(
+        &tree,
+        i_slint_core::item_tree::TraversalOrder::FrontToBack,
+        |component, _item, index, _state| {
+            let item = i_slint_core::item_tree::ItemRc::new(component.clone(), index);
+            if item.downcast::<i_slint_core::items::FocusScope>().is_some() {
+                let geometry = item.geometry();
+                if geometry.contains(point) && !geometry.size.is_empty() {
+                    found = Some(item.stable_id());
+                }
+            }
+            i_slint_core::item_tree::ItemVisitorResult::Continue(())
+        },
+        (),
+    );
+    found
 }

@@ -125,6 +125,28 @@ slint::slint! {
             key-pressed(event) => { root.right-keys += 1; EventResult.accept }
         }
     }
+
+    // A focus scope whose focus state is read by nothing, so the compiler drops
+    // it from the drawing side. A backend that decides the focus keeps it on
+    // the UI thread, and the press still has to see that the scope is focused:
+    // a focused scope ignores the press instead of consuming it. A `TouchArea`
+    // behind it counts the presses that reach the tree, because a consumed press
+    // never gets there.
+    export component QuietFocusApp inherits Window {
+        width: 320px;
+        height: 240px;
+        in-out property <int> reached: 0;
+        area := TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.reached += 1; }
+        }
+        scope := FocusScope {
+            width: 100%;
+            height: 100%;
+            focus-on-click: true;
+        }
+    }
 }
 
 /// The window adapter of a backend that drew a tree of its own.
@@ -588,5 +610,46 @@ fn a_named_control_receives_the_key_whatever_the_focus_is() {
         (app.get_left_keys(), app.get_right_keys()),
         (1, 1),
         "with no target and no focused scope, the key reaches neither"
+    );
+}
+
+/// The focus a control draws nothing for stays on the UI thread, so the tree
+/// never sees it -- and the press that caused it has to be told, or a focused
+/// `FocusScope` would consume a press it should ignore.
+#[test]
+fn a_press_sees_the_focus_the_ui_thread_kept_to_itself() {
+    let platform = PlatformShowingTree::install();
+    let app = QuietFocusApp::new().expect("the platform makes windows");
+    let adapter = platform.adapter_of_last_window();
+    adapter.focus_decided_by_ui.set(true);
+
+    let scope = i_slint_backend_testing::focus_scope_id_at(&app, 160.0, 120.0)
+        .expect("the scope covers the window");
+
+    // First press: the UI thread does not yet name the scope, so the scope
+    // accepts the press (it takes the focus on click) and the event is consumed
+    // before the `TouchArea` behind it -- exactly as the core does when it
+    // decides the focus itself.
+    i_slint_backend_testing::send_mouse_click_with_ui_focus(&app, 160.0, 120.0, None);
+    assert_eq!(app.get_reached(), 0, "the press that took the focus was consumed");
+
+    // Second press: the UI thread already has the focus on the scope, and that
+    // travels with the press. A focused `FocusScope` ignores the press instead
+    // of consuming it, so it falls through to the `TouchArea` and the click is
+    // counted -- the behaviour a shared backend has, reproduced with the focus
+    // the UI thread kept to itself.
+    i_slint_backend_testing::send_mouse_click_with_ui_focus(&app, 160.0, 120.0, Some(scope));
+    assert_eq!(
+        app.get_reached(),
+        1,
+        "a press on the focused scope falls through to what is behind"
+    );
+
+    // The tree's own focus is never set for a control that draws no focus, so
+    // the carried id is the only thing that could have said it was focused.
+    assert_eq!(
+        i_slint_backend_testing::focused_item_id(&app),
+        None,
+        "the drawing side was left out of a focus it does not draw"
     );
 }

@@ -381,6 +381,19 @@ pub enum RenderMessage {
         /// a text control.
         response: std::sync::mpsc::SyncSender<Option<CursorGeometry>>,
     },
+    /// Read the values a text control tells the platform's input method.
+    ///
+    /// Talking to the input method is a UI thread's business, but the values
+    /// come from the item's properties and from the geometry the font shaper
+    /// produced, so only this thread can assemble them.  The UI thread asks
+    /// when it decides to, rather than being handed them on every frame.
+    InputMethodProperties {
+        /// The control id (as published in the shared coordinate table).
+        id: u64,
+        /// Reply channel carrying the values, or `None` when the id is not a
+        /// text control.
+        response: std::sync::mpsc::SyncSender<Option<i_slint_core::window::InputMethodProperties>>,
+    },
     /// A click landed on a render-owned control.
     ///
     /// The UI thread resolved the pointer against the composited geometry and
@@ -430,6 +443,15 @@ pub enum RenderMessage {
         /// control would make every drag start from a place the pointer was
         /// never at.
         position: LogicalPoint,
+        /// The control the UI thread considered focused when the pointer went
+        /// down, if any.
+        ///
+        /// A control whose focus state draws nothing is never told about the
+        /// focus, so the tree's own `has-focus` does not know that the UI thread
+        /// already focused it.  Its press handling does have to know, because
+        /// upstream a focused `FocusScope` ignores the press instead of taking
+        /// it, so the answer travels with the press it belongs to.
+        ui_focused: Option<u64>,
     },
     /// The pointer moved while a press was held: a drag.
     ///
@@ -468,6 +490,18 @@ pub enum RenderMessage {
     /// changes its answer because the focus moved under it.
     SetControlFocus {
         /// The control to focus, as published in the shared coordinate table.
+        id: u64,
+    },
+    /// The UI thread decided the focus left a control whose focus state is
+    /// drawn, and the tree here takes it off.
+    ///
+    /// The UI thread owns the focus, but a control that draws its focus has to
+    /// be told when it loses it, or it keeps painting the focused look.  The id
+    /// names the control the UI thread believes the tree is focused on; the
+    /// tree clears the focus only when it agrees, so a focus a `.slint` file
+    /// moved on its own is not taken away by a stale decision.
+    ClearControlFocus {
+        /// The control the UI thread believes holds the focus.
         id: u64,
     },
     /// The UI thread resolved a wheel event to a control: this control is the
@@ -822,6 +856,7 @@ impl RenderHost {
                         ),
                         focus_on_click: c.focus_on_click,
                         focus_on_tab: c.focus_on_tab,
+                        focus_draws: c.focus_draws,
                     })
                 };
                 let adapter = tl.adapter.borrow().clone();
@@ -880,8 +915,9 @@ impl RenderHost {
         id: u64,
         button: PointerEventButton,
         position: LogicalPoint,
+        ui_focused: Option<u64>,
     ) -> bool {
-        self.sender.send(RenderMessage::PressControl { id, button, position }).is_ok()
+        self.sender.send(RenderMessage::PressControl { id, button, position, ui_focused }).is_ok()
     }
 
     /// Tell the tree that the pointer moved while the press was held.
@@ -1129,6 +1165,30 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::SetControlFocus { id });
     }
 
+    /// Take the focus off a control whose focus state is drawn.
+    ///
+    /// The UI thread decided the focus moved to a control whose focus is not
+    /// drawn there, so nothing in the tree reads `has-focus` for it.  The
+    /// control that had it before may still paint the focused look, and only
+    /// the tree can stop that: the id says which one the UI thread believes is
+    /// focused, and the tree clears it only if it agrees.
+    pub fn clear_control_focus(&self, id: u64) {
+        let _ = self.sender.send(RenderMessage::ClearControlFocus { id });
+    }
+
+    /// The control the drawing tree last published as having the focus.
+    ///
+    /// A `.slint` file can move the focus without the UI thread asking, so the
+    /// UI thread reads the answer here rather than trusting its own memory.
+    pub fn focused_control(&self) -> Option<u64> {
+        if on_render_thread() {
+            if let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().focused()) {
+                return r;
+            }
+        }
+        self.coords.lock().unwrap().focused()
+    }
+
     /// Measure a text control's caret, off the font the render thread shaped.
     ///
     /// The caret is drawn here, but the platform's input method is told where it
@@ -1139,6 +1199,22 @@ impl RenderHost {
     pub fn cursor_geometry(&self, id: u64, query: CursorQuery) -> Option<CursorGeometry> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Option<CursorGeometry>>(1);
         let _ = self.sender.send(RenderMessage::CursorGeometry { id, query, response: tx });
+        rx.recv().unwrap_or(None)
+    }
+
+    /// Read the values a text control tells the platform's input method.
+    ///
+    /// Talking to the input method is a UI thread's business, but the values
+    /// come from the item's properties and from the geometry this thread shaped,
+    /// so only this thread can assemble them.  The UI thread asks here when it
+    /// decides to, rather than being handed them on every frame.
+    pub fn input_method_properties(
+        &self,
+        id: u64,
+    ) -> Option<i_slint_core::window::InputMethodProperties> {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Option<i_slint_core::window::InputMethodProperties>>(1);
+        let _ = self.sender.send(RenderMessage::InputMethodProperties { id, response: tx });
         rx.recv().unwrap_or(None)
     }
 
@@ -1772,7 +1848,33 @@ impl RenderCore {
                         });
                         let _ = response.send(value);
                     }
-                    RenderMessage::PressControl { id, button, position } => {
+                    RenderMessage::InputMethodProperties { id, response } => {
+                        // Reading the values changes nothing on screen either:
+                        // the caller is asking what to tell the platform, not
+                        // moving or drawing anything.
+                        let value = render_window_adapter.as_ref().and_then(|adapter| {
+                            render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                                let text_input =
+                                    item_rc.downcast::<i_slint_core::items::TextInput>()?;
+                                Some(
+                                    text_input
+                                        .as_pin_ref()
+                                        .input_method_properties(adapter, &item_rc),
+                                )
+                            })
+                        });
+                        let _ = response.send(value);
+                    }
+                    RenderMessage::PressControl { id, button, position, ui_focused } => {
+                        // The press handler in the tree asks whether the control
+                        // already has the focus, and for one whose focus state is
+                        // not drawn here the answer only exists on the UI thread.
+                        // It travels with the press and is taken back out after,
+                        // so it cannot leak into an unrelated event.
+                        let window = render_window_adapter.as_ref().map(|adapter| adapter.window());
+                        if let Some(window) = window {
+                            WindowInner::from_pub(window).set_ui_focused_id(ui_focused);
+                        }
                         present |= send_pointer_event_to_control(
                             render_window_adapter.as_ref(),
                             render_controls.get(&id),
@@ -1780,6 +1882,9 @@ impl RenderCore {
                             button,
                             position,
                         );
+                        if let Some(window) = window {
+                            WindowInner::from_pub(window).set_ui_focused_id(None);
+                        }
                     }
                     RenderMessage::MoveControl { position, finger_id } => {
                         present |= send_pointer_move_to_tree(
@@ -1812,10 +1917,30 @@ impl RenderCore {
                                 true,
                                 FocusReason::PointerClick,
                             );
-                            // The compiler found out whether anything on screen
-                            // reacts to focus. When nothing does, this redraw
-                            // would draw the same pixels again.
-                            present |= WindowInner::from_pub(window).focus_affects_rendering();
+                            // The compiler found out whether this control's focus
+                            // state reaches the screen. When it does not, this
+                            // redraw would draw the same pixels again.
+                            present |= item_rc.focus_draws();
+                        }
+                    }
+                    RenderMessage::ClearControlFocus { id } => {
+                        // Only clear the control the UI thread named: a `.slint`
+                        // file can move the focus on its own, and a stale UI
+                        // decision must not take that focus away.
+                        if let Some(adapter) = render_window_adapter.as_ref()
+                            && let Some(item_rc) = render_item_rcs.borrow().get(&id).cloned()
+                            && let Some(focused) = WindowInner::from_pub(adapter.window())
+                                .focus_item
+                                .borrow()
+                                .upgrade()
+                            && focused == item_rc
+                        {
+                            WindowInner::from_pub(adapter.window()).set_focus_item(
+                                &item_rc,
+                                false,
+                                FocusReason::PointerClick,
+                            );
+                            present = true;
                         }
                     }
                     RenderMessage::ScrollControl { id, position, delta_x, delta_y } => {
@@ -1994,7 +2119,7 @@ fn publish_mirror_controls(
     // side effect of compositing an encoded frame, does not run there, and
     // without this the UI thread would hit-test an empty table and no pointer
     // event would ever reach a control.
-    publish_control_coords(coords, &table.controls, interaction);
+    publish_control_coords(coords, &table.controls, interaction, table.focused);
     true
 }
 
@@ -2216,6 +2341,7 @@ fn with_control_property<T>(
             "font-family" => f(&ControlPropertyRef::Text(&item.font_family)),
             "color" => f(&ControlPropertyRef::Color(&item.color)),
             "font-size" => f(&ControlPropertyRef::Number(&item.font_size)),
+            "read-only" => f(&ControlPropertyRef::Bool(&item.read_only)),
             _ => return None,
         });
     }
@@ -3183,9 +3309,11 @@ fn publish_control_coords(
     map: &Arc<Mutex<PublishedControls>>,
     controls: &[ControlRegion],
     interaction: &ControlInteraction,
+    focused: Option<u64>,
 ) {
     let mut map = map.lock().unwrap();
     map.clear();
+    map.set_focused(focused);
     for c in controls {
         map.insert(
             c.id,
@@ -3198,6 +3326,7 @@ fn publish_control_coords(
                 pressed: interaction.is_pressed(c.id),
                 focus_on_click: c.focus_on_click,
                 focus_on_tab: c.focus_on_tab,
+                focus_draws: c.focus_draws,
             },
         );
     }

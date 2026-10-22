@@ -699,6 +699,13 @@ pub struct WindowInner {
     /// UI thread routes input while leaving the focus for appearance to this
     /// tree.
     key_target: Cell<Option<u64>>,
+    /// The item the UI thread last said had the focus, as a stable id.
+    ///
+    /// The focus of a control whose focus state draws nothing never reaches this
+    /// tree, so the tree cannot answer `has-focus` for it.  An event that needs
+    /// that answer -- a press deciding whether to take the focus or ignore it --
+    /// carries it for the length of its dispatch.
+    ui_focused_id: Cell<Option<u64>>,
     focus_item_visibility_tracker: ChangeTracker,
     focus_item_position_tracker: ChangeTracker,
     /// The last text that was sent to the input method
@@ -815,6 +822,7 @@ impl WindowInner {
             }),
             focus_item: Default::default(),
             key_target: Cell::new(None),
+            ui_focused_id: Cell::new(None),
             focus_item_visibility_tracker: Default::default(),
             focus_item_position_tracker: Default::default(),
             last_ime_text: Default::default(),
@@ -1390,6 +1398,25 @@ impl WindowInner {
     #[doc(hidden)]
     pub fn key_target(&self) -> Option<u64> {
         self.key_target.get()
+    }
+
+    /// Carry the UI thread's focus answer for the duration of an event.
+    ///
+    /// The UI thread owns the focus, but it only asks this tree to apply it when
+    /// applying it would change what is drawn.  A control whose focus state is
+    /// not drawn therefore never gets it, and its `has-focus` property stays
+    /// false even though the UI thread has focused it.  An event whose handling
+    /// asks that question -- a press on a `FocusScope` -- carries the answer,
+    /// so it sees the same focus a shared backend's tree would.
+    #[doc(hidden)]
+    pub fn set_ui_focused_id(&self, id: Option<u64>) {
+        self.ui_focused_id.set(id);
+    }
+
+    /// The focus the UI thread carried with the event being dispatched.
+    #[doc(hidden)]
+    pub fn ui_focused_id(&self) -> Option<u64> {
+        self.ui_focused_id.get()
     }
 
     /// Report that the in-flight native drag finished with `action`.

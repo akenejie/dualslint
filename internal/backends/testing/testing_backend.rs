@@ -83,6 +83,34 @@ pub fn send_mouse_click(x: f32, y: f32, window_adapter: &i_slint_core::window::W
 }
 
 #[cfg(any(feature = "internal", feature = "ffi"))]
+/// Simulate a press at (`x`, `y`), carrying `ui_focused` as the focus the UI
+/// thread has chosen, and release at the same position.
+///
+/// This is what a backend does when it decides the focus itself: the focus of a
+/// control that draws none never reaches the tree, so the press carries it. It
+/// is the seam the split focus relies on, so it can be tested without one.
+pub fn send_mouse_click_with_ui_focus(
+    x: f32,
+    y: f32,
+    ui_focused: Option<u64>,
+    window_adapter: &i_slint_core::window::WindowAdapterRc,
+) {
+    use i_slint_core::api::LogicalPosition;
+    use i_slint_core::items::PointerEventButton;
+    use i_slint_core::platform::WindowEvent;
+
+    let position = LogicalPosition::new(x, y);
+    let button = PointerEventButton::Left;
+
+    WindowInner::from_pub(window_adapter.window()).set_ui_focused_id(ui_focused);
+    window_adapter.window().dispatch_event(WindowEvent::PointerMoved { position });
+    window_adapter.window().dispatch_event(WindowEvent::PointerPressed { position, button });
+    WindowInner::from_pub(window_adapter.window()).set_ui_focused_id(None);
+    mock_elapsed_time(50);
+    window_adapter.window().dispatch_event(WindowEvent::PointerReleased { position, button });
+}
+
+#[cfg(any(feature = "internal", feature = "ffi"))]
 /// Dispatch a single key press or release event.
 pub fn send_keyboard_key_text(
     text: &i_slint_core::SharedString,

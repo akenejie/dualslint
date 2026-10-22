@@ -196,6 +196,14 @@ pub struct ControlRegion {
     /// control has the focus, so it also owns what Tab moves through, and the
     /// render thread — which sees the property — publishes the set here.
     pub focus_on_tab: bool,
+    /// Whether moving the focus onto this control can change what is drawn.
+    ///
+    /// The compiler worked this out per element from the `.slint` source and
+    /// stored it in the item tree; the render thread is only publishing it.  A
+    /// control whose focus state nothing reads and that does not paint it has
+    /// no reason to be told about a focus change, so the UI thread keeps that
+    /// control's focus to itself.
+    pub focus_draws: bool,
 }
 
 /// Logical-coordinate entry in the shared coordinate table.  Published by the
@@ -219,6 +227,11 @@ pub struct ControlCoord {
     /// Whether Tab moves the focus through this control, a property of the
     /// control that only the render thread can read.
     pub focus_on_tab: bool,
+    /// Whether moving the focus onto this control can change what is drawn.
+    ///
+    /// Published so the UI thread — which owns the focus — can tell whether a
+    /// focus change is something the drawing thread has to hear about.
+    pub focus_draws: bool,
 }
 
 impl ControlCoord {
@@ -280,12 +293,30 @@ pub struct PublishedControls {
     /// Geometry and state by control id.
     pub by_id: CoordinateMap,
     order: Vec<u64>,
+    /// The item the tree held the focus on when this table was written.
+    ///
+    /// The UI thread owns which control keys go to, but a `.slint` file can move
+    /// the drawing tree's focus on its own, so the answer is published back
+    /// rather than remembered from the last click. Read it with
+    /// [`Self::focused`].
+    focused: Option<u64>,
 }
 
 impl PublishedControls {
     pub fn clear(&mut self) {
         self.by_id.clear();
         self.order.clear();
+        self.focused = None;
+    }
+
+    /// The control the drawing tree had the focus on at the last publish.
+    pub fn focused(&self) -> Option<u64> {
+        self.focused
+    }
+
+    /// Record which control the drawing tree has the focus on.
+    pub fn set_focused(&mut self, focused: Option<u64>) {
+        self.focused = focused;
     }
 
     /// Record a control, appending it to the paint order.

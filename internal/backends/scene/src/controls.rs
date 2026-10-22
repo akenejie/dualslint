@@ -96,13 +96,18 @@ pub struct ControlEncoder<'a> {
     /// which owns the tree — can loan out its properties.  The `ItemRc`s are
     /// not `Send` and stay on the thread that encoded them.
     item_refs: Vec<(u64, ItemRc)>,
+    /// The id of the item this tree has the focus on, read when the walk starts.
+    focused: Option<u64>,
     scale_factor: ScaleFactor,
 }
 
 impl<'a> ControlEncoder<'a> {
     pub fn new(window_inner: &'a WindowInner) -> Self {
         let scale_factor = ScaleFactor::new(window_inner.scale_factor());
-        Self { window_inner, controls: Vec::new(), item_refs: Vec::new(), scale_factor }
+        // A `.slint` file can move the focus on its own, so the answer is read
+        // from the tree rather than taken from the UI thread's last decision.
+        let focused = window_inner.focus_item.borrow().upgrade().map(|item| item.stable_id());
+        Self { window_inner, controls: Vec::new(), item_refs: Vec::new(), focused, scale_factor }
     }
 
     /// Publish this item as a control region: a target for hit-testing and for
@@ -126,6 +131,7 @@ impl<'a> ControlEncoder<'a> {
             geometry: LogicalRect::new(window_origin, geometry.size),
             focus_on_click: focus_on_click(item),
             focus_on_tab: focus_on_tab(item),
+            focus_draws: item.focus_draws(),
         });
         self.item_refs.push((id, item.clone()));
     }
@@ -167,7 +173,7 @@ impl<'a> ControlEncoder<'a> {
     }
 
     fn finish(self) -> ControlTable {
-        ControlTable { controls: self.controls, item_refs: self.item_refs }
+        ControlTable { controls: self.controls, item_refs: self.item_refs, focused: self.focused }
     }
 }
 
@@ -346,6 +352,10 @@ pub struct ControlTable {
     /// The `ItemRc` behind each id in `controls`. Not `Send`, so this stays on
     /// the thread that encoded it.
     pub item_refs: Vec<(u64, ItemRc)>,
+    /// The id of the item the tree has the focus on, if it is a published
+    /// control. A `.slint` file can move the focus on its own, so the UI thread
+    /// reads the answer here instead of trusting its own last decision.
+    pub focused: Option<u64>,
 }
 
 /// The control geometry of a window, and the render-side `ItemRc` behind every
@@ -360,7 +370,7 @@ pub fn encode_window_controls(
     let window_adapter = window_inner.window_adapter();
     let size = window_adapter.size();
     if size.width == 0 || size.height == 0 {
-        return Ok(ControlTable { controls: Vec::new(), item_refs: Vec::new() });
+        return Ok(ControlTable { controls: Vec::new(), item_refs: Vec::new(), focused: None });
     }
 
     let mut encoder = ControlEncoder::new(window_inner);

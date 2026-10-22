@@ -671,10 +671,17 @@ impl Item for FocusScope {
         self_rc: &ItemRc,
         _: &mut MouseCursorInner,
     ) -> InputEventResult {
+        // The focus of a scope whose focus state draws nothing never reaches
+        // this tree, so `has_focus` cannot answer for it; the UI thread, which
+        // owns the focus, carries the answer with the press that needs it.
+        let ui_focused = WindowInner::from_pub(window_adapter.window())
+            .ui_focused_id()
+            .is_some_and(|id| id == self_rc.stable_id());
         if self.enabled()
             && self.focus_on_click()
             && matches!(event, MouseEvent::Pressed { .. })
             && !self.has_focus()
+            && !ui_focused
         {
             if !window_adapter.focus_is_decided_by_ui() {
                 WindowInner::from_pub(window_adapter.window()).set_focus_item(

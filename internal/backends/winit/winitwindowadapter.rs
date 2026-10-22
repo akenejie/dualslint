@@ -476,6 +476,12 @@ pub struct WinitWindowAdapter {
     /// answer here is the one the routing uses, so that a control that draws
     /// nothing for the focus is still the one keys go to.
     render_focused: Cell<Option<u64>>,
+    /// The control whose input method this thread has enabled, if any.
+    ///
+    /// Enabling and disabling the platform's input method is a UI thread's
+    /// business, so the UI thread keeps this to know whether it owes the
+    /// platform a change when the focus moves.
+    render_ime_focused: Cell<Option<u64>>,
     /// The button that is down, for as long as a press is held.
     ///
     /// Kept for the one release that arrives without a button of its own: the
@@ -549,6 +555,7 @@ impl WinitWindowAdapter {
             render_hovered: Default::default(),
             render_pressed: Default::default(),
             render_focused: Default::default(),
+            render_ime_focused: Default::default(),
             render_pressed_button: Default::default(),
             current_resize_direction: Default::default(),
             #[cfg(target_os = "ios")]
@@ -1351,6 +1358,17 @@ impl WinitWindowAdapter {
             )?;
         }
 
+        // The input method follows the window's activation as well as the
+        // focus: a window the user has left should leave the keyboard alone,
+        // and one they return to should bring it back to the focused control.
+        if let Some(host) = self.render_host() {
+            if have_focus {
+                self.sync_render_ime(&host);
+            } else if self.render_ime_focused.replace(None).is_some() {
+                self.input_method_request(corelib::window::InputMethodRequest::Disable);
+            }
+        }
+
         #[cfg(all(muda, target_os = "macos"))]
         {
             if let WinitWindowOrNone::HasWindow { muda_adapter, .. } =
@@ -1533,16 +1551,17 @@ impl WinitWindowAdapter {
                 // The press is the grab and the focus, and nothing else: whether
                 // the release that follows lands here is what makes a click.
                 if let Some(id) = target {
-                    host.press_control(id, button, position);
-                    // The focus is this thread's to decide, and the press is
-                    // where it is decided: the render thread published whether
-                    // this control takes it on a click, and the press is sent
-                    // first so the tree dispatches it before the focus moves,
-                    // which is what keeps a `FocusScope` from accepting the
-                    // press differently just because it now has the focus.
-                    if host.control_coord(id).is_some_and(|coord| coord.focus_on_click) {
-                        host.set_control_focus(id);
-                        self.render_focused.set(Some(id));
+                    // The press travels with the focus this thread already had:
+                    // a control whose focus state draws nothing never got it in
+                    // the tree, so the tree cannot answer `has-focus` for it, and
+                    // the press is where that question is asked. It goes first so
+                    // the tree dispatches it before the focus moves, which is
+                    // what keeps a `FocusScope` from accepting the press
+                    // differently just because it now has the focus.
+                    host.press_control(id, button, position, self.render_focused.get());
+                    if host.control_coord(id).is_some_and(|c| c.focus_on_click) {
+                        self.decide_focus(host, id);
+                        self.sync_render_ime(host);
                     }
                 }
             }
@@ -1669,10 +1688,17 @@ impl WinitWindowAdapter {
             // the tree would otherwise traverse is consumed here so the two do
             // not move the focus twice.
             if self.move_focus_by_tab(&host, event) {
+                // Tab moved the focus here, and the input method follows the
+                // focus: the control that just gained it is told to the platform.
+                self.sync_render_ime(&host);
                 return;
             }
             let target = self.render_focused.get();
             if host.send_key_to_control(event, target) {
+                // A key went into the focused control, which may have moved the
+                // caret or changed the text; the platform is told where it is
+                // now so a soft keyboard sits near the cursor.
+                self.sync_render_ime(&host);
                 return;
             }
         }
@@ -1724,9 +1750,73 @@ impl WinitWindowAdapter {
             None if backwards => *order.last().unwrap(),
             None => order[0],
         };
-        host.set_control_focus(next);
-        self.render_focused.set(Some(next));
+        self.decide_focus(host, next);
         true
+    }
+
+    /// Move the focus to a control, telling the drawing tree only when it has to
+    /// hear about it.
+    ///
+    /// The focus is the UI thread's to decide, and keys are routed by id, so a
+    /// control whose focus state is neither read nor painted keeps its focus
+    /// here and the drawing tree is left alone.  The control the tree was
+    /// focused on before may have been one that paints its focus, though, and it
+    /// has to be told that the focus left, or it keeps painting the focused look.
+    fn decide_focus(&self, host: &crate::render_thread::RenderHost, id: u64) {
+        self.render_focused.set(Some(id));
+        if host.control_coord(id).is_some_and(|c| c.focus_draws) {
+            host.set_control_focus(id);
+            return;
+        }
+        // The tree may be focused on a control of its own choosing (a `.slint`
+        // file can move the focus), so what it holds is read back rather than
+        // remembered from the last decision made here.
+        if let Some(drawn) = host.focused_control().filter(|drawn| *drawn != id)
+            && host.control_coord(drawn).is_none_or(|c| c.focus_draws)
+        {
+            host.clear_control_focus(drawn);
+        }
+    }
+
+    /// Bring the platform's input method in step with the focused control.
+    ///
+    /// Talking to the input method is a UI thread's business, so the UI thread
+    /// decides when to enable, update, or disable it.  The values themselves
+    /// come from the item, which lives on the render thread, and only that
+    /// thread shaped the font the caret rectangle is measured against, so they
+    /// are read back from there rather than assembled here.  A control that is
+    /// `read-only` takes no text, so it asks for no input method either.
+    fn sync_render_ime(&self, host: &crate::render_thread::RenderHost) {
+        let target = self.render_focused.get();
+        let previous = self.render_ime_focused.get();
+
+        let editable = target.is_some_and(|id| {
+            !matches!(
+                host.get_control_property(id, "read-only"),
+                Some(crate::render_thread::ControlPropertyValue::Bool(true))
+            )
+        });
+        let props =
+            if editable { target.and_then(|id| host.input_method_properties(id)) } else { None };
+
+        match props {
+            Some(props) => {
+                if previous == target {
+                    self.input_method_request(corelib::window::InputMethodRequest::Update(props));
+                } else {
+                    // The focused control has changed, so the platform is told
+                    // to start over rather than update an old rectangle.
+                    self.input_method_request(corelib::window::InputMethodRequest::Enable(props));
+                    self.render_ime_focused.set(target);
+                }
+            }
+            None => {
+                if previous.is_some() {
+                    self.input_method_request(corelib::window::InputMethodRequest::Disable);
+                    self.render_ime_focused.set(None);
+                }
+            }
+        }
     }
 
     /// Handles a winit window event for this window: applies the window event filter, feeds
