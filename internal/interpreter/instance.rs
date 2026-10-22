@@ -1068,6 +1068,7 @@ fn build_tree_nodes(
                 ItemTreeNode::Item {
                     is_accessible: node.is_accessible,
                     focus_draws: node.focus_draws,
+                    ime_ui_owned: node.ime_ui_owned,
                     children_count: node.children.len() as u32,
                     children_index: children_offset as u32,
                     parent_index,

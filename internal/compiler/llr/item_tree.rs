@@ -509,6 +509,13 @@ pub struct TreeNode {
     /// carried into the item tree so the UI thread can tell, from a control id
     /// alone, whether a focus change needs the drawing thread at all.
     pub focus_draws: bool,
+    /// Whether this node's item has an input-method value the UI thread owns.
+    ///
+    /// Decided per element by `ime_render_dependency` before the lowering, and
+    /// carried into the item tree so the UI thread can tell, from a control id
+    /// alone, whether the value it reads from its own tree is the one the input
+    /// method is told.
+    pub ime_ui_owned: bool,
     /// If set, this node's children have dynamic z-ordering.
     /// Each entry corresponds to a child (by index) and gives its z value.
     /// The code generator will evaluate these on every children visit and sort the

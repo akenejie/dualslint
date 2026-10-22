@@ -102,6 +102,7 @@ mod tests {
         let nodes = vec![ItemTreeNode::Item {
             is_accessible: false,
             focus_draws: false,
+            ime_ui_owned: false,
             children_count: 0,
             children_index: 1,
             parent_index: 0,
@@ -119,6 +120,7 @@ mod tests {
             ItemTreeNode::Item {
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 1,
                 children_index: 1,
                 parent_index: 0,
@@ -128,6 +130,7 @@ mod tests {
             ItemTreeNode::Item {
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 2,
                 parent_index: 0,
@@ -146,6 +149,7 @@ mod tests {
             ItemTreeNode::Item {
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 3,
                 children_index: 1,
                 parent_index: 0,
@@ -155,6 +159,7 @@ mod tests {
             ItemTreeNode::Item {
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -164,6 +169,7 @@ mod tests {
             ItemTreeNode::Item {
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -173,6 +179,7 @@ mod tests {
             ItemTreeNode::Item {
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -192,6 +199,7 @@ mod tests {
                 // 0
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 2,
                 children_index: 1,
                 parent_index: 0,
@@ -202,6 +210,7 @@ mod tests {
                 // 1
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 2,
                 children_index: 3,
                 parent_index: 0,
@@ -212,6 +221,7 @@ mod tests {
                 // 2
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 1,
                 children_index: 11,
                 parent_index: 0,
@@ -222,6 +232,7 @@ mod tests {
                 // 3
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 1,
                 children_index: 5,
                 parent_index: 1,
@@ -232,6 +243,7 @@ mod tests {
                 // 4
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 2,
                 children_index: 6,
                 parent_index: 1,
@@ -242,6 +254,7 @@ mod tests {
                 // 5
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 3,
@@ -252,6 +265,7 @@ mod tests {
                 // 6
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 2,
                 children_index: 8,
                 parent_index: 4,
@@ -262,6 +276,7 @@ mod tests {
                 // 7
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 1,
                 children_index: 10,
                 parent_index: 4,
@@ -272,6 +287,7 @@ mod tests {
                 // 8
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 6,
@@ -282,6 +298,7 @@ mod tests {
                 // 9
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 6,
@@ -292,6 +309,7 @@ mod tests {
                 // 10
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 7,
@@ -302,6 +320,7 @@ mod tests {
                 // 11
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 2,
                 children_index: 12,
                 parent_index: 2,
@@ -312,6 +331,7 @@ mod tests {
                 // 12
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 11,
@@ -322,6 +342,7 @@ mod tests {
                 // 13
                 is_accessible: false,
                 focus_draws: false,
+                ime_ui_owned: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 11,

@@ -857,6 +857,7 @@ impl RenderHost {
                         focus_on_click: c.focus_on_click,
                         focus_on_tab: c.focus_on_tab,
                         focus_draws: c.focus_draws,
+                        ime_ui_owned: c.ime_ui_owned,
                     })
                 };
                 let adapter = tl.adapter.borrow().clone();
@@ -1174,6 +1175,17 @@ impl RenderHost {
     /// focused, and the tree clears it only if it agrees.
     pub fn clear_control_focus(&self, id: u64) {
         let _ = self.sender.send(RenderMessage::ClearControlFocus { id });
+    }
+
+    /// Whether the control named by `id` has an input-method value the UI
+    /// thread owns.
+    ///
+    /// The compiler decided this per element and the drawing side only publishes
+    /// the bit.  The UI thread reads it to know whether the hints it holds in its
+    /// own tree are the ones the platform's input method is told, rather than a
+    /// value the drawing side holds.
+    pub fn ime_ui_owned(&self, id: u64) -> bool {
+        self.control_coord(id).is_some_and(|c| c.ime_ui_owned)
     }
 
     /// The control the drawing tree last published as having the focus.
@@ -3327,6 +3339,7 @@ fn publish_control_coords(
                 focus_on_click: c.focus_on_click,
                 focus_on_tab: c.focus_on_tab,
                 focus_draws: c.focus_draws,
+                ime_ui_owned: c.ime_ui_owned,
             },
         );
     }

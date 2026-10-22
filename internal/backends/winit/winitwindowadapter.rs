@@ -1799,6 +1799,24 @@ impl WinitWindowAdapter {
         let props =
             if editable { target.and_then(|id| host.input_method_properties(id)) } else { None };
 
+        // The hints are the one input-method value the compiler puts on this
+        // thread's side, so it is read here from the tree the UI thread owns
+        // rather than from the value the drawing side assembled.  An edited
+        // text can make the hints stale before it reaches here; that is a
+        // narrow window and the fallback value is still a valid answer.
+        let props = props.map(|mut props| {
+            if let Some(id) = target {
+                if host.ime_ui_owned(id) {
+                    if let Some(hints) =
+                        WindowInner::from_pub(self.window()).input_method_hints_for(id)
+                    {
+                        props.input_method_hints = hints;
+                    }
+                }
+            }
+            props
+        });
+
         match props {
             Some(props) => {
                 if previous == target {

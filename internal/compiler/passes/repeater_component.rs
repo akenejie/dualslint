@@ -52,6 +52,7 @@ fn create_repeater_components(component: &Rc<Component>) {
                 is_injected_wrapper_element: original_elem.is_injected_wrapper_element,
                 debug: original_elem.debug.clone(),
                 focus_draws: original_elem.focus_draws,
+                ime_ui_owned: original_elem.ime_ui_owned,
                 enclosing_component: Default::default(),
                 states: std::mem::take(&mut original_elem.states),
                 transitions: std::mem::take(&mut original_elem.transitions),

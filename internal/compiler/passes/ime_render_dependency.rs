@@ -27,11 +27,13 @@ const IME_ONLY_PROPERTIES: [&str; 1] = ["input-method-hints"];
 pub fn ime_affects_rendering(doc: &Document) {
     let mut affects = false;
     doc.visit_all_used_components(|component| {
-        if affects {
-            return;
-        }
         recurse_elem_including_sub_components_no_borrow(component, &(), &mut |elem, _| {
-            affects |= element_uses_ime_only_property(elem);
+            let owned = element_uses_ime_only_property(elem);
+            // Record it on the element too: the UI thread reads the value from
+            // its own tree by control id, so it has to know which elements carry
+            // a value it owns rather than being handed one from the drawing side.
+            elem.borrow_mut().ime_ui_owned = owned;
+            affects |= owned;
         });
     });
     doc.ime_affects_rendering.set(Some(affects));

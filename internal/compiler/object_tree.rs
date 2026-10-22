@@ -1346,6 +1346,16 @@ pub struct Element {
     /// same pixels.  Elements that do not carry focus keep the default, which is
     /// never consulted.
     pub focus_draws: bool,
+
+    /// Whether this element has an input-method value the UI thread owns.
+    ///
+    /// Set by the `ime_render_dependency` pass.  A `TextInput` carries values
+    /// the platform's input method is told and nothing draws — the hints for
+    /// what kind of text is expected, above all — and those belong to the thread
+    /// that owns input rather than to the thread that draws.  This records the
+    /// answer per element so the UI thread can read the value from its own tree
+    /// instead of being handed it from the drawing side.
+    pub ime_ui_owned: bool,
 }
 
 impl Spanned for Element {

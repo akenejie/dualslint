@@ -204,6 +204,13 @@ pub struct ControlRegion {
     /// no reason to be told about a focus change, so the UI thread keeps that
     /// control's focus to itself.
     pub focus_draws: bool,
+    /// Whether this control has an input-method value the UI thread owns.
+    ///
+    /// The compiler worked this out per element and stored it in the item tree;
+    /// the render thread is only publishing it.  A control with a value the
+    /// platform's input method is told and nothing draws has it read from the
+    /// UI thread's own tree rather than being handed it from here.
+    pub ime_ui_owned: bool,
 }
 
 /// Logical-coordinate entry in the shared coordinate table.  Published by the
@@ -232,6 +239,9 @@ pub struct ControlCoord {
     /// Published so the UI thread — which owns the focus — can tell whether a
     /// focus change is something the drawing thread has to hear about.
     pub focus_draws: bool,
+    /// Whether this control has an input-method value the UI thread owns, so the
+    /// UI thread reads it from its own tree rather than from the drawing side.
+    pub ime_ui_owned: bool,
 }
 
 impl ControlCoord {

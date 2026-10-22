@@ -75,6 +75,7 @@ pub fn ensure_window(
         // The content element that used to be the root keeps whatever focus
         // state it drew there; the Window that replaces it draws none.
         focus_draws: std::mem::replace(&mut win_elem_mut.focus_draws, false),
+        ime_ui_owned: std::mem::replace(&mut win_elem_mut.ime_ui_owned, false),
 
         inline_depth: 0,
         is_legacy_syntax: false,

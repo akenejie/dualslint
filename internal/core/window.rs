@@ -1419,6 +1419,21 @@ impl WindowInner {
         self.ui_focused_id.get()
     }
 
+    /// Reads the input-method hints of the control named by `id` from this
+    /// thread's own tree.
+    ///
+    /// The hints are the one input-method value the compiler puts on the UI
+    /// thread's side: they are told to the platform and drawn by nothing.  The
+    /// UI thread therefore reads them here, from the tree it owns, rather than
+    /// asking the drawing thread for them.  Returns `None` when the id names no
+    /// `TextInput` or the element carries no such value.
+    #[doc(hidden)]
+    pub fn input_method_hints_for(&self, id: u64) -> Option<InputMethodHints> {
+        let item = crate::item_tree::find_item_by_stable_id(&self.component(), id)?;
+        let text_input = item.downcast::<crate::items::TextInput>()?;
+        Some(text_input.as_pin_ref().input_method_hints())
+    }
+
     /// Report that the in-flight native drag finished with `action`.
     ///
     /// Backends call this when the OS drag completes (`DragAction::None` if cancelled); the

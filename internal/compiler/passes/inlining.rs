@@ -608,6 +608,7 @@ fn duplicate_element_with_mapping(
         is_component_placeholder: elem.is_component_placeholder,
         debug: elem.debug.clone(),
         focus_draws: elem.focus_draws,
+        ime_ui_owned: elem.ime_ui_owned,
         enclosing_component: Rc::downgrade(root_component),
         states: elem.states.clone(),
         match_elements: Default::default(),
