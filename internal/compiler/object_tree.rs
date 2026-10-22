@@ -1335,6 +1335,17 @@ pub struct Element {
     ///
     /// The order in the list is first the parent, and then the removed children.
     pub debug: Vec<ElementDebugInfo>,
+
+    /// Whether moving keyboard focus to this element can change what is drawn.
+    ///
+    /// Set by the `focus_render_dependency` pass for every element that carries
+    /// focus.  A control whose focus state changes pixels needs the drawing
+    /// thread to be told about it; one whose focus state is read by nothing and
+    /// painted by nothing does not, and the UI thread then leaves the drawing
+    /// thread's focus alone rather than asking for a redraw that would draw the
+    /// same pixels.  Elements that do not carry focus keep the default, which is
+    /// never consulted.
+    pub focus_draws: bool,
 }
 
 impl Spanned for Element {

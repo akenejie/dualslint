@@ -502,6 +502,13 @@ pub struct TreeNode {
     pub item_index: itertools::Either<ItemInstanceIdx, u32>,
     pub children: Vec<TreeNode>,
     pub is_accessible: bool,
+    /// Whether moving the keyboard focus onto this node's item can change what
+    /// is drawn there.
+    ///
+    /// Decided per element by `focus_render_dependency` before the lowering, and
+    /// carried into the item tree so the UI thread can tell, from a control id
+    /// alone, whether a focus change needs the drawing thread at all.
+    pub focus_draws: bool,
     /// If set, this node's children have dynamic z-ordering.
     /// Each entry corresponds to a child (by index) and gives its z value.
     /// The code generator will evaluate these on every children visit and sort the

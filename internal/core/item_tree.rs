@@ -633,6 +633,27 @@ impl ItemRc {
         }
     }
 
+    /// Whether moving the keyboard focus onto this item can change what is
+    /// drawn there.
+    ///
+    /// The compiler decided this per element and stored it in the tree node, so
+    /// a thread that only has a published control id can read it back from the
+    /// item the id names.  A dynamic tree node carries no item and answers
+    /// `false`.
+    pub fn focus_draws(&self) -> bool {
+        let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
+        let item_tree = crate::item_tree::ItemTreeNodeArray::new(&comp_ref_pin);
+
+        if let Some(n) = &item_tree.get(self.index) {
+            match n {
+                ItemTreeNode::Item { focus_draws, .. } => *focus_draws,
+                ItemTreeNode::DynamicTree { .. } => false,
+            }
+        } else {
+            false
+        }
+    }
+
     pub fn accessible_role(&self) -> crate::items::AccessibleRole {
         let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
         comp_ref_pin.as_ref().accessible_role(self.index)
@@ -1271,6 +1292,16 @@ pub enum ItemTreeNode {
     Item {
         /// True when the item has accessibility properties attached
         is_accessible: bool,
+
+        /// True when moving the keyboard focus onto this item can change what
+        /// is drawn there.
+        ///
+        /// The compiler decides this from the element the item comes from: a
+        /// binding that reads `has-focus`, a bound focus handler, or an item
+        /// that paints its focus state itself.  The UI thread, which decides
+        /// where the focus goes, has no tree of its own to ask, so the bit
+        /// travels with the geometry it already reads through the control id.
+        focus_draws: bool,
 
         /// number of children
         children_count: u32,
@@ -2024,6 +2055,7 @@ mod tests {
             parent_component: None,
             item_tree: vec![ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 1,
                 parent_index: 0,
@@ -2078,6 +2110,7 @@ mod tests {
                 // Root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 3,
                     children_index: 1,
                     parent_index: 0,
@@ -2087,6 +2120,7 @@ mod tests {
                 // First child of the root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
@@ -2096,6 +2130,7 @@ mod tests {
                 // Second child of the root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
@@ -2105,6 +2140,7 @@ mod tests {
                 // Third child of the root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
@@ -2218,6 +2254,7 @@ mod tests {
             item_tree: vec![
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 0,
@@ -2281,6 +2318,7 @@ mod tests {
                 // Root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 3,
                     children_index: 1,
                     parent_index: 0,
@@ -2290,6 +2328,7 @@ mod tests {
                 // First child
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 4, // Does not matter because children_count is zero
                     parent_index: 0,   // Root as parent
@@ -2299,6 +2338,7 @@ mod tests {
                 ItemTreeNode::DynamicTree { index: 0, parent_index: 0 },
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 4,
                     parent_index: 0, // Root as parent
@@ -2317,6 +2357,7 @@ mod tests {
             parent_component: Some(VRc::downgrade(&VRc::into_dyn(component.clone()))),
             item_tree: vec![ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 1,
                 parent_index: 2,
@@ -2426,6 +2467,7 @@ mod tests {
                 // Root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 3,
                     children_index: 1,
                     parent_index: 0,
@@ -2435,6 +2477,7 @@ mod tests {
                 // First child
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 4,
                     parent_index: 0,
@@ -2447,6 +2490,7 @@ mod tests {
                 // Third child
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 4,
                     parent_index: 0,
@@ -2467,6 +2511,7 @@ mod tests {
                 // Root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 2,
@@ -2488,6 +2533,7 @@ mod tests {
             item_tree: vec![
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 1,
@@ -2496,6 +2542,7 @@ mod tests {
                 },
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 2,
                     parent_index: 0,
@@ -2636,6 +2683,7 @@ mod tests {
             item_tree: vec![
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 2,
                     children_index: 1,
                     parent_index: 0,
@@ -2645,6 +2693,7 @@ mod tests {
                 ItemTreeNode::DynamicTree { index: 0, parent_index: 0 },
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 4,
                     parent_index: 0,
@@ -2664,6 +2713,7 @@ mod tests {
                 parent_component: Some(VRc::downgrade(&VRc::into_dyn(component.clone()))),
                 item_tree: vec![ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 1,
                     parent_index: 1,
@@ -2680,6 +2730,7 @@ mod tests {
                 parent_component: Some(VRc::downgrade(&VRc::into_dyn(component.clone()))),
                 item_tree: vec![ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 1,
                     parent_index: 1,
@@ -2696,6 +2747,7 @@ mod tests {
                 parent_component: Some(VRc::downgrade(&VRc::into_dyn(component.clone()))),
                 item_tree: vec![ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 1,
                     parent_index: 1,
@@ -2748,6 +2800,7 @@ mod tests {
     fn test_component_item_tree_root_only() {
         let nodes = vec![ItemTreeNode::Item {
             is_accessible: false,
+            focus_draws: false,
             children_count: 0,
             children_index: 1,
             parent_index: 0,
@@ -2769,6 +2822,7 @@ mod tests {
         let nodes = vec![
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 1,
                 children_index: 1,
                 parent_index: 0,
@@ -2777,6 +2831,7 @@ mod tests {
             },
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 2,
                 parent_index: 0,
@@ -2802,6 +2857,7 @@ mod tests {
         let nodes = vec![
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 3,
                 children_index: 1,
                 parent_index: 0,
@@ -2810,6 +2866,7 @@ mod tests {
             },
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -2818,6 +2875,7 @@ mod tests {
             },
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -2826,6 +2884,7 @@ mod tests {
             },
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -2871,6 +2930,7 @@ mod tests {
                     // Root
                     ItemTreeNode::Item {
                         is_accessible: false,
+                        focus_draws: false,
                         children_count: 1,
                         children_index: 1,
                         parent_index: 0,
@@ -2880,6 +2940,7 @@ mod tests {
                     // First child
                     ItemTreeNode::Item {
                         is_accessible: false,
+                        focus_draws: false,
                         children_count: 1,
                         children_index: 2, // Monotonic increasing
                         parent_index: 0,
@@ -2889,6 +2950,7 @@ mod tests {
                     // First child of the first child of the root
                     ItemTreeNode::Item {
                         is_accessible: false,
+                        focus_draws: false,
                         children_count: 0,
                         children_index: 3, // Not relevant because it has no children
                         parent_index: 1,
@@ -3035,6 +3097,7 @@ mod tests {
                 item_tree: vec![
                     ItemTreeNode::Item {
                         is_accessible: false,
+                        focus_draws: false,
                         children_count: 1,
                         children_index: 1,
                         parent_index: 0,
@@ -3043,6 +3106,7 @@ mod tests {
                     },
                     ItemTreeNode::Item {
                         is_accessible: false,
+                        focus_draws: false,
                         children_count: 1,
                         children_index: 2,
                         parent_index: 0,
@@ -3051,6 +3115,7 @@ mod tests {
                     },
                     ItemTreeNode::Item {
                         is_accessible: false,
+                        focus_draws: false,
                         children_count: 1,
                         children_index: 3,
                         parent_index: 1,
@@ -3059,6 +3124,7 @@ mod tests {
                     },
                     ItemTreeNode::Item {
                         is_accessible: false,
+                        focus_draws: false,
                         children_count: 0,
                         children_index: 4,
                         parent_index: 2,
@@ -3285,6 +3351,7 @@ mod tests {
                 // Root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 0,
@@ -3306,6 +3373,7 @@ mod tests {
                 // Root
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 1,
                     children_index: 1,
                     parent_index: 1, // The index in the parent item tree
@@ -3315,6 +3383,7 @@ mod tests {
                 // First child
                 ItemTreeNode::Item {
                     is_accessible: false,
+                    focus_draws: false,
                     children_count: 0,
                     children_index: 0,
                     parent_index: 0,

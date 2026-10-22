@@ -73,3 +73,49 @@ fn the_generated_code_carries_the_decision() {
         "the drawing thread has to be told that focus draws nothing:\n{rust}"
     );
 }
+
+/// The decision is per element and carried into the item tree, so the UI thread
+/// can tell from a control id alone whether a focus change has to reach the
+/// drawing thread. This reads the bit back out of the generated nodes.
+fn focus_draws_bits(source: &str) -> Vec<bool> {
+    let rust = compile(source).1;
+    let mut bits = Vec::new();
+    let mut rest = rust.as_str();
+    while let Some(pos) = rest.find("focus_draws") {
+        rest = &rest[pos + "focus_draws".len()..];
+        let value = rest.trim_start().trim_start_matches(':').trim_start();
+        if value.starts_with("true") {
+            bits.push(true);
+        } else if value.starts_with("false") {
+            bits.push(false);
+        }
+    }
+    bits
+}
+
+#[test]
+fn each_control_carries_its_own_answer() {
+    // A scope nothing reads draws the same when focused; a `TextInput` paints
+    // its focus itself. Both are in one window, so the answers cannot come from
+    // a single document-wide bit.
+    let bits = focus_draws_bits(&window(
+        "a := FocusScope { } ti := TextInput { } Rectangle { background: a.has-focus ? red : blue; }",
+    ));
+    assert!(bits.contains(&false), "the unread scope draws nothing: {bits:?}");
+    assert!(bits.contains(&true), "the text input paints its focus: {bits:?}");
+}
+
+#[test]
+fn a_scope_the_application_reads_draws_on_focus() {
+    let bits = focus_draws_bits(&window(
+        "a := FocusScope { } Rectangle { background: a.has-focus ? red : blue; }",
+    ));
+    assert!(bits.contains(&true), "reading `has-focus` makes the scope draw: {bits:?}");
+}
+
+#[test]
+fn a_scope_nothing_reads_still_carries_the_false_bit() {
+    // The window root and the scope are both there, and neither draws for focus.
+    let bits = focus_draws_bits(&window("FocusScope { }"));
+    assert_eq!(bits, vec![false, false], "nothing in this window draws for focus");
+}

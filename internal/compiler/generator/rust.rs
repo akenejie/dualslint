@@ -2817,6 +2817,7 @@ fn generate_item_tree(
                 let children_index = children_offset as u32;
                 let item_array_len = item_array.len() as u32;
                 let is_accessible = node.is_accessible;
+                let focus_draws = node.focus_draws;
                 // The compiler assigns each element a constant id: its index in
                 // this component's item-tree array.  Two instances of the same
                 // component definition share the id, so the runtime combines it
@@ -2825,6 +2826,7 @@ fn generate_item_tree(
                 item_tree_array.push(quote!(
                     sp::ItemTreeNode::Item {
                         is_accessible: #is_accessible,
+                        focus_draws: #focus_draws,
                         children_count: #children_count,
                         children_index: #children_index,
                         parent_index: #parent_index,

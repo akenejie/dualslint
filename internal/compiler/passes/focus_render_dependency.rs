@@ -25,11 +25,13 @@ const FOCUS_CALLBACKS: [&str; 3] = ["focus-gained", "focus-lost", "focus-changed
 pub fn focus_affects_rendering(doc: &Document) {
     let mut affects = false;
     doc.visit_all_used_components(|component| {
-        if affects {
-            return;
-        }
         recurse_elem_including_sub_components_no_borrow(component, &(), &mut |elem, _| {
-            affects |= element_draws_on_focus_change(elem);
+            let draws = element_draws_on_focus_change(elem);
+            // Record it on the element too: a control whose focus state draws
+            // nothing is one the UI thread should not ask the drawing thread to
+            // redraw for, and the published geometry carries this bit to it.
+            elem.borrow_mut().focus_draws = draws;
+            affects |= draws;
         });
     });
     doc.focus_affects_rendering.set(Some(affects));

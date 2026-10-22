@@ -72,6 +72,9 @@ pub fn ensure_window(
         item_index_of_first_children: Default::default(),
         grid_layout_cell: None,
         debug: std::mem::take(&mut win_elem_mut.debug),
+        // The content element that used to be the root keeps whatever focus
+        // state it drew there; the Window that replaces it draws none.
+        focus_draws: std::mem::replace(&mut win_elem_mut.focus_draws, false),
 
         inline_depth: 0,
         is_legacy_syntax: false,

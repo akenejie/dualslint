@@ -101,6 +101,7 @@ mod tests {
     fn test_focus_chain_root_only() {
         let nodes = vec![ItemTreeNode::Item {
             is_accessible: false,
+            focus_draws: false,
             children_count: 0,
             children_index: 1,
             parent_index: 0,
@@ -117,6 +118,7 @@ mod tests {
         let nodes = vec![
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 1,
                 children_index: 1,
                 parent_index: 0,
@@ -125,6 +127,7 @@ mod tests {
             },
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 2,
                 parent_index: 0,
@@ -142,6 +145,7 @@ mod tests {
         let nodes = vec![
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 3,
                 children_index: 1,
                 parent_index: 0,
@@ -150,6 +154,7 @@ mod tests {
             },
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -158,6 +163,7 @@ mod tests {
             },
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -166,6 +172,7 @@ mod tests {
             },
             ItemTreeNode::Item {
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 4,
                 parent_index: 0,
@@ -184,6 +191,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 0
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 2,
                 children_index: 1,
                 parent_index: 0,
@@ -193,6 +201,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 1
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 2,
                 children_index: 3,
                 parent_index: 0,
@@ -202,6 +211,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 2
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 1,
                 children_index: 11,
                 parent_index: 0,
@@ -211,6 +221,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 3
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 1,
                 children_index: 5,
                 parent_index: 1,
@@ -220,6 +231,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 4
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 2,
                 children_index: 6,
                 parent_index: 1,
@@ -229,6 +241,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 5
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 3,
@@ -238,6 +251,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 6
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 2,
                 children_index: 8,
                 parent_index: 4,
@@ -247,6 +261,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 7
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 1,
                 children_index: 10,
                 parent_index: 4,
@@ -256,6 +271,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 8
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 6,
@@ -265,6 +281,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 9
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 6,
@@ -274,6 +291,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 10
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 7,
@@ -283,6 +301,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 11
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 2,
                 children_index: 12,
                 parent_index: 2,
@@ -292,6 +311,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 12
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 11,
@@ -301,6 +321,7 @@ mod tests {
             ItemTreeNode::Item {
                 // 13
                 is_accessible: false,
+                focus_draws: false,
                 children_count: 0,
                 children_index: 0,
                 parent_index: 11,
