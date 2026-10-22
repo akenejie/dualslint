@@ -1135,10 +1135,10 @@ impl RenderHost {
     /// below it when that item lets the press through.  The UI thread owns the
     /// pointer, so it walks this list to find the item the press lands on.
     pub fn press_targets(&self) -> Vec<PressTarget> {
-        if on_render_thread() {
-            if let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().press_targets().to_vec()) {
-                return r;
-            }
+        if on_render_thread()
+            && let Some(r) = with_tl_access(|a| a.coords.lock().unwrap().press_targets().to_vec())
+        {
+            return r;
         }
         self.coords.lock().unwrap().press_targets().to_vec()
     }
@@ -1156,12 +1156,12 @@ impl RenderHost {
         tree_focused: Option<u64>,
         ui_focused: Option<u64>,
     ) -> Option<PressTarget> {
-        if on_render_thread() {
-            if let Some(r) = with_tl_access(|a| {
+        if on_render_thread()
+            && let Some(r) = with_tl_access(|a| {
                 a.coords.lock().unwrap().press_target_at(x, y, tree_focused, ui_focused).copied()
-            }) {
-                return r;
-            }
+            })
+        {
+            return r;
         }
         self.coords.lock().unwrap().press_target_at(x, y, tree_focused, ui_focused).copied()
     }
