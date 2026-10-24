@@ -610,6 +610,7 @@ fn duplicate_element_with_mapping(
         focus_draws: elem.focus_draws,
         ime_ui_owned: elem.ime_ui_owned,
         pointer_reacts: elem.pointer_reacts,
+        pointer_draws: elem.pointer_draws,
         property_ownership: elem.property_ownership.clone(),
         enclosing_component: Rc::downgrade(root_component),
         states: elem.states.clone(),

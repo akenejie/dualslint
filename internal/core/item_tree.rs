@@ -694,6 +694,20 @@ impl ItemRc {
         }
     }
 
+    pub fn pointer_draws(&self) -> bool {
+        let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
+        let item_tree = crate::item_tree::ItemTreeNodeArray::new(&comp_ref_pin);
+
+        if let Some(n) = &item_tree.get(self.index) {
+            match n {
+                ItemTreeNode::Item { pointer_draws, .. } => *pointer_draws,
+                ItemTreeNode::DynamicTree { .. } => false,
+            }
+        } else {
+            false
+        }
+    }
+
     pub fn accessible_role(&self) -> crate::items::AccessibleRole {
         let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
         comp_ref_pin.as_ref().accessible_role(self.index)
@@ -1355,13 +1369,10 @@ pub enum ItemTreeNode {
 
         /// True when a pointer event on this item, or on something inside it,
         /// can change what is on screen.
-        ///
-        /// The compiler decides this from the element the item comes from: a
-        /// bound `clicked` handler, a binding that reads where the pointer is,
-        /// or an item that answers the pointer by itself.  A pointer event on a
-        /// control that changes nothing on screen needs not be sent on, so the
-        /// UI thread can leave the drawing thread alone for it.
         pointer_reacts: bool,
+
+        /// True when pointer state (hover/press) affects what is drawn.
+        pointer_draws: bool,
 
         /// number of children
         children_count: u32,

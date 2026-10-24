@@ -1639,10 +1639,14 @@ impl WinitWindowAdapter {
             return;
         }
         if let Some(previous) = self.render_hovered.replace(target) {
-            host.apply_control_state(previous, false, self.render_pressed.get() == Some(previous));
+            if host.control_coord(previous).is_some_and(|c| c.pointer_draws) {
+                host.apply_control_state(previous, false, self.render_pressed.get() == Some(previous));
+            }
         }
         if let Some(target) = target {
-            host.apply_control_state(target, true, self.render_pressed.get() == Some(target));
+            if host.control_coord(target).is_some_and(|c| c.pointer_draws) {
+                host.apply_control_state(target, true, self.render_pressed.get() == Some(target));
+            }
         }
     }
 
@@ -1652,10 +1656,14 @@ impl WinitWindowAdapter {
             return;
         }
         if let Some(previous) = self.render_pressed.replace(target) {
-            host.apply_control_state(previous, self.render_hovered.get() == Some(previous), false);
+            if host.control_coord(previous).is_some_and(|c| c.pointer_draws) {
+                host.apply_control_state(previous, self.render_hovered.get() == Some(previous), false);
+            }
         }
         if let Some(target) = target {
-            host.apply_control_state(target, self.render_hovered.get() == Some(target), true);
+            if host.control_coord(target).is_some_and(|c| c.pointer_draws) {
+                host.apply_control_state(target, self.render_hovered.get() == Some(target), true);
+            }
         }
     }
 

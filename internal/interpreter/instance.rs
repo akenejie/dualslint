@@ -1070,6 +1070,7 @@ fn build_tree_nodes(
                     focus_draws: node.focus_draws,
                     ime_ui_owned: node.ime_ui_owned,
                     pointer_reacts: node.pointer_reacts,
+                    pointer_draws: node.pointer_draws,
                     children_count: node.children.len() as u32,
                     children_index: children_offset as u32,
                     parent_index,

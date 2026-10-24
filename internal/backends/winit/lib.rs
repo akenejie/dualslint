@@ -40,6 +40,7 @@ mod ios;
 ///
 /// See `render_thread::RenderHost` for what it takes over and what it leaves
 /// behind.
+pub mod property_store;
 pub mod render_thread;
 
 /// Re-export of the winit crate.

@@ -14,6 +14,7 @@ use i_slint_core::graphics::euclid;
 use i_slint_core::lengths::{LogicalRect, PhysicalPx};
 
 pub mod controls;
+pub mod property_ownership;
 
 /// Physical-pixel geometry, the space a rendering backend draws in.
 pub type PhysicalLength = euclid::Length<f32, PhysicalPx>;
@@ -211,6 +212,7 @@ pub struct ControlRegion {
     /// platform's input method is told and nothing draws has it read from the
     /// UI thread's own tree rather than being handed it from here.
     pub ime_ui_owned: bool,
+    pub pointer_draws: bool,
 }
 
 /// What an item does with a pointer press.
@@ -277,6 +279,7 @@ pub struct ControlCoord {
     /// Whether this control has an input-method value the UI thread owns, so the
     /// UI thread reads it from its own tree rather than from the drawing side.
     pub ime_ui_owned: bool,
+    pub pointer_draws: bool,
 }
 
 impl ControlCoord {

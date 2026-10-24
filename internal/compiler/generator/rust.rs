@@ -2820,6 +2820,7 @@ fn generate_item_tree(
                 let focus_draws = node.focus_draws;
                 let ime_ui_owned = node.ime_ui_owned;
                 let pointer_reacts = node.pointer_reacts;
+                let pointer_draws = node.pointer_draws;
                 // The compiler assigns each element a constant id: its index in
                 // this component's item-tree array.  Two instances of the same
                 // component definition share the id, so the runtime combines it
@@ -2831,6 +2832,7 @@ fn generate_item_tree(
                         focus_draws: #focus_draws,
                         ime_ui_owned: #ime_ui_owned,
                         pointer_reacts: #pointer_reacts,
+                        pointer_draws: #pointer_draws,
                         children_count: #children_count,
                         children_index: #children_index,
                         parent_index: #parent_index,

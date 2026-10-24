@@ -77,6 +77,7 @@ pub fn ensure_window(
         focus_draws: std::mem::replace(&mut win_elem_mut.focus_draws, false),
         ime_ui_owned: std::mem::replace(&mut win_elem_mut.ime_ui_owned, false),
         pointer_reacts: std::mem::replace(&mut win_elem_mut.pointer_reacts, false),
+        pointer_draws: std::mem::replace(&mut win_elem_mut.pointer_draws, false),
         property_ownership: std::mem::take(&mut win_elem_mut.property_ownership),
 
         inline_depth: 0,

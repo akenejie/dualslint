@@ -1368,6 +1368,13 @@ pub struct Element {
     /// as well, because a press reaches them too.
     pub pointer_reacts: bool,
 
+    /// Whether this element's pointer state shows on screen.
+    ///
+    /// Set by the `property_ownership` pass.  A control whose pressed and
+    /// hovered states nothing reads draws the same whether it is pressed or
+    /// not, so the UI thread has no reason to tell the drawing thread about it.
+    pub pointer_draws: bool,
+
     /// Which thread holds the value of each of this element's properties.
     ///
     /// Set by the `property_ownership` pass, which decides it property by

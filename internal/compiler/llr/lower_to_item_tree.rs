@@ -1421,6 +1421,7 @@ fn make_tree(
             tree_node.focus_draws |= e.focus_draws;
             tree_node.ime_ui_owned |= e.ime_ui_owned;
             tree_node.pointer_reacts |= e.pointer_reacts;
+            tree_node.pointer_draws |= e.pointer_draws;
             tree_node
         }
         LoweredElement::NativeItem { item_index } => TreeNode {
@@ -1428,6 +1429,7 @@ fn make_tree(
             focus_draws: e.focus_draws,
             ime_ui_owned: e.ime_ui_owned,
             pointer_reacts: e.pointer_reacts,
+            pointer_draws: e.pointer_draws,
             sub_component_path: sub_component_path.into(),
             item_index: itertools::Either::Left(*item_index),
             children: children.collect(),
@@ -1438,6 +1440,7 @@ fn make_tree(
             focus_draws: false,
             ime_ui_owned: false,
             pointer_reacts: false,
+            pointer_draws: false,
             sub_component_path: sub_component_path.into(),
             item_index: itertools::Either::Right(usize::from(*repeated_index) as u32),
             children: Vec::new(),
@@ -1448,6 +1451,7 @@ fn make_tree(
             focus_draws: false,
             ime_ui_owned: false,
             pointer_reacts: false,
+            pointer_draws: false,
             sub_component_path: sub_component_path.into(),
             item_index: itertools::Either::Right(*repeated_index + repeater_count),
             children: Vec::new(),

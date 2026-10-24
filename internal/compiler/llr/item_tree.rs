@@ -523,6 +523,8 @@ pub struct TreeNode {
     /// a control id alone, whether a pointer event on this control has to reach
     /// the drawing thread at all.
     pub pointer_reacts: bool,
+    /// Whether this node's pointer state shows on screen.
+    pub pointer_draws: bool,
     /// If set, this node's children have dynamic z-ordering.
     /// Each entry corresponds to a child (by index) and gives its z value.
     /// The code generator will evaluate these on every children visit and sort the
