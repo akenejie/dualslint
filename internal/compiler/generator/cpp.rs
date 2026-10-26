@@ -1528,7 +1528,11 @@ fn generate_public_component(
         compilation_unit: unit,
         current_scope: EvaluationScope::SubComponent(component.item_tree.root, None),
         generator_state: CppGeneratorContext {
-            global_access: "(&this->m_globals)".to_string(),
+            // `self`, not `this`: the member functions set `self = this`, and the
+            // screen-tree calls run their access against the component pointer the
+            // tree on screen hands them, which a captureless lambda can only name
+            // through that same `self`.
+            global_access: "(&self->m_globals)".to_string(),
             conditional_includes,
         },
         argument_types: &[],
@@ -3803,9 +3807,12 @@ impl PublicCallTarget {
 /// The statements that run a call against the tree the window shows.
 ///
 /// `call` is the call itself, written against `self` (the component on screen)
-/// and the arguments as `data->arg_0`, `data->arg_1`, and so on. Its value is
-/// assigned to `data->result` unless the call returns nothing. The call is
-/// posted to the render thread and waited for, so plain values carry safely.
+/// and the arguments as `data->arg_0`, `data->arg_1`, and so on. A call that
+/// returns a value is posted to the render thread and waited for, so plain
+/// values carry safely and the answer comes back. A call that answers void
+/// has nothing to bring back, so it goes one way instead: posted without
+/// waiting, its data heap-allocated and freed by the call's own destructor
+/// once the render thread has run it -- or once a dropped call discards it.
 fn screen_tree_call_code(
     route: &PublicCallTarget,
     arg_types: &[SmolStr],
@@ -3833,32 +3840,66 @@ fn screen_tree_call_code(
         code.push(format!("    {} result;", ret.cpp_type().unwrap()));
     }
     code.push("};".to_string());
-    code.push(format!("SlintScreenTreeCallData call_data{{ {} }};", arg_sources.join(", ")));
-    code.push("slint::cbindgen_private::slint_windowrc_run_on_screen_tree(".to_string());
+    if returns_value {
+        // `result` is listed so the aggregate initializes every member: a
+        // `-Wmissing-field-initializers` build counts a partial one an error.
+        code.push(format!(
+            "SlintScreenTreeCallData call_data{{ {} }};",
+            arg_sources.iter().map(String::as_str).chain(std::iter::once("{}")).collect::<Vec<_>>().join(", ")
+        ));
+        code.push("slint::cbindgen_private::slint_windowrc_run_on_screen_tree(".to_string());
+        code.push("    &self->m_globals.window().window_handle().handle(),".to_string());
+        code.push("    &local_tree->into_dyn(),".to_string());
+        code.push("    &call_data,".to_string());
+        code.push(
+            "    [](void *user_data, const slint::cbindgen_private::ItemTreeRc *tree) {".to_string(),
+        );
+        code.push(
+            "        auto *data = static_cast<SlintScreenTreeCallData *>(user_data);".to_string(),
+        );
+        code.push(format!(
+            "        if (tree->vtable() != &{component_type}::static_vtable) {{ return; }}"
+        ));
+        code.push(format!(
+            "        [[maybe_unused]] auto self = static_cast<const {component_type} *>(tree->borrow().instance);"
+        ));
+        code.push(format!("        data->result = {call};"));
+        code.push("    });".to_string());
+        code.push("return call_data.result;".to_string());
+        return code;
+    }
+    // A one-way call owns its data on the heap: the caller's frame is gone by
+    // the time the render thread runs it. The destructor callback frees it
+    // exactly once, on whichever path the call took.
+    code.push(format!(
+        "auto *call_data = new SlintScreenTreeCallData{{ {} }};",
+        arg_sources.join(", ")
+    ));
+    code.push("slint::cbindgen_private::slint_windowrc_post_on_screen_tree(".to_string());
     code.push("    &self->m_globals.window().window_handle().handle(),".to_string());
     code.push("    &local_tree->into_dyn(),".to_string());
-    code.push("    &call_data,".to_string());
+    code.push("    call_data,".to_string());
     code.push(
         "    [](void *user_data, const slint::cbindgen_private::ItemTreeRc *tree) {".to_string(),
     );
     code.push(
-        "        auto *data = static_cast<SlintScreenTreeCallData *>(user_data);".to_string(),
+        "        [[maybe_unused]] auto *data = static_cast<SlintScreenTreeCallData *>(user_data);"
+            .to_string(),
     );
     code.push(format!(
         "        if (tree->vtable() != &{component_type}::static_vtable) {{ return; }}"
     ));
+    // Mutable, because an assignment is one of the things a one-way call is
+    // for; the handover uses the same cast for the same reason.
     code.push(format!(
-        "        [[maybe_unused]] auto self = static_cast<const {component_type} *>(tree->borrow().instance);"
+        "        [[maybe_unused]] auto self = const_cast<{component_type} *>(static_cast<const {component_type} *>(tree->borrow().instance));"
     ));
-    if returns_value {
-        code.push(format!("        data->result = {call};"));
-    } else {
-        code.push(format!("        {call};"));
-    }
-    code.push("    });".to_string());
-    if returns_value {
-        code.push("return call_data.result;".to_string());
-    }
+    code.push(format!("        {call};"));
+    code.push("    },".to_string());
+    code.push(
+        "    [](void *user_data) { delete static_cast<SlintScreenTreeCallData *>(user_data); });"
+            .to_string(),
+    );
     code
 }
 

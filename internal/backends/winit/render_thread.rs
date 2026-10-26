@@ -965,17 +965,20 @@ impl RenderHost {
     /// it.
     ///
     /// `Ok` means the tree ran the call. `Err` hands the call back because it
-    /// was not taken -- there is no tree attached, or this thread is gone -- so
-    /// that the caller can run it against the tree it holds. A call that was
-    /// taken and then lost with the thread reports `Ok`, and the caller's reply
-    /// channel closes, which hands back a default instead of hanging.
+    /// was not taken -- this thread is gone -- so that the caller can run it
+    /// against the tree it holds. A call that was taken and then lost with the
+    /// thread reports `Ok`, and the caller's reply channel closes, which hands
+    /// back a default instead of hanging.
+    ///
+    /// A call that arrives before a tree is attached is not handed back: the
+    /// message queue is FIFO, so it lands on the loop after `AttachComponent`
+    /// and runs against the tree that is about to be drawn. Running it against
+    /// the caller's own tree instead would put the effect -- a popup, say -- on
+    /// a tree nothing draws, where it lingers out of sight.
     pub fn run_on_screen_tree(
         &self,
         task: Box<dyn FnOnce(&ItemTreeRc) + Send + 'static>,
     ) -> Result<(), Box<dyn FnOnce(&ItemTreeRc) + Send + 'static>> {
-        if !self.attached.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(task);
-        }
         // The loop owns the tree on this thread; asking it through the channel
         // would wait on the very loop that is making the call. Run it here.
         if self.is_own_render_thread() {
@@ -1010,6 +1013,21 @@ impl RenderHost {
                 Err(task)
             }
         }
+    }
+
+    /// Post a call to the tree on the render thread, one way.
+    ///
+    /// The caller gets no answer, so it does not wait for the call to have
+    /// run: the queue is FIFO, and that is all the ordering a call with no
+    /// reply needs. A call posted before a tree is attached still lands on it,
+    /// after `AttachComponent`; one posted after the thread is gone is
+    /// dropped, because there is no drawn tree left to reach.
+    pub fn post_on_screen_tree(&self, task: Box<dyn FnOnce(&ItemTreeRc) + Send + 'static>) {
+        // The reply half is dropped here: a one-way call has no reply to
+        // deliver, and the loop's `done.send` closing without a reader is how
+        // the call is marked done.
+        let (done, _reply) = std::sync::mpsc::sync_channel::<()>(1);
+        let _ = self.sender.send(RenderMessage::RunOnScreenTree { task, done });
     }
 
     /// Borrow the render-owned control identified by `id` and assign one of

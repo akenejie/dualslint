@@ -528,6 +528,24 @@ impl Window {
         receiver.recv().unwrap_or_default()
     }
 
+    /// Post a call to the tree the window draws, one way.
+    ///
+    /// This is [`Self::call_on_screen_tree`] for calls that expect no answer:
+    /// the task is queued for the tree on screen and this call returns without
+    /// waiting for it to run. The queue is FIFO, so a call posted before the
+    /// drawn tree exists still reaches it once it does, and a call posted when
+    /// no tree is drawn anymore is dropped -- there is nothing left for it to
+    /// reach.
+    pub fn post_on_screen_tree(
+        &self,
+        local_tree: crate::item_tree::ItemTreeRc,
+        task: impl FnOnce(&crate::item_tree::ItemTreeRc) + Send + 'static,
+    ) {
+        WindowInner::from_pub(self)
+            .window_adapter()
+            .post_on_screen_tree(local_tree, Box::new(task));
+    }
+
     /// Shows the window on the screen. An additional strong reference on the
     /// associated component is maintained while the window is visible.
     ///

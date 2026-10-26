@@ -2428,6 +2428,28 @@ impl WindowAdapter for WinitWindowAdapter {
         task(&local_tree);
     }
 
+    fn post_on_screen_tree(
+        &self,
+        local_tree: i_slint_core::item_tree::ItemTreeRc,
+        task: Box<dyn FnOnce(&i_slint_core::item_tree::ItemTreeRc) + Send + 'static>,
+    ) {
+        // A one-way call has no value to bring back, so waiting for the render
+        // thread to have run it would only stall this thread on the round
+        // trip. The queue is FIFO, so a call posted before the mirror is
+        // attached still lands on the tree that is about to be drawn, and a
+        // call posted after the thread is gone is dropped: nothing draws
+        // again, so there is no tree left for it to reach. Running it against
+        // the tree this window holds would put the effect -- a popup, say -- on
+        // a tree nothing draws, where it lingers out of sight.
+        if !crate::render_thread::on_render_thread()
+            && let Some(host) = self.render_host()
+        {
+            host.post_on_screen_tree(task);
+            return;
+        }
+        task(&local_tree);
+    }
+
     fn renderer(&self) -> &dyn i_slint_core::renderer::Renderer {
         self.renderer().as_core_renderer()
     }

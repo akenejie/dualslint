@@ -36,6 +36,8 @@ fn generate_cpp(source: &str) -> String {
 
 /// The bridge a generated invoker uses to reach the tree on screen.
 const BRIDGE: &str = "slint_windowrc_run_on_screen_tree";
+/// The bridge a generated one-way call uses: posted, not waited for.
+const POST: &str = "slint_windowrc_post_on_screen_tree";
 
 /// A window-rooted component carries its calls to the tree it shows.
 #[test]
@@ -49,6 +51,22 @@ export component App inherits Window {
 "#,
     );
     assert!(cpp.contains(BRIDGE), "both calls should be carried:\n{cpp}");
+}
+
+/// A call that answers void has nothing to bring back, so it goes one way:
+/// posted to the tree on screen rather than waited on.
+#[test]
+fn a_void_call_is_posted_rather_than_waited_for() {
+    let cpp = generate_cpp(
+        r#"
+export component App inherits Window {
+    callback poke();
+    public function show() { }
+}
+"#,
+    );
+    assert!(cpp.contains(POST), "the void calls should be posted:\n{cpp}");
+    assert!(!cpp.contains(BRIDGE), "a void call waits for nothing:\n{cpp}");
 }
 
 /// A call that carries a model is a reference into the tree the caller holds, so it stays there.
@@ -85,12 +103,12 @@ fn a_global_has_no_screen_tree_to_reach() {
 export global Stats {
     callback changed(int);
 }
-export component App inherits Window {
-    in property<int> unused;
-}
+export component App inherits Window { }
 "#,
     );
-    // The window root itself contributes no portable call here, so the only bridge that could
-    // appear would be the global's, which must not.
+    // Nothing portable crosses here: the window has no properties to hand over and no
+    // portable calls of its own, so the only bridge that could appear would be the
+    // global's, which must not.
     assert!(!cpp.contains(BRIDGE), "a global has no window to ask:\n{cpp}");
+    assert!(!cpp.contains(POST), "a global has no window to post to:\n{cpp}");
 }

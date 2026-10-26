@@ -1242,14 +1242,24 @@ fn render_handover_state(
     ctx: &EvaluationContext,
 ) -> TokenStream {
     let carries = public_properties.iter().filter_map(|(_, p)| {
-        if !p.ty.is_property_type() || p.read_only() || !is_thread_portable_type(&p.ty) {
+        if !p.ty.is_property_type() || p.read_only() || (!is_thread_portable_type(&p.ty) && !matches!(&p.ty, Type::Array(_))) {
             return None;
         }
-        let set_value = property_set_value_tokens(&p.prop, quote!(value), ctx);
-        let read = primitive_property_value(
-            &p.ty,
-            MemberAccess::Direct(access_member(&p.prop, ctx).unwrap()),
-        );
+        let prop_access = access_member(&p.prop, ctx).unwrap();
+        let (read, set_value) = if let Type::Array(_) = &p.ty {
+            (
+                quote!(#prop_access.get().iter().collect::<Vec<_>>()),
+                quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(value)))),
+            )
+        } else {
+            (
+                primitive_property_value(
+                    &p.ty,
+                    MemberAccess::Direct(prop_access.clone()),
+                ),
+                property_set_value_tokens(&p.prop, quote!(value), ctx),
+            )
+        };
         Some(quote! {
             {
                 // The value is read here rather than through the public getter:
@@ -1420,6 +1430,34 @@ impl CallTarget {
         }
     }
 
+    /// The statements a one-way call runs: posted to the tree on screen,
+    /// without waiting for it to have run.
+    ///
+    /// The compiler posts calls whose effect is the point and whose types
+    /// carry nothing that needs bringing back -- a callback that answers
+    /// `void`, a property assignment. Waiting for such a call would stall the
+    /// caller on a round trip that returns nothing, and a call posted when no
+    /// tree is drawn anymore is dropped, because there is nothing left for it
+    /// to reach.
+    fn wrap_oneshot(&self, call: TokenStream) -> TokenStream {
+        match self {
+            CallTarget::OwnTree => call,
+            CallTarget::ScreenTree { window, inner_component } => quote! {
+                #window.post_on_screen_tree(
+                    sp::VRc::into_dyn(self.0.clone()),
+                    move |tree| {
+                        let component = sp::VRc::map_dyn(tree.clone(), |tree| {
+                            sp::VRef::downcast_pin::<#inner_component>(tree)
+                                .expect("the tree on screen is not the component the call belongs to")
+                        });
+                        let _self = component.as_pin_ref();
+                        #call
+                    },
+                )
+            },
+        }
+    }
+
     /// Whether a call of these types can be moved to the tree on screen.
     fn takes(&self, args: &[Type], ret: &Type) -> bool {
         matches!(self, CallTarget::ScreenTree { .. })
@@ -1461,8 +1499,16 @@ fn public_api(
                 (0..callback.args.len()).map(|i| format_ident!("arg_{}", i)).collect::<Vec<_>>();
             let caller_ident = accessor_names::rust_accessor_ident(name, AccessorKind::Invoker);
             let call = quote!(#prop.call(&(#(#args_name,)*)));
+            // A callback that answers void has nothing to bring back, so the
+            // call goes one way: posted to the tree on screen rather than
+            // waited on. One that returns a value still needs the answer, so
+            // it waits.
             let call = if call_target.takes(&callback.args, &callback.return_type) {
-                call_target.wrap(call)
+                if matches!(callback.return_type, Type::Void) {
+                    call_target.wrap_oneshot(call)
+                } else {
+                    call_target.wrap(call)
+                }
             } else {
                 quote!(
                     let _self = #self_init;
@@ -1569,7 +1615,10 @@ fn public_api(
                         MemberAccess::Direct(access_member(&p.prop, ctx).unwrap()),
                     );
                     let set_forwarded = property_set_value_tokens(&p.prop, quote!(forwarded), ctx);
-                    let carry = call_target.wrap(set_forwarded);
+                    // The carry is an assignment, not a question: it goes one
+                    // way, and the next call that reads the drawn tree waits
+                    // behind it in the same queue, so it still sees this value.
+                    let carry = call_target.wrap_oneshot(set_forwarded);
                     quote!(
                         // The value the application assigned is now on the tree it
                         // holds, but the tree the window draws is the one whose
@@ -1578,6 +1627,14 @@ fn public_api(
                         // this here, where it assigns the value that is already
                         // set and changes nothing.
                         let forwarded = #read_back;
+                        #carry
+                    )
+                } else if let Type::Array(_) = &p.ty {
+                    let prop_access = access_member(&p.prop, ctx).unwrap();
+                    let set_forwarded = quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(forwarded))));
+                    let carry = call_target.wrap_oneshot(set_forwarded);
+                    quote!(
+                        let forwarded = #prop_access.get().iter().collect::<Vec<_>>();
                         #carry
                     )
                 } else {

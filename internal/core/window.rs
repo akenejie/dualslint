@@ -170,6 +170,27 @@ pub trait WindowAdapter {
         task(&local_tree);
     }
 
+    /// Post a call to the tree the window draws, one way.
+    ///
+    /// The generated code posts calls whose effect is the point and that
+    /// expect no answer -- a popup opening, a value the drawing thread holds
+    /// being assigned. Nothing comes back, so the caller does not wait for the
+    /// call to have run, and a backend whose drawn tree lives on another
+    /// thread can hand it over without the round trip a [`Self::run_on_screen_tree`]
+    /// answer needs.
+    ///
+    /// The default runs the call like [`Self::run_on_screen_tree`] does, which
+    /// is right for a backend that draws the tree the caller holds: the call
+    /// lands where it always did.
+    #[doc(hidden)]
+    fn post_on_screen_tree(
+        &self,
+        local_tree: ItemTreeRc,
+        task: Box<dyn FnOnce(&ItemTreeRc) + Send + 'static>,
+    ) {
+        self.run_on_screen_tree(local_tree, task)
+    }
+
     /// Re-implement this function to update the properties such as window title or layout constraints.
     ///
     /// This function is called before `set_visible(true)`, and will be called again when the properties
@@ -2973,6 +2994,60 @@ pub mod ffi {
         let local = unsafe { &*local_tree }.clone();
         let window_adapter = unsafe { &*(handle as *const Rc<dyn WindowAdapter>) };
         window_adapter.run_on_screen_tree(local, Box::new(run));
+    }
+
+    /// Post `task` against the tree the window in `handle` shows, one way.
+    ///
+    /// This is `slint_windowrc_run_on_screen_tree` for calls that expect no
+    /// answer: the call is queued for the thread that draws and this returns
+    /// without waiting for it. The queue is FIFO, so a call posted before the
+    /// drawn tree exists still reaches it once it does; one posted when no
+    /// tree is drawn anymore is dropped. `destroy` runs exactly once either
+    /// way -- after the task has run, or when the dropped call takes its data
+    /// with it -- so the caller's data is freed on whichever path it took.
+    ///
+    /// Safety: `handle` and `local_tree` must point to valid values of their
+    /// types, and `user_data` must be valid for `task` and `destroy` to use.
+    /// `task`, `user_data` and `destroy` cross to the render thread as if they
+    /// were `Send`, so whatever they reach must be safe to use there -- which
+    /// holds when the call only carries plain values.
+    #[cfg(feature = "std")]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_windowrc_post_on_screen_tree(
+        handle: *const WindowAdapterRcOpaque,
+        local_tree: *const ItemTreeRc,
+        user_data: *mut c_void,
+        task: extern "C" fn(*mut c_void, *const ItemTreeRc),
+        destroy: extern "C" fn(*mut c_void),
+    ) {
+        /// The callback and its data, carried to the render thread. The data
+        /// is the caller's and its lifetime is the call's: the destructor runs
+        /// when this struct is dropped, which is after the task has run -- or
+        /// when a dropped call discards it.
+        struct PortableCall {
+            user_data: *mut c_void,
+            task: extern "C" fn(*mut c_void, *const ItemTreeRc),
+            destroy: extern "C" fn(*mut c_void),
+        }
+        impl Drop for PortableCall {
+            fn drop(&mut self) {
+                (self.destroy)(self.user_data)
+            }
+        }
+        // SAFETY: the caller guarantees, as documented above, that the task,
+        // its data and the destructor can be used on the render thread.
+        unsafe impl Send for PortableCall {}
+
+        let call = PortableCall { user_data, task, destroy };
+        let run = move |tree: &ItemTreeRc| {
+            // Hold the whole call so the closure carries the `Send` wrapper
+            // rather than capturing the raw pointer on its own.
+            let call = &call;
+            (call.task)(call.user_data, core::ptr::from_ref(tree));
+        };
+        let local = unsafe { &*local_tree }.clone();
+        let window_adapter = unsafe { &*(handle as *const Rc<dyn WindowAdapter>) };
+        window_adapter.post_on_screen_tree(local, Box::new(run));
     }
 
     /// Remember how to make another instance of the component showing in `handle`.
