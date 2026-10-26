@@ -169,15 +169,24 @@ fn wire_radio_button(
     };
     let item_index_ref =
         || Expression::PropertyReference(NamedReference::new(child, "item-index".into()));
+    // A literal typed the way the branches have to agree: a bare `0.0`
+    // carries `float`, and a condition whose branches disagree collapses to
+    // void — which then lands in these `int` properties' bindings and the
+    // generated code can no longer return its value. `default_value_for_type`
+    // spells the int zero the same way the resolver would have.
+    let int_zero = || Expression::Cast {
+        from: Box::new(Expression::NumberLiteral(0.0, Unit::None)),
+        to: Type::Int32,
+    };
     let row_expr = Expression::Condition {
         condition: is_vertical.clone().into(),
         true_expr: item_index_ref().into(),
-        false_expr: Expression::NumberLiteral(0.0, Unit::None).into(),
+        false_expr: int_zero().into(),
         source_location: None,
     };
     let col_expr = Expression::Condition {
         condition: is_vertical.into(),
-        true_expr: Expression::NumberLiteral(0.0, Unit::None).into(),
+        true_expr: int_zero().into(),
         false_expr: item_index_ref().into(),
         source_location: None,
     };
