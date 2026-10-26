@@ -38,18 +38,30 @@ fn init() -> State {
     let main_window = MainWindow::new().unwrap();
 
     main_window.on_todo_added({
+        let weak_window = main_window.as_weak();
         let todo_model = todo_model.clone();
-        move |text| todo_model.push(TodoItem { checked: false, title: text })
+        move |text| {
+            todo_model.push(TodoItem { checked: false, title: text });
+            let window = weak_window.unwrap();
+            window.invoke_apply_sorting_and_filtering();
+        }
     });
     main_window.on_remove_done({
+        let weak_window = main_window.as_weak();
         let todo_model = todo_model.clone();
         move || {
             let mut offset = 0;
+            let mut removed = 0;
             for i in 0..todo_model.row_count() {
                 if todo_model.row_data(i - offset).unwrap().checked {
                     todo_model.remove(i - offset);
                     offset += 1;
+                    removed += 1;
                 }
+            }
+            if removed > 0 {
+                let window = weak_window.unwrap();
+                window.invoke_apply_sorting_and_filtering();
             }
         }
     });
