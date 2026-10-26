@@ -25,7 +25,7 @@ pub fn classify(builtin_name: Option<&str>, prop: &str) -> PropertyOwnership {
         "has-focus" | "focus" | "clear-focus" | "read-only" | "input-type" | "input-hint"
         | "action" | "cursor-position" | "cursor-position-byte-offset" | "selection-start"
         | "selection-end" | "anchor-position" | "text-cursor-width" | "font-metrics"
-        | "focus-on-click" | "focus-on-tab-navigation" | "mouse-cursor" => {
+        | "focus-on-click" | "focus-on-tab-navigation" | "mouse-cursor" | "input-method-hints" => {
             PropertyOwnership::Ui
         }
         "has-hover" | "pressed" | "enabled" => PropertyOwnership::Shared,
