@@ -142,7 +142,9 @@ impl CSlintControlPropertyValue {
 /// `component` and `item` must be the pointers the render thread passed in, and
 /// `property` must be a NUL-terminated string. When the tag written into `out`
 /// is [`SLINT_CONTROL_PROPERTY_TEXT`], `out.text` must be a NUL-terminated
-/// string that stays valid until this call returns.
+/// string that stays valid until the next read or write on the same thread:
+/// the value is copied after this call returns, so a buffer this call owns and
+/// destroys on its way out is gone by then.
 pub type SlintRenderThreadPropertyRead = unsafe extern "C" fn(
     component: *const std::os::raw::c_void,
     item: *const std::os::raw::c_void,
