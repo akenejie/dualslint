@@ -621,6 +621,14 @@ impl<T: Clone + 'static> Model for VecModel<T> {
     }
 
     fn set_row_data(&self, row: usize, data: Self::Data) {
+        #[cfg(feature = "std")]
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!(
+                "[vecmodel] set_row_data {row} thread={:?} self={:p}",
+                std::thread::current().id(),
+                self as *const _,
+            );
+        }
         if row < self.row_count() {
             self.array.borrow_mut()[row] = data;
             self.notify.row_changed(row);
