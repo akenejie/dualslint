@@ -1274,6 +1274,10 @@ mod weak_handle {
         {
             let weak_handle = self.clone();
             super::invoke_from_event_loop(move || {
+                #[cfg(feature = "std")]
+                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                    std::eprintln!("[upgrade-in-event-loop] closure runs");
+                }
                 if let Some(h) = weak_handle.upgrade() {
                     func(h);
                 }

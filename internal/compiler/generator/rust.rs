@@ -1318,11 +1318,19 @@ fn render_handover_state(
             {
                 let host_window = slint::ComponentHandle::window(&component);
                 if sp::WindowInner::from_pub(host_window).has_host_callback(#index) {
+                    #[cfg(feature = "std")]
+                    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                        std::eprintln!("[handover-route] installing route for callback #index", #index);
+                    }
                     let local_tree = sp::VRc::into_dyn(component.0.clone());
                     let local_identity = sp::item_tree_identity(&local_tree);
                     let ui_thread = std::thread::current().id();
                     let app = weak.clone();
                     host_window.call_on_screen_tree(local_tree, move |tree| {
+                        #[cfg(feature = "std")]
+                        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                            std::eprintln!("[handover-route] task runs");
+                        }
                         // A window with no tree of its own runs this against the tree
                         // the application holds. Pointing that tree's callback back at
                         // the application would have it call itself, so leave it: the

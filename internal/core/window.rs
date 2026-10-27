@@ -1350,6 +1350,10 @@ impl WindowInner {
     #[cfg(feature = "std")]
     #[doc(hidden)]
     pub fn note_host_callback(&self, index: u32) {
+        #[cfg(feature = "std")]
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[note-host-callback] index={index}");
+        }
         self.host_handled_callbacks.borrow_mut().insert(index);
     }
 

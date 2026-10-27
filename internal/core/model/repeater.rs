@@ -667,6 +667,15 @@ impl<C: RepeatedItemTree + 'static> Repeater<C> {
             let old_model = model.get_internal();
             let m = model.get();
             if old_model != m {
+                #[cfg(feature = "std")]
+                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                    std::eprintln!(
+                        "[repeater] model swap old_count={:?} new_count={} thread={:?}",
+                        old_model.row_count(),
+                        m.row_count(),
+                        std::thread::current().id(),
+                    );
+                }
                 *self.data().inner.borrow_mut() = RepeaterInner::default();
                 self.data().is_dirty.set(true);
                 let peer = self.project_ref().0.model_peer();

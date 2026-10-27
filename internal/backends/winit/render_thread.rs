@@ -1027,6 +1027,10 @@ impl RenderHost {
         // deliver, and the loop's `done.send` closing without a reader is how
         // the call is marked done.
         let (done, _reply) = std::sync::mpsc::sync_channel::<()>(1);
+        #[cfg(feature = "std")]
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[post] set_model carry posted");
+        }
         let _ = self.sender.send(RenderMessage::RunOnScreenTree { task, done });
     }
 
@@ -2057,6 +2061,13 @@ impl RenderCore {
                         if let Some(tree) = render_window_adapter.as_ref().and_then(|adapter| {
                             WindowInner::from_pub(adapter.window()).try_component()
                         }) {
+                            #[cfg(feature = "std")]
+                            if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                std::eprintln!(
+                                    "[run-on-screen] task runs, identity={:p}",
+                                    i_slint_core::item_tree::item_tree_identity(&tree) as *const ()
+                                );
+                            }
                             task(&tree);
                             present = true;
                         }
