@@ -87,7 +87,11 @@ fn get_local(instance: &Instance, name: &str) -> Option<Value> {
 /// it holds.
 fn get_from_screen_tree(instance: &Instance, name: &str) -> Option<Value> {
     let adapter = instance.window_adapter_or_default()?;
-    let local_tree = WindowInner::from_pub(adapter.window()).try_component()?;
+    // The tree the caller holds is this instance's own tree -- not the
+    // window's component: a component embedded in a container lives in the
+    // window of the component that embeds it, whose tree is somebody else's.
+    let local_tree = instance.self_weak.get().and_then(|w| w.upgrade())?;
+    let local_tree = VRc::into_dyn(local_tree);
     // The answer comes back through a pointer rather than a channel, because
     // `Value` is not `Send` -- a model is a shared reference. The task the
     // backend runs is what fills the slot, and the backend runs it before
@@ -187,9 +191,13 @@ fn set_local(instance: &Instance, name: &str, mut value: Value) -> Result<(), Se
 /// same tree, where [`set_local`] assigns the value that is already set.
 fn forward_public_property(instance: &Instance, name: &str, value: Value) {
     let Some(adapter) = instance.window_adapter_or_default() else { return };
-    let Some(local_tree) = WindowInner::from_pub(adapter.window()).try_component() else {
+    // The tree the caller holds is this instance's own tree -- not the
+    // window's component: a component embedded in a container lives in the
+    // window of the component that embeds it, whose tree is somebody else's.
+    let Some(local_tree) = instance.self_weak.get().and_then(|w| w.upgrade()) else {
         return;
     };
+    let local_tree = VRc::into_dyn(local_tree);
     // `Value` is not `Send` because a model is a shared reference, but the
     // carried value is one that can travel, and the task runs before
     // `run_on_screen_tree` returns.

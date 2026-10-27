@@ -1474,7 +1474,11 @@ impl CallTarget {
     /// would freeze where it began.
     fn wrap_carry(&self, call: TokenStream) -> TokenStream {
         match self {
-            CallTarget::OwnTree => call,
+            // A target with no drawn tree of its own has nothing to carry to:
+            // the setter already assigned the value on the one tree there is,
+            // and assigning again would detach what the application put there
+            // -- a model the application still mutates, say.
+            CallTarget::OwnTree => quote!(),
             CallTarget::ScreenTree { window, inner_component } => quote! {
                 let local_tree = sp::VRc::into_dyn(self.0.clone());
                 let local_identity = sp::item_tree_identity(&local_tree);
