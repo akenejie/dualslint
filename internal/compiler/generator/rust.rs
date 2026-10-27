@@ -25,7 +25,7 @@ use crate::llr::lower_layout_expression::{
 };
 use crate::llr::{
     self, ArrayOutput, EvaluationContext as llr_EvaluationContext, EvaluationScope, Expression,
-    ParentScope, TypeResolutionContext as _,
+    ParentScope, TypeResolutionContext as _, is_send_type,
 };
 use crate::object_tree::Document;
 use crate::typeloader::LibraryInfo;
@@ -1242,7 +1242,12 @@ fn render_handover_state(
     ctx: &EvaluationContext,
 ) -> TokenStream {
     let carries = public_properties.iter().filter_map(|(_, p)| {
-        if !p.ty.is_property_type() || p.read_only() || (!is_thread_portable_type(&p.ty) && !matches!(&p.ty, Type::Array(_))) {
+        let carried = match &p.ty {
+            _ if !p.ty.is_property_type() || p.read_only() => false,
+            Type::Array(element) => is_send_type(element),
+            other => is_thread_portable_type(other),
+        };
+        if !carried {
             return None;
         }
         let prop_access = access_member(&p.prop, ctx).unwrap();
@@ -1458,6 +1463,36 @@ impl CallTarget {
         }
     }
 
+    /// The statements a property carry runs: the value assigned onto the tree
+    /// on screen, one way.
+    ///
+    /// This is [`Self::wrap_oneshot`] with one guard added: a backend that
+    /// draws the tree the caller holds runs the task against that same tree,
+    /// where the setter has already assigned the value. Assigning again would
+    /// restart an animated property from its current frame -- for a condition
+    /// like `alternate-reverse` that frame is the target, so the animation
+    /// would freeze where it began.
+    fn wrap_carry(&self, call: TokenStream) -> TokenStream {
+        match self {
+            CallTarget::OwnTree => call,
+            CallTarget::ScreenTree { window, inner_component } => quote! {
+                let local_tree = sp::VRc::into_dyn(self.0.clone());
+                let local_identity = sp::item_tree_identity(&local_tree);
+                #window.post_on_screen_tree(local_tree, move |tree| {
+                    if sp::item_tree_identity(tree) == local_identity {
+                        return;
+                    }
+                    let component = sp::VRc::map_dyn(tree.clone(), |tree| {
+                        sp::VRef::downcast_pin::<#inner_component>(tree)
+                            .expect("the tree on screen is not the component the call belongs to")
+                    });
+                    let _self = component.as_pin_ref();
+                    #call
+                })
+            },
+        }
+    }
+
     /// Whether a call of these types can be moved to the tree on screen.
     fn takes(&self, args: &[Type], ret: &Type) -> bool {
         matches!(self, CallTarget::ScreenTree { .. })
@@ -1609,42 +1644,61 @@ fn public_api(
             let setter_ident = accessor_names::rust_accessor_ident(name, AccessorKind::Setter);
             if !p.read_only() {
                 let set_value = property_set_value_tokens(&p.prop, quote!(value), ctx);
-                let forward = if call_target.takes(&[], &p.ty) && p.ty.is_property_type() {
-                    let read_back = primitive_property_value(
-                        &p.ty,
-                        MemberAccess::Direct(access_member(&p.prop, ctx).unwrap()),
-                    );
+                let (pre_forward, forward) = if call_target.takes(&[], &p.ty)
+                    && p.ty.is_property_type()
+                {
+                    // The carry assigns `value` itself, not a value read back
+                    // from the local tree: an animated property has already
+                    // started moving toward what was assigned, and reading it
+                    // back would hand the drawn tree frame zero, freezing its
+                    // own animation at the old number. The clone is taken
+                    // before the local set consumes `value`.
                     let set_forwarded = property_set_value_tokens(&p.prop, quote!(forwarded), ctx);
                     // The carry is an assignment, not a question: it goes one
                     // way, and the next call that reads the drawn tree waits
                     // behind it in the same queue, so it still sees this value.
-                    let carry = call_target.wrap_oneshot(set_forwarded);
-                    quote!(
-                        // The value the application assigned is now on the tree it
-                        // holds, but the tree the window draws is the one whose
-                        // bindings decide what is seen, so carry the value there
-                        // too. A backend that draws the tree the caller holds runs
-                        // this here, where it assigns the value that is already
-                        // set and changes nothing.
-                        let forwarded = #read_back;
-                        #carry
+                    let carry = call_target.wrap_carry(set_forwarded);
+                    (
+                        quote!(let forwarded = value.clone();),
+                        quote!(
+                            // The value the application assigned is now on the
+                            // tree it holds, but the tree the window draws is the
+                            // one whose bindings decide what is seen, so carry
+                            // the value there too. A backend that draws the tree
+                            // the caller holds runs this against that same tree,
+                            // where the guard in the carry sees no work and
+                            // changes nothing.
+                            #carry
+                        ),
                     )
-                } else if let Type::Array(_) = &p.ty {
+                } else if let Type::Array(element) = &p.ty
+                    && crate::llr::is_send_type(element)
+                {
+                    // A model whose rows are plain values can have the rows
+                    // copied across. One whose rows hold a nested model cannot:
+                    // the row would carry a reference into the tree the caller
+                    // holds, and the drawn tree keeps its own copy instead --
+                    // the same divergence the non-portable properties accept.
                     let prop_access = access_member(&p.prop, ctx).unwrap();
-                    let set_forwarded = quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(forwarded))));
-                    let carry = call_target.wrap_oneshot(set_forwarded);
-                    quote!(
-                        let forwarded = #prop_access.get().iter().collect::<Vec<_>>();
-                        #carry
+                    let set_forwarded =
+                        quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(forwarded))));
+                    let carry = call_target.wrap_carry(set_forwarded);
+                    (
+                        quote!(),
+                        quote!(
+                            let forwarded = #prop_access.get().iter().collect::<Vec<_>>();
+                            #carry
+                        ),
                     )
                 } else {
-                    quote!()
+                    (quote!(), quote!())
                 };
                 property_and_callback_accessors.push(quote!(
                     #[allow(dead_code)]
                     pub fn #setter_ident(&self, value: #rust_property_type) {
                         #[allow(unused_imports)]
                         let _self = #self_init;
+                        #pre_forward
                         #set_value;
                         #forward
                     }

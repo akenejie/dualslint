@@ -3819,6 +3819,7 @@ fn screen_tree_call_code(
     arg_sources: &[String],
     ret: &crate::langtype::Type,
     call: &str,
+    skip_same_tree: bool,
 ) -> Vec<String> {
     let PublicCallTarget::ScreenTree { component_type } = route else {
         unreachable!("only screen-tree calls are generated here")
@@ -3838,6 +3839,9 @@ fn screen_tree_call_code(
     }
     if returns_value {
         code.push(format!("    {} result;", ret.cpp_type().unwrap()));
+    }
+    if skip_same_tree {
+        code.push("    const void *local_instance;".to_string());
     }
     code.push("};".to_string());
     if returns_value {
@@ -3868,13 +3872,17 @@ fn screen_tree_call_code(
         code.push("return call_data.result;".to_string());
         return code;
     }
-    // A one-way call owns its data on the heap: the caller's frame is gone by
-    // the time the render thread runs it. The destructor callback frees it
-    // exactly once, on whichever path the call took.
-    code.push(format!(
-        "auto *call_data = new SlintScreenTreeCallData{{ {} }};",
-        arg_sources.join(", ")
-    ));
+    // A one-way carry carries the identity of the tree the caller holds, so
+    // the task can recognize a backend that draws that same tree: assigning
+    // there a second time would restart an animated property from its current
+    // frame and freeze it where it began.
+    let data_fields = arg_sources
+        .iter()
+        .cloned()
+        .chain(skip_same_tree.then(|| "local_tree->borrow().instance".to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    code.push(format!("auto *call_data = new SlintScreenTreeCallData{{ {data_fields} }};"));
     code.push("slint::cbindgen_private::slint_windowrc_post_on_screen_tree(".to_string());
     code.push("    &self->m_globals.window().window_handle().handle(),".to_string());
     code.push("    &local_tree->into_dyn(),".to_string());
@@ -3886,6 +3894,11 @@ fn screen_tree_call_code(
         "        [[maybe_unused]] auto *data = static_cast<SlintScreenTreeCallData *>(user_data);"
             .to_string(),
     );
+    if skip_same_tree {
+        code.push(
+            "        if (tree->borrow().instance == data->local_instance) { return; }".to_string(),
+        );
+    }
     code.push(format!(
         "        if (tree->vtable() != &{component_type}::static_vtable) {{ return; }}"
     ));
@@ -4040,6 +4053,7 @@ fn generate_public_api_for_properties(
                     &(0..param_types.len()).map(|i| format!("arg_{i}")).collect::<Vec<_>>(),
                     &callback.return_type,
                     &call,
+                    false,
                 ));
                 code
             } else {
@@ -4111,6 +4125,7 @@ fn generate_public_api_for_properties(
                     &(0..param_types.len()).map(|i| format!("arg_{i}")).collect::<Vec<_>>(),
                     &function.return_type,
                     &call,
+                    false,
                 ));
                 code
             } else {
@@ -4167,6 +4182,7 @@ fn generate_public_api_for_properties(
                     &[],
                     &p.ty,
                     &format!("{access}.get()"),
+                    false,
                 ));
             } else {
                 prop_getter.push(format!("return {access}.get();"));
@@ -4200,6 +4216,7 @@ fn generate_public_api_for_properties(
                         &["value".to_string()],
                         &Type::Void,
                         &call,
+                        true,
                     ));
                 }
                 declarations.push((

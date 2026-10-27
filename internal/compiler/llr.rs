@@ -43,6 +43,35 @@ pub fn is_thread_portable_type(ty: &crate::langtype::Type) -> bool {
     )
 }
 
+/// Whether a value of this type can cross to the thread that draws, by value.
+///
+/// `is_thread_portable_type` answers for the types a binding expression
+/// produces; this one answers for property types too, which is what the
+/// setter carry needs: a model property whose rows are plain records can
+/// have those rows copied across, while one whose rows hold a nested model
+/// cannot, because the row then carries a reference into the tree the
+/// caller holds.
+pub fn is_send_type(ty: &crate::langtype::Type) -> bool {
+    use crate::langtype::Type;
+    match ty {
+        Type::Struct(s) => s.fields.values().all(is_send_field),
+        other => is_thread_portable_type(other),
+    }
+}
+
+/// Whether a value of this type can sit in a record that crosses to the thread
+/// that draws. A struct field of array type is a model handle -- a reference
+/// into the tree that owns it, not a copyable value -- so an array field keeps
+/// its record home, however plain the element type looks.
+fn is_send_field(ty: &crate::langtype::Type) -> bool {
+    use crate::langtype::Type;
+    match ty {
+        Type::Array(_) => false,
+        Type::Struct(s) => s.fields.values().all(is_send_field),
+        other => is_thread_portable_type(other),
+    }
+}
+
 /// The optimization passes over the LLR
 pub mod optim_passes {
     pub mod count_property_use;
