@@ -231,6 +231,15 @@ pub fn unregister_item_tree<Base>(
         items_to_unregister: &mut dyn Iterator<Item = Pin<ItemRef<'_>>>,
         window_adapter: &WindowAdapterRc,
     ) {
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!(
+                "[unregister] tree ptr={:p} thread={:?}",
+                crate::item_tree::ItemTreeRef::as_ptr(item_tree)
+                    .cast::<core::ffi::c_void>()
+                    .as_ptr(),
+                std::thread::current().id(),
+            );
+        }
         items_to_deinit.for_each(|item| item.as_ref().deinit(window_adapter));
         window_adapter.renderer().free_graphics_resources(item_tree, items_to_free).expect(
             "Fatal error encountered when freeing graphics resources while destroying Slint component",

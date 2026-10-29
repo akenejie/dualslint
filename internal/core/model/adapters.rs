@@ -968,10 +968,28 @@ where
     type Data = M::Data;
 
     fn row_count(&self) -> usize {
-        self.0.wrapped_model.row_count()
+        let c = self.0.wrapped_model.row_count();
+        #[cfg(feature = "std")]
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!(
+                "[sortmodel] row_count={c} dirty={:?} thread={:?} self={:p}",
+                self.0.sorted_rows_dirty.get(),
+                std::thread::current().id(),
+                self as *const _,
+            );
+        }
+        c
     }
 
     fn row_data(&self, row: usize) -> Option<Self::Data> {
+        #[cfg(feature = "std")]
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!(
+                "[sortmodel] row_data({row}) thread={:?} self={:p}",
+                std::thread::current().id(),
+                self as *const _,
+            );
+        }
         self.0.build_mapping_vec();
 
         self.0
