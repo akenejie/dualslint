@@ -22,8 +22,10 @@ use pin_project::pin_project;
 mod adapters;
 mod model_peer;
 mod repeater;
+mod screen_tree_model;
 
 pub use repeater::{Conditional, ListViewProperties, RepeatedItemTree, Repeater, RepeaterTracker};
+pub use screen_tree_model::{ScreenTreeModel, screen_tree_model_carry};
 
 /// Error returned by the row mutation functions of [`Model`] when the modification
 /// was not applied.

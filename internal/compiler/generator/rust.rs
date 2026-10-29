@@ -1258,10 +1258,7 @@ fn render_handover_state(
             )
         } else {
             (
-                primitive_property_value(
-                    &p.ty,
-                    MemberAccess::Direct(prop_access.clone()),
-                ),
+                primitive_property_value(&p.ty, MemberAccess::Direct(prop_access.clone())),
                 property_set_value_tokens(&p.prop, quote!(value), ctx),
             )
         };
@@ -1318,18 +1315,14 @@ fn render_handover_state(
             {
                 let host_window = slint::ComponentHandle::window(&component);
                 if sp::WindowInner::from_pub(host_window).has_host_callback(#index) {
-                    #[cfg(feature = "std")]
-                    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                        std::eprintln!("[handover-route] installing route for callback #index", #index);
-                    }
                     let local_tree = sp::VRc::into_dyn(component.0.clone());
                     let local_identity = sp::item_tree_identity(&local_tree);
                     let ui_thread = std::thread::current().id();
                     let app = weak.clone();
                     host_window.call_on_screen_tree(local_tree, move |tree| {
-                        #[cfg(feature = "std")]
-                        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                            std::eprintln!("[handover-route] task runs");
+                        if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                            ::std::eprintln!("[route] install idx={} same_tree={}",
+                                #index, sp::item_tree_identity(tree) == local_identity);
                         }
                         // A window with no tree of its own runs this against the tree
                         // the application holds. Pointing that tree's callback back at
@@ -1346,16 +1339,23 @@ fn render_handover_state(
                         let _self = component.as_pin_ref();
                         #callback_access.set_handler(move |#args_param| {
                             #(let #arg_names = args.#arg_indices.clone();)*
+                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                ::std::eprintln!("[route] called idx={}", #index);
+                            }
                             if std::thread::current().id() == ui_thread {
                                 if let Some(component) = app.upgrade() {
                                     let _self = sp::VRc::as_pin_ref(&component.0);
                                     #callback_access.call(&(#(#arg_names,)*));
                                 }
                             } else {
-                                let _ = app.upgrade_in_event_loop(move |component| {
+                                let routed = app.upgrade_in_event_loop(move |component| {
                                     let _self = sp::VRc::as_pin_ref(&component.0);
                                     #callback_access.call(&(#(#arg_names,)*));
                                 });
+                                if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                    ::std::eprintln!("[route] upgrade_in_event_loop idx={} -> {:?}",
+                                        #index, routed.err());
+                                }
                             }
                         });
                     });
@@ -1491,6 +1491,13 @@ impl CallTarget {
                 let local_tree = sp::VRc::into_dyn(self.0.clone());
                 let local_identity = sp::item_tree_identity(&local_tree);
                 #window.post_on_screen_tree(local_tree, move |tree| {
+                    let tree_identity = sp::item_tree_identity(tree);
+                    if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                        ::std::eprintln!(
+                            "[carry] task runs local={local_identity:#x} tree={tree_identity:#x} same={}",
+                            tree_identity == local_identity,
+                        );
+                    }
                     if sp::item_tree_identity(tree) == local_identity {
                         return;
                     }
@@ -1691,14 +1698,45 @@ fn public_api(
                     // the row would carry a reference into the tree the caller
                     // holds, and the drawn tree keeps its own copy instead --
                     // the same divergence the non-portable properties accept.
+                    //
+                    // The copy is a model of its own, not a throwaway
+                    // snapshot: the same one is updated in place on every
+                    // carry, so the drawn tree's repeater reuses its row
+                    // instances instead of dropping them all, and the rows the
+                    // user edits on screen -- a checkbox ticked in the drawn
+                    // tree -- are written back to the model the application
+                    // holds, where the sorted and filtered views read them.
                     let prop_access = access_member(&p.prop, ctx).unwrap();
-                    let set_forwarded =
-                        quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(forwarded))));
+                    let set_forwarded = quote! {
+                        #prop_access.set(sp::screen_tree_model_carry(
+                            &#prop_access.get(),
+                            forwarded,
+                            write_back,
+                        ));
+                    };
                     let carry = call_target.wrap_carry(set_forwarded);
                     (
                         quote!(),
                         quote!(
                             let forwarded = #prop_access.get().iter().collect::<Vec<_>>();
+                            // The rows the user edits on screen belong to the
+                            // application's model, not to the drawn tree's
+                            // copy: the drawn tree's model hands every edited
+                            // row back through this, on the thread the
+                            // application runs on. The weak handle is a `Send`
+                            // one, which is what lets it travel with the model.
+                            //
+                            // `prop_access` pins against `_self`, which the
+                            // upgrade's closure names: the application's tree.
+                            let write_back = {
+                                let weak = slint::ComponentHandle::as_weak(self);
+                                move |row, data| {
+                                    let _ = weak.upgrade_in_event_loop(move |component| {
+                                        let _self = sp::VRc::as_pin_ref(&component.0);
+                                        #prop_access.get().set_row_data(row, data);
+                                    });
+                                }
+                            };
                             #carry
                         ),
                     )

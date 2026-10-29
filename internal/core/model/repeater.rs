@@ -802,6 +802,19 @@ impl<C: RepeatedItemTree + 'static> Repeater<C> {
 
     /// Sets the data directly in the model
     pub fn model_set_row_data(self: Pin<&Self>, row: usize, data: C::Data) {
+        // A model swap that has not been materialized yet leaves the row
+        // instances holding another model's rows and indices. Writing the
+        // cached row through now would land old data in a new model's row --
+        // titles and checked states scrambling across rows. The pending swap
+        // rebuilds every row from the new model anyway, so the write has
+        // nothing left to say: drop it.
+        if self.data().project_ref().model.is_dirty() {
+            #[cfg(feature = "std")]
+            if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                std::eprintln!("[repeater] row write to {row} dropped: a model swap is pending");
+            }
+            return;
+        }
         let model = self.model();
         model.set_row_data(row, data);
     }
