@@ -12,7 +12,7 @@
 [package]
 name = "i-slint-backend-scene"
 description = "Control protocol types and geometry-only encoder for the 2-thread backends"
-authors.workspace = true
+authors = ["akenejie <akenegit@outlook.com>"]
 edition.workspace = true
 homepage.workspace = true
 license = "AGPL-3.0-only"
