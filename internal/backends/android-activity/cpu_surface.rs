@@ -1,4 +1,4 @@
-// Copyright © akenejie <mailto:akenejie@gmail.com>
+// Copyright © akenejie
 // SPDX-License-Identifier: AGPL-3.0-only
 
 //! CPU presentation for the android-activity backend.

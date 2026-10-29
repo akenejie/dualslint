@@ -1,3 +1,6 @@
+// Copyright © akenejie
+// SPDX-License-Identifier: AGPL-3.0-only
+//
 thread_local! {
     static THREAD_LOCAL_ACCESS: std::cell::RefCell<Option<ThreadLocalAccess>> = const { std::cell::RefCell::new(None) };
 }
@@ -38,9 +41,6 @@ fn set_tl_access(access: Option<ThreadLocalAccess>) {
 #[cfg(not(render_thread_can_draw))]
 fn set_tl_access(_access: Option<ThreadLocalAccess>) {}
 
-// Copyright © akenejie
-// SPDX-License-Identifier: AGPL-3.0-only
-//
 // dualslint — 2-thread render separation for the Slint GUI toolkit.
 //
 // This module is the cross-thread protocol and the render-thread GL driver.

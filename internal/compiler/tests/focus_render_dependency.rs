@@ -1,5 +1,5 @@
-// Copyright © SixtyFPS GmbH <info@slint.dev>
-// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Software-3.0
+// Copyright © akenejie
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Whether moving focus on screen has to redraw is decided from the elements,
 //! before the drawing thread ever sees them. These tests pin that decision: a

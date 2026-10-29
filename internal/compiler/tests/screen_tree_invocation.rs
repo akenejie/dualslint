@@ -1,5 +1,5 @@
-// Copyright © SixtyFPS GmbH <info@slint.dev>
-// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Software-3.0
+// Copyright © akenejie
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! A window-rooted component's exported callback and function calls are carried to the tree the
 //! window shows, on the thread that draws it, so that they reach the bindings and callbacks that

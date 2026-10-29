@@ -1,5 +1,5 @@
-// Copyright © akenejie <mailto:akenejie@gmail.com>
-// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
+// Copyright © akenejie
+// SPDX-License-Identifier: AGPL-3.0-only
 
 // cSpell: ignore DummyDisplayHandle
 

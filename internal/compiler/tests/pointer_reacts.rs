@@ -1,5 +1,5 @@
-// Copyright © SixtyFPS GmbH <info@slint.dev>
-// SPDX-License-Identifier: GPL-3.0-only OR License-Royalty-free-2.0 OR License-Slint-Royalty-free-2.0
+// Copyright © akenejie
+// SPDX-License-Identifier: AGPL-3.0-only
 
 //! Whether a pointer event on a control has to reach the drawing thread is
 //! decided from the elements, before either thread sees them. These tests pin
