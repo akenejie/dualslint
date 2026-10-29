@@ -57,6 +57,17 @@ impl<T: Clone> ItemCache<T> {
     pub fn get_or_update_cache_entry(&self, item_rc: &ItemRc, update_fn: impl FnOnce() -> T) -> T {
         let component = &(**item_rc.item_tree()) as *const _;
         let mut borrowed = self.map.borrow_mut();
+        // The key is an address, which a dropped tree's slot hands to the next
+        // allocation. An entry whose tree is gone serves data computed for
+        // whatever lived there before -- glyphs saying one thing while the
+        // property says another -- so it is dropped here and computed fresh.
+        if let Some(per_component) = borrowed.get_mut(&component)
+            && per_component
+                .get(&item_rc.index())
+                .is_some_and(|entry| entry.owner.as_ref().is_some_and(|o| o.upgrade().is_none()))
+        {
+            per_component.remove(&item_rc.index());
+        }
         match borrowed.entry(component).or_default().entry(item_rc.index()) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
                 let mut tracker = entry.get_mut().dependency_tracker.take();
@@ -77,7 +88,12 @@ impl<T: Clone> ItemCache<T> {
             }
             std::collections::hash_map::Entry::Vacant(_) => {
                 drop(borrowed);
-                let new_entry = crate::graphics::CachedGraphicsData::new(update_fn);
+                let owner = vtable::VRc::downgrade(item_rc.item_tree());
+                let new_entry = crate::graphics::CachedGraphicsData::new(
+                    update_fn,
+                    #[cfg(feature = "std")]
+                    Some(owner),
+                );
                 let data = new_entry.data.clone();
                 self.map
                     .borrow_mut()
@@ -128,6 +144,9 @@ impl<T> ItemCache<T> {
     pub fn component_destroyed(&self, component: crate::item_tree::ItemTreeRef) {
         let component_ptr: *const _ =
             crate::item_tree::ItemTreeRef::as_ptr(component).cast().as_ptr();
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[textcache] destroy ptr={:p}", component_ptr);
+        }
         self.map.borrow_mut().remove(&component_ptr);
     }
 
@@ -169,6 +188,13 @@ impl<T> ItemCache<T> {
 
         {
             let mut borrowed = self.map.borrow_mut();
+            if let Some(per_component) = borrowed.get_mut(&component)
+                && per_component.get(&index).is_some_and(|entry| {
+                    entry.owner.as_ref().is_some_and(|o| o.upgrade().is_none())
+                })
+            {
+                per_component.remove(&index);
+            }
             match borrowed.entry(component).or_default().entry(index) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let mut tracker = entry.get_mut().dependency_tracker.take();
@@ -186,8 +212,16 @@ impl<T> ItemCache<T> {
                 }
                 std::collections::hash_map::Entry::Vacant(_) => {
                     drop(borrowed);
-                    let new_entry = crate::graphics::CachedGraphicsData::new(update_fn);
+                    let owner = vtable::VRc::downgrade(item_rc.item_tree());
+                    let new_entry = crate::graphics::CachedGraphicsData::new(
+                        update_fn,
+                        #[cfg(feature = "std")]
+                        Some(owner),
+                    );
                     self.map.borrow_mut().get_mut(&component).unwrap().insert(index, new_entry);
+                    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                        std::eprintln!("[textcache] new ptr={:p} idx={index}", component);
+                    }
                 }
             }
         }

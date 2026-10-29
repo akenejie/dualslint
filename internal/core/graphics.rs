@@ -88,15 +88,33 @@ pub struct CachedGraphicsData<T> {
     /// The property tracker that should be used to evaluate whether the primitive needs to be re-created
     /// or not.
     pub dependency_tracker: Option<core::pin::Pin<Box<crate::properties::PropertyTracker>>>,
+    /// The item tree the cached data was computed for, held weakly.
+    ///
+    /// The cache is keyed by the tree's address, and an address outlives the
+    /// tree that was there: a dropped component's slot is reused by the next
+    /// allocation. A key that matches a reused address would serve data
+    /// computed for the tree that is gone -- glyphs saying one thing while the
+    /// property says another -- so a serve checks that the tree it was made
+    /// for still lives, and a dead handle turns the entry into a miss.
+    #[cfg(feature = "std")]
+    pub owner: Option<crate::item_tree::ItemTreeWeak>,
 }
 
 impl<T> CachedGraphicsData<T> {
     /// Creates a new TrackingRenderingPrimitive by evaluating the provided update_fn once, storing the returned
     /// rendering primitive and initializing the dependency tracker.
-    pub fn new(update_fn: impl FnOnce() -> T) -> Self {
+    pub fn new(
+        update_fn: impl FnOnce() -> T,
+        #[cfg(feature = "std")] owner: Option<crate::item_tree::ItemTreeWeak>,
+    ) -> Self {
         let dependency_tracker = Box::pin(crate::properties::PropertyTracker::default());
         let data = dependency_tracker.as_ref().evaluate(update_fn);
-        Self { data, dependency_tracker: Some(dependency_tracker) }
+        Self {
+            data,
+            dependency_tracker: Some(dependency_tracker),
+            #[cfg(feature = "std")]
+            owner,
+        }
     }
 }
 

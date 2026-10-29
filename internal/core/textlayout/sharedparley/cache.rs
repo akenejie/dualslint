@@ -25,6 +25,12 @@ use super::*;
 /// handled by the cache as a whole.
 struct CachedParagraphs {
     wrap: TextWrap,
+    /// The string the paragraphs were shaped from, so a served entry can be
+    /// checked against the string the item holds now. A mismatch means the
+    /// cache is answering for an item the entry does not belong to -- the
+    /// drawn glyphs would then say one thing while the property says another.
+    #[cfg(feature = "std")]
+    source: crate::SharedString,
     /// What [`super::layout::layout`] derived when it last broke these paragraphs, so an
     /// unchanged-input call can skip the breaking. `None` after a reshape (fresh entries
     /// start without one) and while checked out through the guard.
@@ -219,6 +225,7 @@ pub(super) fn cached_paragraphs<'a>(
     cache: Option<&'a TextLayoutCache>,
     item_rc: Option<&crate::item_tree::ItemRc>,
     wrap: TextWrap,
+    source: &crate::SharedString,
     window: &crate::api::Window,
     font_context: &mut parley::FontContext,
     shape: &dyn Fn(&mut parley::FontContext) -> Vec<TextParagraph>,
@@ -259,12 +266,23 @@ pub(super) fn cached_paragraphs<'a>(
         cache.entry_count_estimate.set(cache.entry_count_estimate.get() + 1);
         CachedParagraphs {
             wrap,
+            source: source.clone(),
             paragraphs: Some(shape(font_context)),
             line_breaking: None,
             last_used: 0, // stamped right below, for both a hit and this miss
         }
     });
     entry.last_used = cache.generation.get();
+    if *source != entry.source && std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+        std::eprintln!(
+            "[draw-text-mismatch] item={} cached-from={:?} drawing={:?} component={:p} thread={:?}",
+            item_rc.index(),
+            entry.source,
+            source,
+            &(**item_rc.item_tree()) as *const _,
+            std::thread::current().id(),
+        );
+    }
     let paragraphs = entry.paragraphs.take().unwrap_or_default();
     CachedParagraphsGuard {
         paragraphs: Some(paragraphs),

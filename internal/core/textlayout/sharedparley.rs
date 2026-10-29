@@ -108,10 +108,23 @@ fn with_text_layout<R>(
 
     let text_wrap = layout_builder.text_wrap;
     let scale_factor = layout_builder.scale_factor;
-    let mut guard =
-        cached_paragraphs(cache, item_rc, text_wrap, window, &mut font_ctx, &|font_context| {
-            shape_paragraphs(text, item_rc, text_wrap, scale_factor, font_context)
-        });
+    // The string the item holds now, recorded with the shaped paragraphs so a
+    // served entry can be checked against it.
+    let source = match text.text() {
+        crate::item_rendering::PlainOrStyledText::Plain(text) => text,
+        crate::item_rendering::PlainOrStyledText::Styled(styled) => {
+            crate::SharedString::from(crate::styled_text::get_raw_text(&styled).as_ref())
+        }
+    };
+    let mut guard = cached_paragraphs(
+        cache,
+        item_rc,
+        text_wrap,
+        &source,
+        window,
+        &mut font_ctx,
+        &|font_context| shape_paragraphs(text, item_rc, text_wrap, scale_factor, font_context),
+    );
 
     let line_breaking = guard.take_line_breaking();
     let layout =
