@@ -205,8 +205,35 @@ publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hov
 ### 状態・モデルの同期に関する設計規約
 
 - **UI スレッドが状態・モデルを管理し、必要に応じて Render 側へ明示的に同期する:**
-  dualslint では、アプリケーションのデータモデル（`VecModel` 等）や状態は UI スレッド側で管理されます。モデルの変更（アイテムの追加や削除など）やソート・フィルタの適用を行った際、render スレッド側の mirror tree へ変更を反映させるには、UI 側から `set_xxx`（例: `window.set_todo_model(...)`）等を呼び出して明示的にデータを同期させる必要があります。
+  dualslint では、アプリケーションのデータモデル（`VecModel` 等）や状態は UI スレッド側で管理されます。モデルの変更（アイテムの追加や削除など）やソート・フィルタの適用を行った際、render スレッド側の mirror tree へ変更を反映させるには、UI 側から `set_xxx` 等を呼び出して明示的にデータを同期させる必要があります。
   フレームワーク側で暗黙的な全状態コピーや全自動同期は行わず、不必要なパフォーマンス低下や所有権の曖昧さを排除するため、状態の伝達タイミングはアプリケーション側の判断と責任に委ねられています。
+- **導出される表示は「再適用する同期関数」をアプリ側で定義し、モデルを変更したら呼び出す:**
+  ソートやフィルタで `set_xxx` に渡すモデルを作り替える処理は、`.slint` 側にコールバックとして宣言します。コンパイラが `on_xxx`（ハンドラ設定）と `invoke_xxx`（呼び出し）のアクセサを生成するので、UI コードはモデルを変更したあとに必ず `invoke_xxx` を呼びます。アプリケーションの状態から表示モデルを作り直す手順を一つの関数にまとめることで、同期のタイミングを呼び出し一箇所に集約できます。
+
+  ```slint
+  export component TaskList inherits Window {
+      in property <[Task]> tasks;
+      callback re-apply-view();   // 表示の作り直しを UI 側へ依頼する
+  }
+  ```
+
+  ```rust
+  task_list.on_re_apply_view({
+      let all_tasks = all_tasks.clone();
+      move || {
+          let view: ModelRc<Task> = if hide_done.get() {
+              Rc::new(FilterModel::new(all_tasks.clone(), |t| !t.done)).into()
+          } else {
+              all_tasks.clone().into()
+          };
+          task_list.set_tasks(view);   // この set が render 側の mirror へ carry される
+      }
+  });
+  // 行の追加・削除などモデルを変更したあと:
+  task_list.invoke_re_apply_view();
+  ```
+
+  行の中身の編集（描画ツリー上でのチェックボックスの指示など）は、mirror が保持するモデルのコピーからアプリケーションのモデルへ自動で書き戻されます。書き戻しは、`set_xxx` で同期済みの公開配列プロパティ（行がプレーンな値のもの）に対して有効で、ソートやフィルタを通る場合もインデックスは正しい行へ割り当てられます。
 
 ## アプリとの統合方法
 
