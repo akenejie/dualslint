@@ -517,7 +517,10 @@ impl Window {
         // The value travels back over a channel because the task may run on
         // another thread. A callback that panics there takes the sender with it,
         // which is what `unwrap_or_default` reports: a callback that did not
-        // return has no value to hand back.
+        // return has no value to hand back. The wait for the value is bounded
+        // for the same reason: the thread that runs the task can be wedged in
+        // a driver call that never comes back once the window is going away,
+        // and a getter that would hang the exit reads a default instead.
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         WindowInner::from_pub(self).window_adapter().run_on_screen_tree(
             local_tree,
@@ -525,7 +528,7 @@ impl Window {
                 let _ = sender.send(task(tree));
             }),
         );
-        receiver.recv().unwrap_or_default()
+        receiver.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or_default()
     }
 
     /// Post a call to the tree the window draws, one way.

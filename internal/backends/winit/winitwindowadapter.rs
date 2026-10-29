@@ -783,20 +783,6 @@ impl WinitWindowAdapter {
             }
         }
 
-        if show_after_creation {
-            self.shown.set(WindowVisibility::Hidden);
-            self.set_visibility(WindowVisibility::ShownFirstTime)?;
-        }
-
-        {
-            // Workaround for winit bug #2990
-            // Non-resizable windows can still contain a maximize button,
-            // so we'd have to additionally remove the button.
-            let mut buttons = winit_window.enabled_buttons();
-            buttons.set(WindowButtons::MAXIMIZE, resizable);
-            winit_window.set_enabled_buttons(buttons);
-        }
-
         self.shared_backend_data
             .register_window(winit_window.id(), (self.self_weak.upgrade().unwrap()) as _);
 
@@ -804,6 +790,14 @@ impl WinitWindowAdapter {
         // attached to it.  It only needs to know the window exists, and this is
         // the one place every renderer agrees on: whoever created the native
         // window, this window now exists.
+        //
+        // This runs before the show below, and the order matters: showing is
+        // what hands the window's drawing over to the render thread, and the
+        // handover's round trip asks that thread whether it owns the window --
+        // an answer it can only give once the Configure naming the window has
+        // reached it. Sent after the show, the first handover fails and the
+        // window waits for a later redraw to try again, which an idle
+        // application never asks for.
         if let Some(host) = self.render_host() {
             let size = self.size.get();
             let scale_factor = self.window().scale_factor() as f64;
@@ -817,6 +811,20 @@ impl WinitWindowAdapter {
                 scale_factor,
                 self.self_weak.clone(),
             );
+        }
+
+        if show_after_creation {
+            self.shown.set(WindowVisibility::Hidden);
+            self.set_visibility(WindowVisibility::ShownFirstTime)?;
+        }
+
+        {
+            // Workaround for winit bug #2990
+            // Non-resizable windows can still contain a maximize button,
+            // so we'd have to additionally remove the button.
+            let mut buttons = winit_window.enabled_buttons();
+            buttons.set(WindowButtons::MAXIMIZE, resizable);
+            winit_window.set_enabled_buttons(buttons);
         }
 
         for waker in self.window_existence_wakers.take().into_iter() {
@@ -1409,6 +1417,14 @@ impl WinitWindowAdapter {
         Some(host)
     }
 
+    /// The render thread this window already has, if any, without starting one.
+    ///
+    /// The teardown path asks this: dropping the adapter must not start a
+    /// render thread it would only tell to quit.
+    pub(crate) fn existing_render_host(&self) -> Option<crate::render_thread::RenderHost> {
+        self.render_host.borrow().clone()
+    }
+
     /// Whether a render thread has taken over *this* window's controls, in
     /// which case the UI thread hands this window's events to that tree instead
     /// of dispatching them into its own.
@@ -1640,7 +1656,11 @@ impl WinitWindowAdapter {
         }
         if let Some(previous) = self.render_hovered.replace(target) {
             if host.control_coord(previous).is_some_and(|c| c.pointer_draws) {
-                host.apply_control_state(previous, false, self.render_pressed.get() == Some(previous));
+                host.apply_control_state(
+                    previous,
+                    false,
+                    self.render_pressed.get() == Some(previous),
+                );
             }
         }
         if let Some(target) = target {
@@ -1657,7 +1677,11 @@ impl WinitWindowAdapter {
         }
         if let Some(previous) = self.render_pressed.replace(target) {
             if host.control_coord(previous).is_some_and(|c| c.pointer_draws) {
-                host.apply_control_state(previous, self.render_hovered.get() == Some(previous), false);
+                host.apply_control_state(
+                    previous,
+                    self.render_hovered.get() == Some(previous),
+                    false,
+                );
             }
         }
         if let Some(target) = target {
@@ -2987,9 +3011,15 @@ impl Drop for WinitWindowAdapter {
         // window the application closed, and would hold on to that surface for
         // the rest of the process.
         if let Some(window_id) = window_id
-            && let Some(host) = self.render_host()
+            && let Some(host) = self.existing_render_host()
         {
             host.submit_suspend(window_id);
+            // The window is going away, and with it the surface this thread
+            // presents into. Tell the thread to stop rather than leave it
+            // holding its graphics context for the rest of the process: a
+            // context the windowing system tears down under a live thread is
+            // what the driver reports as a bus error at shutdown.
+            host.send_quit();
         }
 
         self.shared_backend_data.unregister_window(window_id);

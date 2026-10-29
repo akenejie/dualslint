@@ -316,6 +316,12 @@ impl EventLoopState {
                     .run_app_on_demand(&mut self)
                     .map_err(|e| format!("Error running winit event loop: {e}"))?;
 
+                // The loop is over and the process is on its way out. The render
+                // threads draw through the same display connection winit is
+                // about to stop servicing, so they stop now, before anything
+                // tears that connection down under their feet.
+                crate::render_thread::shutdown_render_threads();
+
                 // Keep the EventLoop instance alive and re-use it in future invocations of run_event_loop().
                 // Winit does not support creating multiple instances of the event loop.
                 self.shared_backend_data.not_running_event_loop.replace(Some(winit_loop));

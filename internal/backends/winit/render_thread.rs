@@ -108,6 +108,34 @@ pub use i_slint_backend_scene::*;
 /// `request_redraw`, the system accent colour -- is a request about all of them.
 static GLOBAL_HOSTS: Mutex<Vec<RenderHost>> = Mutex::new(Vec::new());
 
+/// The render threads' join handles, so the process can wait for them to have
+/// stopped before tearing down the windowing system they draw through.
+///
+/// A render thread that is still inside an OpenGL or windowing call when the
+/// UI thread's event loop exits takes the display connection down under its
+/// feet, which the driver reports as a bus error. Asking the thread to quit
+/// and joining it first is what makes the shutdown orderly. The wait is
+/// bounded because a thread can be parked inside a driver call that never
+/// returns once the window is gone; the process is on its way out at that
+/// point, so leaving the thread to the exit is the best that remains.
+struct RenderThreadHandle {
+    finished: std::sync::mpsc::Receiver<()>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+static GLOBAL_JOIN_HANDLES: Mutex<Vec<RenderThreadHandle>> = Mutex::new(Vec::new());
+
+/// How long the shutdown waits for one render thread to have stopped.
+const SHUTDOWN_JOIN_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(1);
+
+/// How long a caller of the blocking [`RenderHost::run_on_screen_tree`] waits
+/// for the render thread to have run the call.
+///
+/// The normal round trip is a frame or two; the bound only bites when the
+/// render thread is wedged in a driver call that the teardown will never
+/// unstick, where the unbounded wait it replaces was a hang.
+const SCREEN_TREE_REPLY_TIMEOUT: core::time::Duration = core::time::Duration::from_secs(1);
+
 /// The window the user is looking at, which is the window an API without a
 /// window argument has to mean.
 ///
@@ -658,6 +686,9 @@ fn name_surface_owner(window: &SlintApiWindow) -> Option<(usize, winit::window::
 /// The send half of the render-thread channel.  Clonable and Send-safe.
 pub struct RenderHost {
     sender: mpsc::Sender<RenderMessage>,
+    /// Identifies the channel, so diagnostics can tell which render thread a
+    /// post was meant for.
+    channel_id: usize,
     event_loop_proxy: Option<winit::event_loop::EventLoopProxy<crate::SlintEvent>>,
     /// Set to `true` once `AttachComponent` has been sent.  Used to suppress
     /// the UI-thread encode path once the render thread owns the screen.
@@ -686,6 +717,7 @@ impl Clone for RenderHost {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            channel_id: self.channel_id,
             event_loop_proxy: self.event_loop_proxy.clone(),
             attached: self.attached.clone(),
             surface: self.surface.clone(),
@@ -1000,7 +1032,13 @@ impl RenderHost {
         let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
         match self.sender.send(RenderMessage::RunOnScreenTree { task, done: tx }) {
             Ok(()) => {
-                let _ = rx.recv().is_ok();
+                // The wait is bounded because the render thread can be wedged
+                // in a driver call that never returns -- a buffer allocation
+                // waiting on an X event for a window the process is tearing
+                // down, say. A caller that has been running the tree's calls
+                // all along then reads a default instead of hanging the exit;
+                // the task itself is dropped with the thread.
+                let _ = rx.recv_timeout(SCREEN_TREE_REPLY_TIMEOUT).is_ok();
                 Ok(())
             }
             // A send that fails means the render thread is gone, and it takes the
@@ -1027,9 +1065,8 @@ impl RenderHost {
         // deliver, and the loop's `done.send` closing without a reader is how
         // the call is marked done.
         let (done, _reply) = std::sync::mpsc::sync_channel::<()>(1);
-        #[cfg(feature = "std")]
         if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-            std::eprintln!("[post] set_model carry posted");
+            std::eprintln!("[post] on-screen-tree task posted ch={}", self.channel_id);
         }
         let _ = self.sender.send(RenderMessage::RunOnScreenTree { task, done });
     }
@@ -1385,10 +1422,31 @@ impl RenderHost {
 /// The render-thread receive half and event loop driver.
 pub(crate) struct RenderCore {
     rx: mpsc::Receiver<RenderMessage>,
+    channel_id: usize,
     /// The table this thread publishes into. It is the same table the UI thread
     /// reads, reached from the other end through the [`RenderHost`].
     coords: Arc<Mutex<PublishedControls>>,
+    /// Calls posted for the tree on screen before a component was attached.
+    ///
+    /// The queue is FIFO, so a call posted before `AttachComponent` sits ahead
+    /// of it in this channel and reaches the loop while there is no tree to run
+    /// against. Rather than drop it there, the loop parks it and runs it
+    /// against the tree as soon as the attach built one -- which is what the
+    /// `post_on_screen_tree` contract promises. A call parked once the cap is
+    /// reached is dropped, so a caller of the blocking variant still learns of
+    /// the loss as a default instead of hanging when no tree ever comes.
+    pending_on_screen_tree: Vec<PendingScreenTreeCall>,
 }
+
+/// A parked call, together with the reply half the blocking caller waits on.
+struct PendingScreenTreeCall {
+    task: Box<dyn FnOnce(&ItemTreeRc) + Send>,
+    done: std::sync::mpsc::SyncSender<()>,
+}
+
+/// How many calls may wait for a tree to be attached before the loop gives up
+/// keeping the FIFO promise and drops the overflow.
+const PENDING_ON_SCREEN_TREE_CAP: usize = 1024;
 
 /// The window the render thread presents into.
 ///
@@ -1589,8 +1647,12 @@ impl SurfaceState {
 }
 
 impl RenderCore {
-    fn new(rx: mpsc::Receiver<RenderMessage>, coords: Arc<Mutex<PublishedControls>>) -> Self {
-        Self { rx, coords }
+    fn new(
+        rx: mpsc::Receiver<RenderMessage>,
+        coords: Arc<Mutex<PublishedControls>>,
+        channel_id: usize,
+    ) -> Self {
+        Self { rx, coords, channel_id, pending_on_screen_tree: Vec::new() }
     }
 
     /// Run the render-thread event loop.  Blocks until `Quit`.
@@ -1606,6 +1668,10 @@ impl RenderCore {
             }
         }
         let _clear_on_exit = ClearOnExit;
+        // A message the previous iteration's capped drain did not get to. It
+        // is processed before the thread sleeps again, so deferring delays it
+        // by one present at most and nothing is ever dropped.
+        let mut deferred: Option<RenderMessage> = None;
         // Render-thread state: the window to present into, and the GL context
         // and upstream renderer once the UI thread has handed the window's
         // graphics over.
@@ -1678,15 +1744,20 @@ impl RenderCore {
             // this thread changes on its own, so it sleeps until it is spoken to.
             #[cfg(not(render_thread_can_draw))]
             let wait: Option<std::time::Duration> = None;
-            let msg = match wait {
-                Some(wait) => match self.rx.recv_timeout(wait) {
-                    Ok(msg) => Some(msg),
-                    Err(mpsc::RecvTimeoutError::Timeout) => None,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                },
-                None => match self.rx.recv() {
-                    Ok(msg) => Some(msg),
-                    Err(_) => break,
+            // A message left over from the previous iteration's capped drain
+            // goes first; only when there is none does the thread sleep.
+            let msg = match deferred.take() {
+                Some(msg) => Some(msg),
+                None => match wait {
+                    Some(wait) => match self.rx.recv_timeout(wait) {
+                        Ok(msg) => Some(msg),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    },
+                    None => match self.rx.recv() {
+                        Ok(msg) => Some(msg),
+                        Err(_) => break,
+                    },
                 },
             };
             // What woke this thread is the only reason there can be a frame to
@@ -1701,7 +1772,25 @@ impl RenderCore {
             // thread to wake for the next one, so the clock stays pinned at the
             // same deadline and the screen keeps the frame it has.
             let mut present = msg.is_none();
-            if let Some(msg) = msg {
+            // The queue is drained before anything is presented: one user
+            // action reaches this thread as several messages -- the press, the
+            // application's answer, the carries that answer posts -- and a
+            // frame per message would show the action in pieces, the checkbox
+            // in one frame and the list it reorders in the next. Processing
+            // everything that is queued and presenting once is what makes one
+            // action one update on screen. The drain is capped so a flood
+            // cannot starve the screen; the message it stops on is deferred to
+            // the next iteration rather than dropped.
+            let mut quit = false;
+            let mut drained = 0u32;
+            let mut next = msg;
+            loop {
+                let Some(msg) = next.take() else { break };
+                drained += 1;
+                if drained > 64 {
+                    deferred = Some(msg);
+                    break;
+                }
                 match msg {
                     #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))]
                     RenderMessage::Configure { window, width, height, scale_factor } => {
@@ -1832,6 +1921,30 @@ impl RenderCore {
                             // From here on the render thread owns every control.  Drop
                             // the UI-thread's publish so peers never borrow stale ids.
                             self.coords.lock().unwrap().clear();
+                            // Calls that were posted before this attach sat ahead
+                            // of it in the FIFO channel and were parked. Run them
+                            // now, oldest first, against the tree that just came
+                            // into being -- that is the order and the target the
+                            // poster was promised.
+                            for parked in std::mem::take(&mut self.pending_on_screen_tree) {
+                                if let Some(tree) =
+                                    render_window_adapter.as_ref().and_then(|adapter| {
+                                        WindowInner::from_pub(adapter.window()).try_component()
+                                    })
+                                {
+                                    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                        std::eprintln!(
+                                            "[run-on-screen] parked task runs ch={}",
+                                            self.channel_id
+                                        );
+                                    }
+                                    (parked.task)(&tree);
+                                }
+                                // The reply closes whether the tree was there or
+                                // not, so a caller waiting for a value learns of
+                                // the loss as a default rather than hanging.
+                                let _ = parked.done.send(());
+                            }
                             present = true;
                         }
                     }
@@ -2058,23 +2171,62 @@ impl RenderCore {
                         // changes a property or opens a window therefore does it
                         // to the tree that is drawn, and a frame follows for
                         // whatever it changed.
-                        if let Some(tree) = render_window_adapter.as_ref().and_then(|adapter| {
+                        match render_window_adapter.as_ref().and_then(|adapter| {
                             WindowInner::from_pub(adapter.window()).try_component()
                         }) {
-                            #[cfg(feature = "std")]
-                            if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                std::eprintln!(
-                                    "[run-on-screen] task runs, identity={:p}",
-                                    i_slint_core::item_tree::item_tree_identity(&tree) as *const ()
-                                );
+                            Some(tree) => {
+                                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                    std::eprintln!(
+                                        "[run-on-screen] task runs ch={} identity={:p}",
+                                        self.channel_id,
+                                        i_slint_core::item_tree::item_tree_identity(&tree)
+                                            as *const ()
+                                    );
+                                }
+                                task(&tree);
+                                present = true;
                             }
-                            task(&tree);
-                            present = true;
+                            None => {
+                                #[cfg(render_thread_can_draw)]
+                                {
+                                    // No tree yet: the call was posted before the
+                                    // attach, so it sits ahead of `AttachComponent`
+                                    // in this FIFO channel. Park it for the attach
+                                    // to run, as the post contract promises.
+                                    if self.pending_on_screen_tree.len()
+                                        < PENDING_ON_SCREEN_TREE_CAP
+                                    {
+                                        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                            std::eprintln!(
+                                                "[run-on-screen] task parked ch={} (no tree yet)",
+                                                self.channel_id
+                                            );
+                                        }
+                                        self.pending_on_screen_tree
+                                            .push(PendingScreenTreeCall { task, done });
+                                    } else {
+                                        // The park is full and no tree came: drop
+                                        // the call. The reply channel closes, so a
+                                        // caller waiting for a value learns of the
+                                        // loss as a default rather than hanging.
+                                        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                            std::eprintln!(
+                                                "[run-on-screen] task dropped ch={} (no tree, park full)",
+                                                self.channel_id
+                                            );
+                                        }
+                                        let _ = done.send(());
+                                    }
+                                }
+                                #[cfg(not(render_thread_can_draw))]
+                                {
+                                    // This build never attaches a mirror, so the
+                                    // call has nothing it will ever reach: report
+                                    // the loss the way an absent tree always has.
+                                    let _ = done.send(());
+                                }
+                            }
                         }
-                        // The caller's channel closes whether the tree was there
-                        // or not, so a caller that is waiting for a value learns
-                        // the difference as a default rather than as a hang.
-                        let _ = done.send(());
                     }
                     RenderMessage::HitTest { x, y, response } => {
                         // The last control in paint order that contains the point is
@@ -2118,13 +2270,41 @@ impl RenderCore {
                         render_item_rcs.borrow_mut().clear();
                         interaction.clear();
                     }
-                    RenderMessage::Quit => break,
+                    RenderMessage::Quit => {
+                        quit = true;
+                        break;
+                    }
                 }
+                // All the messages that were queued when this one arrived are
+                // part of the same visual moment; pick them up before drawing.
+                next = self.rx.try_recv().ok();
+            }
+            if quit {
+                break;
             }
 
             // The tree can also be the reason there is a frame to draw: its own
             // properties changed while nothing was happening, or an animation is
             // playing and the frame clock is not a timer.
+            #[cfg(render_thread_can_draw)]
+            {
+                std::thread_local! {
+                    static ITER_START: std::cell::Cell<Option<std::time::Instant>> =
+                        const { std::cell::Cell::new(None) };
+                }
+                ITER_START.with(|start| {
+                    let now = std::time::Instant::now();
+                    if let Some(prev) = start.get() {
+                        let elapsed = now.duration_since(prev);
+                        if elapsed > std::time::Duration::from_millis(50)
+                            && std::env::var_os("SLINT_LOG_REPEATER").is_some()
+                        {
+                            std::eprintln!("[loop] slow iteration: {elapsed:?}");
+                        }
+                    }
+                    start.set(Some(now));
+                });
+            }
             #[cfg(render_thread_can_draw)]
             let (frame_requested, animating_now) =
                 (frame_request.replace(false), animating(&render_window_adapter));
@@ -2244,6 +2424,7 @@ fn present_render_owned(
     render_item_rcs: &Rc<RefCell<HashMap<u64, ItemRc>>>,
     interaction: &mut ControlInteraction,
 ) {
+    let started = std::time::Instant::now();
     if !publish_mirror_controls(
         coords,
         render_window_adapter,
@@ -2254,11 +2435,19 @@ fn present_render_owned(
     ) {
         return;
     }
+    let encoded = started.elapsed();
     let Some(adapter) = render_window_adapter.as_ref() else {
         return;
     };
+    let swap_started = std::time::Instant::now();
     if let Err(e) = state.present(adapter) {
         eprintln!("dualslint render thread: present failed: {e}");
+    }
+    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+        let swap = swap_started.elapsed();
+        if swap > std::time::Duration::from_millis(50) {
+            std::eprintln!("[frame] slow present: swap={swap:?} encode={encoded:?}");
+        }
     }
 }
 
@@ -2896,6 +3085,10 @@ fn send_key_to_tree(
     result
 }
 
+/// Identifies the channel, so diagnostics can tell which render thread a post
+/// was meant for.
+static NEXT_CHANNEL_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
 /// Create the render-thread channel pair.
 pub(crate) fn channel(
     event_loop_proxy: winit::event_loop::EventLoopProxy<crate::SlintEvent>,
@@ -2904,12 +3097,13 @@ pub(crate) fn channel(
     let coords = Arc::new(Mutex::new(PublishedControls::default()));
     let host = RenderHost {
         sender: tx,
+        channel_id: NEXT_CHANNEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         event_loop_proxy: Some(event_loop_proxy),
         attached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         surface: Arc::new(Mutex::new(None)),
         coords: coords.clone(),
     };
-    let core = RenderCore::new(rx, coords);
+    let core = RenderCore::new(rx, coords, host.channel_id);
     (host, core)
 }
 
@@ -2961,8 +3155,42 @@ pub(crate) fn create_host(
     if let Ok(mut hosts) = GLOBAL_HOSTS.lock() {
         hosts.push(host.clone());
     }
-    std::thread::Builder::new().name("slint-render".into()).spawn(move || core.run()).ok();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    if let Ok(handle) = std::thread::Builder::new().name("slint-render".into()).spawn(move || {
+        core.run();
+        // The loop is over; the shutdown's bounded wait reads this.
+        let _ = finished_tx.send(());
+    }) {
+        if let Ok(mut handles) = GLOBAL_JOIN_HANDLES.lock() {
+            handles.push(RenderThreadHandle { finished: finished_rx, handle });
+        }
+    }
     host
+}
+
+/// Ask every render thread to quit and wait, briefly, for it to have happened.
+///
+/// Called where the UI thread's event loop has returned and the process is on
+/// its way out: a render thread that kept running would still hold its graphics
+/// context while the windowing system connection it draws through is torn
+/// down, and the driver reports that race as a bus error. The wait per thread
+/// is bounded because a thread that is parked inside a driver call when the
+/// window goes away never comes back to read the quit; the process exiting is
+/// what remains for it.
+pub fn shutdown_render_threads() {
+    let hosts = hosts();
+    for host in hosts {
+        host.send_quit();
+    }
+    let handles = GLOBAL_JOIN_HANDLES
+        .lock()
+        .map(|mut handles| std::mem::take(&mut *handles))
+        .unwrap_or_default();
+    for RenderThreadHandle { finished, handle } in handles {
+        if finished.recv_timeout(SHUTDOWN_JOIN_TIMEOUT).is_ok() {
+            let _ = handle.join();
+        }
+    }
 }
 
 /// Hand `window`'s drawing to the render thread, and say whether the render
@@ -3800,13 +4028,16 @@ impl GlRenderState {
             .make_current(&surface)
             .map_err(|e| format!("make_current failed: {e}"))?;
 
-        // Set vsync
-        surface
-            .set_swap_interval(
-                &context,
-                glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
-            )
-            .ok();
+        // Present without waiting for the compositor. A swap that waits on the
+        // display's refresh was measured to block this thread for hundreds of
+        // milliseconds at a stretch on some drivers, and this thread is the one
+        // that answers the application's calls and dispatches its input: every
+        // blocked swap is a blocked callback, which shows up on screen as a
+        // control that updates long after its label. The queuing a
+        // non-blocking swap does instead paces the frames at the compositor
+        // without ever parking this thread, which is the behavior a thread
+        // that both draws and serves needs.
+        surface.set_swap_interval(&context, glutin::surface::SwapInterval::DontWait).ok();
 
         Ok(Self {
             gl: Rc::new(GlObjects { context, surface }),

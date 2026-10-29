@@ -4,8 +4,8 @@
 //! UI-thread property store for properties owned by the UI thread (OS communication).
 //! Separated from the render tree; keyed by control id (stable id).
 
-use i_slint_backend_scene::property_ownership::{classify, PropertyOwnership};
 use i_slint_backend_scene::ControlPropertyValue;
+use i_slint_backend_scene::property_ownership::{PropertyOwnership, classify};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +24,13 @@ impl UiPropertyStore {
         Self::default()
     }
 
-    pub fn set(&self, id: u64, builtin_name: Option<&str>, name: &str, value: ControlPropertyValue) {
+    pub fn set(
+        &self,
+        id: u64,
+        builtin_name: Option<&str>,
+        name: &str,
+        value: ControlPropertyValue,
+    ) {
         let owner = classify(builtin_name, name);
         if !owner.ui_holds() {
             return;
@@ -33,7 +39,12 @@ impl UiPropertyStore {
         map.entry(id).or_default().insert(name.to_string(), UiPropertyEntry { value: Some(value) });
     }
 
-    pub fn get(&self, id: u64, builtin_name: Option<&str>, name: &str) -> Option<ControlPropertyValue> {
+    pub fn get(
+        &self,
+        id: u64,
+        builtin_name: Option<&str>,
+        name: &str,
+    ) -> Option<ControlPropertyValue> {
         let owner = classify(builtin_name, name);
         if !owner.ui_holds() {
             return None;
