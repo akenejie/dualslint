@@ -1340,6 +1340,15 @@ impl WindowInner {
         }
     }
 
+    /// The handover shelf, without `std`: nothing stores a handover there, so
+    /// what the generated code offers is dropped on the floor. With a single
+    /// thread there is no tree elsewhere to hand over to, and the generated
+    /// carries recognize that through their tree-identity guard and change
+    /// nothing.
+    #[cfg(not(feature = "std"))]
+    #[doc(hidden)]
+    pub fn set_render_handover(&self, _handover: alloc::boxed::Box<dyn Fn()>) {}
+
     /// Record that the application replaced the declared handler of the root
     /// component's callback number `index` with one of its own.
     ///
@@ -1359,10 +1368,25 @@ impl WindowInner {
 
     /// Whether [`Self::note_host_callback`] recorded a handler of the
     /// application's own for the root component's callback number `index`.
+    ///
+    /// Without `std` nothing records a handler: there is no handover to read
+    /// the note, so both halves are silent.
     #[cfg(feature = "std")]
     #[doc(hidden)]
     pub fn has_host_callback(&self, index: u32) -> bool {
         self.host_handled_callbacks.borrow().contains(&index)
+    }
+
+    /// The handler notes, without `std`: nothing records one, and nothing
+    /// reads one, so both halves are silent.
+    #[cfg(not(feature = "std"))]
+    #[doc(hidden)]
+    pub fn note_host_callback(&self, _index: u32) {}
+
+    #[cfg(not(feature = "std"))]
+    #[doc(hidden)]
+    pub fn has_host_callback(&self, _index: u32) -> bool {
+        false
     }
 
     /// Record whether moving focus can change what this window draws.

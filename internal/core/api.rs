@@ -508,27 +508,40 @@ impl Window {
     /// caller holds is not the one on screen, and the call belongs to the tree
     /// that is: that is where the bindings and callbacks that decide what the
     /// call looks like live.
+    ///
+    /// With `std` the value travels back over a channel because the task may
+    /// run on another thread. A callback that panics there takes the sender
+    /// with it, which is what `unwrap_or_default` reports: a callback that did
+    /// not return has no value to hand back. The wait for the value is bounded
+    /// for the same reason: the thread that runs the task can be wedged in a
+    /// driver call that never comes back once the window is going away, and a
+    /// getter that would hang the exit reads a default instead. Without `std`
+    /// there is only the one thread, so the task runs against the tree the
+    /// caller holds, exactly as a backend with no tree of its own would.
     #[doc(hidden)]
     pub fn call_on_screen_tree<Ret: Send + Default + 'static>(
         &self,
         local_tree: crate::item_tree::ItemTreeRc,
         task: impl FnOnce(&crate::item_tree::ItemTreeRc) -> Ret + Send + 'static,
     ) -> Ret {
-        // The value travels back over a channel because the task may run on
-        // another thread. A callback that panics there takes the sender with it,
-        // which is what `unwrap_or_default` reports: a callback that did not
-        // return has no value to hand back. The wait for the value is bounded
-        // for the same reason: the thread that runs the task can be wedged in
-        // a driver call that never comes back once the window is going away,
-        // and a getter that would hang the exit reads a default instead.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        WindowInner::from_pub(self).window_adapter().run_on_screen_tree(
-            local_tree,
-            Box::new(move |tree| {
-                let _ = sender.send(task(tree));
-            }),
-        );
-        receiver.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or_default()
+        #[cfg(feature = "std")]
+        {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            WindowInner::from_pub(self).window_adapter().run_on_screen_tree(
+                local_tree,
+                Box::new(move |tree| {
+                    let _ = sender.send(task(tree));
+                }),
+            );
+            receiver.recv_timeout(std::time::Duration::from_secs(1)).unwrap_or_default()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            // With a single thread there is no tree elsewhere to reach: the
+            // task runs against the tree the caller holds, which is also what
+            // a backend with no tree of its own runs it against.
+            task(&local_tree)
+        }
     }
 
     /// Post a call to the tree the window draws, one way.

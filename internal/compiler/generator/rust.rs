@@ -426,7 +426,7 @@ fn generate_public_component(
             // runs on the thread that draws -- would never upgrade on this
             // thread, and the calls it forwards would be dropped silently.
             #global_weaks
-            sp::WindowInner::from_pub(window.window()).set_render_handover(Box::new(move || {
+            sp::WindowInner::from_pub(window.window()).set_render_handover(sp::Box::new(move || {
                 let Some(component) = weak.upgrade() else { return };
                 #body
             }));
@@ -1276,7 +1276,7 @@ fn render_handover_state(
         let prop_access = access_member(&p.prop, ctx).unwrap();
         let (read, set_value) = if let Type::Array(_) = &p.ty {
             (
-                quote!(#prop_access.get().iter().collect::<Vec<_>>()),
+                quote!(#prop_access.get().iter().collect::<sp::Vec<_>>()),
                 quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(value)))),
             )
         } else {
@@ -1340,13 +1340,9 @@ fn render_handover_state(
                 if sp::WindowInner::from_pub(host_window).has_host_callback(#index) {
                     let local_tree = sp::VRc::into_dyn(component.0.clone());
                     let local_identity = sp::item_tree_identity(&local_tree);
-                    let ui_thread = std::thread::current().id();
                     let app = weak.clone();
                     host_window.call_on_screen_tree(local_tree, move |tree| {
-                        if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                            ::std::eprintln!("[route] install idx={} same_tree={}",
-                                #index, sp::item_tree_identity(tree) == local_identity);
-                        }
+                                                sp::log_diagnostics(format_args!("[route] install idx={} same_tree={}", #index, sp::item_tree_identity(tree) == local_identity));
                         // A window with no tree of its own runs this against the tree
                         // the application holds. Pointing that tree's callback back at
                         // the application would have it call itself, so leave it: the
@@ -1362,23 +1358,20 @@ fn render_handover_state(
                         let _self = component.as_pin_ref();
                         #callback_access.set_handler(move |#args_param| {
                             #(let #arg_names = args.#arg_indices.clone();)*
-                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                ::std::eprintln!("[route] called idx={}", #index);
-                            }
-                            if std::thread::current().id() == ui_thread {
-                                if let Some(component) = app.upgrade() {
-                                    let _self = sp::VRc::as_pin_ref(&component.0);
-                                    #callback_access.call(&(#(#arg_names,)*));
-                                }
+                                                        sp::log_diagnostics(format_args!("[route] called idx={}", #index));
+                            // A weak upgrades only on the thread that made it,
+                            // so the upgrade both picks the branch and does
+                            // the work: on the application's thread the call
+                            // runs here, anywhere else it is posted there.
+                            if let Some(component) = app.upgrade() {
+                                let _self = sp::VRc::as_pin_ref(&component.0);
+                                #callback_access.call(&(#(#arg_names,)*));
                             } else {
                                 let routed = app.upgrade_in_event_loop(move |component| {
                                     let _self = sp::VRc::as_pin_ref(&component.0);
                                     #callback_access.call(&(#(#arg_names,)*));
                                 });
-                                if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                    ::std::eprintln!("[route] upgrade_in_event_loop idx={} -> {:?}",
-                                        #index, routed.err());
-                                }
+                                                                sp::log_diagnostics(format_args!("[route] upgrade_in_event_loop idx={} -> {:?}", #index, routed.err()));
                             }
                         });
                     });
@@ -1412,7 +1405,7 @@ fn render_handover_state(
             let prop_access = access_member(&p.prop, ctx).unwrap();
             let (read, set_value) = if let Type::Array(_) = &p.ty {
                 (
-                    quote!(#prop_access.get().iter().collect::<Vec<_>>()),
+                    quote!(#prop_access.get().iter().collect::<sp::Vec<_>>()),
                     quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(value)))),
                 )
             } else {
@@ -1513,12 +1506,8 @@ fn render_handover_state(
                         let app_global = #weak_ident.clone();
                         let local_tree = sp::VRc::into_dyn(component.0.clone());
                         let local_identity = sp::item_tree_identity(&local_tree);
-                        let ui_thread = std::thread::current().id();
                         host_window.call_on_screen_tree(local_tree, move |tree| {
-                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                ::std::eprintln!("[global-route] install idx={} same_tree={}",
-                                    #index, sp::item_tree_identity(tree) == local_identity);
-                            }
+                                                        sp::log_diagnostics(format_args!("[global-route] install idx={} same_tree={}", #index, sp::item_tree_identity(tree) == local_identity));
                             if sp::item_tree_identity(tree) == local_identity {
                                 return;
                             }
@@ -1530,23 +1519,21 @@ fn render_handover_state(
                             let _self = component.as_pin_ref();
                             #callback_access.set_handler(move |#args_param| {
                                 #(let #arg_names = args.#arg_indices.clone();)*
-                                if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                    ::std::eprintln!("[global-route] called idx={}", #index);
-                                }
-                                if std::thread::current().id() == ui_thread {
-                                    if let Some(global) = app_global.upgrade() {
-                                        let _self = global.0.as_ref();
-                                        #callback_access.call(&(#(#arg_names,)*));
-                                    }
+                                                                sp::log_diagnostics(format_args!("[global-route] called idx={}", #index));
+                                // A weak upgrades only on the thread that made
+                                // it, so the upgrade both picks the branch and
+                                // does the work: on the application's thread
+                                // the call runs here, anywhere else it is
+                                // posted there.
+                                if let Some(global) = app_global.upgrade() {
+                                    let _self = global.0.as_ref();
+                                    #callback_access.call(&(#(#arg_names,)*));
                                 } else {
                                     let routed = app_global.upgrade_in_event_loop(move |global| {
                                         let _self = global.0.as_ref();
                                         #callback_access.call(&(#(#arg_names,)*));
                                     });
-                                    if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                        ::std::eprintln!("[global-route] upgrade idx={} -> {:?}",
-                                            #index, routed.err());
-                                    }
+                                                                        sp::log_diagnostics(format_args!("[global-route] upgrade idx={} -> {:?}", #index, routed.err()));
                                 }
                             });
                         });
@@ -1654,20 +1641,12 @@ impl CallTarget {
                 match _self.globals().window_adapter_ref() {
                     Ok(window_adapter) => {
                         let Some(local_tree) = _self.globals().root_item_tree_weak.upgrade() else {
-                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                ::std::eprintln!("[global-invoke] no local tree; running locally");
-                            }
+                                                        sp::log_diagnostics(format_args!("[global-invoke] no local tree; running locally"));
                             return #call;
                         };
-                        if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                            ::std::eprintln!("[global-invoke] posting local={:#x}",
-                                sp::item_tree_identity(&local_tree));
-                        }
+                                                sp::log_diagnostics(format_args!("[global-invoke] posting local={:#x}", sp::item_tree_identity(&local_tree)));
                         window_adapter.window().call_on_screen_tree(local_tree, move |tree| {
-                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                ::std::eprintln!("[global-invoke] runs tree={:#x}",
-                                    sp::item_tree_identity(tree));
-                            }
+                                                        sp::log_diagnostics(format_args!("[global-invoke] runs tree={:#x}", sp::item_tree_identity(tree)));
                             // The tree on screen holds its own copy of the
                             // global; reach it through its root. A root this
                             // call does not belong to is left alone, and the
@@ -1682,9 +1661,7 @@ impl CallTarget {
                         })
                     }
                     Err(_) => {
-                        if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                            ::std::eprintln!("[global-invoke] no window adapter; running locally");
-                        }
+                                                sp::log_diagnostics(format_args!("[global-invoke] no window adapter; running locally"));
                         #call
                     }
                 }
@@ -1761,12 +1738,7 @@ impl CallTarget {
                 let local_identity = sp::item_tree_identity(&local_tree);
                 #window.post_on_screen_tree(local_tree, move |tree| {
                     let tree_identity = sp::item_tree_identity(tree);
-                    if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                        ::std::eprintln!(
-                            "[carry] task runs local={local_identity:#x} tree={tree_identity:#x} same={}",
-                            tree_identity == local_identity,
-                        );
-                    }
+                                        sp::log_diagnostics(format_args!("[carry] task runs local={local_identity:#x} tree={tree_identity:#x} same={}", tree_identity == local_identity,));
                     if sp::item_tree_identity(tree) == local_identity {
                         return;
                     }
@@ -1795,12 +1767,7 @@ impl CallTarget {
                         let local_identity = sp::item_tree_identity(&local_tree);
                         window_adapter.window().post_on_screen_tree(local_tree, move |tree| {
                             let tree_identity = sp::item_tree_identity(tree);
-                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                                ::std::eprintln!(
-                                    "[global-carry] task runs local={local_identity:#x} tree={tree_identity:#x} same={}",
-                                    tree_identity == local_identity,
-                                );
-                            }
+                                                        sp::log_diagnostics(format_args!("[global-carry] task runs local={local_identity:#x} tree={tree_identity:#x} same={}", tree_identity == local_identity,));
                             if tree_identity == local_identity {
                                 return;
                             }
@@ -2059,7 +2026,7 @@ fn public_api(
                     (
                         quote!(),
                         quote!(
-                            let forwarded = #prop_access.get().iter().collect::<Vec<_>>();
+                            let forwarded = #prop_access.get().iter().collect::<sp::Vec<_>>();
                             // The rows the user edits on screen belong to the
                             // application's model, not to the drawn tree's
                             // copy: the drawn tree's model hands every edited

@@ -63,6 +63,28 @@ pub fn log_message(message: LogMessage) {
     });
 }
 
+/// The diagnostics the generated carry and route code prints when the
+/// `SLINT_LOG_REPEATER` environment variable is set.
+///
+/// The generated code runs against trees whose crate may be `no_std`, where
+/// neither the environment nor a standard error stream exist, so the check
+/// and the write live here, where `std` is a feature rather than a given.
+/// Without `std` the diagnostics are simply not printed.
+#[doc(hidden)]
+pub fn log_diagnostics(arguments: core::fmt::Arguments) {
+    #[cfg(feature = "std")]
+    {
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            // A failed write is dropped: the diagnostics must not take the
+            // thread that carries a value down with them.
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "{arguments}");
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = arguments;
+}
+
 #[doc(hidden)]
 pub fn default_log_message(_arguments: core::fmt::Arguments) {
     cfg_if::cfg_if! {

@@ -231,6 +231,7 @@ pub fn unregister_item_tree<Base>(
         items_to_unregister: &mut dyn Iterator<Item = Pin<ItemRef<'_>>>,
         window_adapter: &WindowAdapterRc,
     ) {
+        #[cfg(feature = "std")]
         if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
             std::eprintln!(
                 "[unregister] tree ptr={:p} thread={:?}",
