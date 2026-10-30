@@ -138,6 +138,10 @@ impl slint::Model for RowModel {
 struct CellsModel {
     rows: Vec<Rc<RowModel>>,
     dep_graph: RefCell<DepGraph<(usize, usize), (usize, usize)>>,
+    /// The window the model is shown in, and this model's own handle: the
+    /// re-apply needs both, and `new` builds them together.
+    window: RefCell<Option<slint::Weak<MainWindow>>>,
+    self_handle: RefCell<Option<slint::ModelRc<ModelRc<CellContent>>>>,
 }
 
 impl CellsModel {
@@ -154,6 +158,8 @@ impl CellsModel {
                 })
                 .collect(),
             dep_graph: Default::default(),
+            window: Default::default(),
+            self_handle: Default::default(),
         })
     }
 
@@ -191,6 +197,16 @@ impl CellsModel {
         }
 
         make_deps(&mut self.dep_graph.borrow_mut(), (row, col), &exp);
+
+        // The evaluation happens on the tree the application holds; the tree
+        // the window draws holds copies of the rows, and a cell a formula
+        // changed here is stale there. Re-applying the model hands the
+        // updated values to the drawn tree's copies, per cell.
+        let window = self.window.borrow().clone();
+        let model = self.self_handle.borrow().clone();
+        if let (Some(window), Some(model)) = (window, model) {
+            window.upgrade().map(|window| window.set_cells(model));
+        }
 
         Some(())
     }
@@ -241,6 +257,11 @@ impl Model for CellsModel {
 pub fn main() {
     let main_window = MainWindow::new().unwrap();
     let cells_model = CellsModel::new();
+    // The re-apply reads the window and the model's own handle out of the
+    // model after every evaluation, so the tree the window draws sees the
+    // values a formula changed.
+    *cells_model.window.borrow_mut() = Some(main_window.as_weak());
+    *cells_model.self_handle.borrow_mut() = Some(ModelRc::from(cells_model.clone()));
     main_window.set_cells(ModelRc::from(cells_model));
     main_window.run().unwrap();
 }

@@ -7,7 +7,7 @@ use crate::model::{Model, ModelNotify, ModelRc, ModelTracker};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 /// The rows the drawn tree shows: an editable copy of the model the
 /// application holds.
@@ -117,5 +117,149 @@ pub fn screen_tree_model_carry<Element: Clone + PartialEq + 'static>(
         current.clone()
     } else {
         ModelRc::from(Rc::new(ScreenTreeModel::with_rows(rows, write_back)))
+    }
+}
+
+/// The rows the drawn tree shows when a row is a model of its own: a copy of
+/// the application's two-dimensional model, one [`ScreenTreeModel`] per row.
+///
+/// A two-dimensional model cannot travel the way a flat one does -- a row
+/// would carry a reference into the tree the application holds -- so the
+/// carry ([`screen_tree_model_nested_carry`]) takes the rows' plain values
+/// and rebuilds the grid on the drawn side: every row becomes a pooled model
+/// of its own, updated in place on the next carry, and a cell the user edits
+/// is handed back through `write_back` with the row and column it happened
+/// in.
+pub struct NestedScreenTreeModel<T> {
+    rows: RefCell<Vec<Row<T>>>,
+    notify: ModelNotify,
+    write_back: SharedWriteBack<T>,
+}
+
+/// The write-back of the grid, shared with every row so a row's closure can
+/// hand an edit on without keeping the grid alive.
+type SharedWriteBack<T> = Rc<dyn Fn(usize, usize, T)>;
+
+/// One row of the grid: the pooled copy of the application's row model, and
+/// the slot that says which row of the application's grid this copy
+/// currently is. Rows shift when the grid loses one, so the slot is read at
+/// write-back time rather than captured.
+struct Row<T> {
+    model: Rc<ScreenTreeModel<T>>,
+    slot: Rc<Cell<usize>>,
+}
+
+impl<T: Clone + PartialEq + 'static> NestedScreenTreeModel<T> {
+    fn build_row(&self, index: usize, cells: Vec<T>) -> Row<T> {
+        let slot = Rc::new(Cell::new(index));
+        let write_back = self.write_back.clone();
+        let model = {
+            let slot = slot.clone();
+            Rc::new(ScreenTreeModel::with_rows(cells, move |col, data| {
+                write_back(slot.get(), col, data);
+            }))
+        };
+        Row { model, slot }
+    }
+
+    fn with_rows(rows: Vec<Vec<T>>, write_back: impl Fn(usize, usize, T) + 'static) -> Self {
+        let model = Self {
+            rows: RefCell::new(Vec::new()),
+            notify: ModelNotify::default(),
+            write_back: Rc::new(write_back),
+        };
+        *model.rows.borrow_mut() = rows
+            .into_iter()
+            .enumerate()
+            .map(|(index, cells)| model.build_row(index, cells))
+            .collect();
+        model
+    }
+
+    /// Replace the rows, notifying only what changed.
+    ///
+    /// Rows that stay are updated in place -- the inner model notifies its
+    /// own cells -- and rows that appear or disappear notify the outer model,
+    /// so the drawn tree's repeater re-creates only the rows that came or
+    /// went. Every surviving row's slot is renumbered, so a write-back from
+    /// it lands on the row the application's grid holds now.
+    fn set_rows(&self, rows: Vec<Vec<T>>) {
+        let mut current = self.rows.borrow_mut();
+        let common = current.len().min(rows.len());
+        let added = rows.len().checked_sub(current.len());
+        let removed = current.len().checked_sub(rows.len());
+        for (index, cells) in rows.iter().enumerate().take(common) {
+            current[index].model.set_rows(cells.clone());
+            current[index].slot.set(index);
+        }
+        current.truncate(common);
+        drop(current);
+        if let Some(count) = added.filter(|count| *count > 0) {
+            let start = common;
+            let built: Vec<Row<T>> = (start..start + count)
+                .map(|index| self.build_row(index, rows[index].clone()))
+                .collect();
+            self.rows.borrow_mut().extend(built);
+            self.notify.row_added(start, count);
+        }
+        if let Some(count) = removed.filter(|count| *count > 0) {
+            self.notify.row_removed(common, count);
+        }
+    }
+}
+
+impl<T: Clone + PartialEq + 'static> Model for NestedScreenTreeModel<T> {
+    type Data = ModelRc<T>;
+
+    fn row_count(&self) -> usize {
+        self.rows.borrow().len()
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        self.rows.borrow().get(row).map(|row| ModelRc::from(row.model.clone()))
+    }
+
+    fn set_row_data(&self, row: usize, data: Self::Data) {
+        // The framework writes through a row's own model, never through the
+        // grid; a whole-row assignment copies the given model's cells over
+        // the pooled copy.
+        let Some(row) = self.rows.borrow().get(row).map(|row| row.model.clone()) else { return };
+        for index in 0..row.row_count() {
+            if let Some(cell) = data.row_data(index) {
+                row.set_row_data(index, cell);
+            }
+        }
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.notify
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+/// The model the drawn tree's two-dimensional property holds, carrying `rows`.
+///
+/// The two-dimensional counterpart of [`screen_tree_model_carry`]: the first
+/// carry builds the grid of pooled row models and installs it in the
+/// property, and every carry after that updates the same rows in place --
+/// which the drawn tree's repeaters see as per-cell and per-row changes, so
+/// their instances are reused instead of dropped and re-created.
+/// `write_back` hands the cells the user edits on screen -- with the row and
+/// column they happened in -- to the application's model.
+pub fn screen_tree_model_nested_carry<Element: Clone + PartialEq + 'static>(
+    current: &ModelRc<ModelRc<Element>>,
+    rows: Vec<Vec<Element>>,
+    write_back: impl Fn(usize, usize, Element) + 'static,
+) -> ModelRc<ModelRc<Element>> {
+    if let Some(existing) = current.as_any().downcast_ref::<NestedScreenTreeModel<Element>>() {
+        existing.set_rows(rows);
+        // The same model back: the repeater compares by pointer and keeps
+        // its row instances.
+        current.clone()
+    } else {
+        ModelRc::from(Rc::new(NestedScreenTreeModel::with_rows(rows, write_back)))
     }
 }

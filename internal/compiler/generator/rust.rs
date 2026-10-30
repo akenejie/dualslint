@@ -1274,7 +1274,29 @@ fn render_handover_state(
             return None;
         }
         let prop_access = access_member(&p.prop, ctx).unwrap();
-        let (read, set_value) = if let Type::Array(_) = &p.ty {
+        let (read, set_value) = if let Type::Array(array) = &p.ty
+            && matches!(&**array, Type::Array(_))
+        {
+            // A two-dimensional model: the cells travel as values, and the
+            // drawn tree receives them as fresh models of models -- no pooled
+            // copy yet, and none needed: the setter carry the application
+            // already posted builds the pooled grid with its write-back, and
+            // delivers after this handover.
+            (
+                quote! {
+                    #prop_access
+                        .get()
+                        .iter()
+                        .map(|row| {
+                            sp::ModelRc::new(sp::VecModel::from(
+                                row.iter().collect::<sp::Vec<_>>(),
+                            ))
+                        })
+                        .collect::<sp::Vec<_>>()
+                },
+                quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(value)))),
+            )
+        } else if let Type::Array(_) = &p.ty {
             (
                 quote!(#prop_access.get().iter().collect::<sp::Vec<_>>()),
                 quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(value)))),
@@ -1983,25 +2005,22 @@ fn public_api(
                             #carry
                         ),
                     )
-                } else if let Type::Array(element) = &p.ty
+                } else if let Type::Array(array) = &p.ty
+                    && let Type::Array(element) = &**array
                     && crate::llr::is_send_type(element)
                 {
-                    // A model whose rows are plain values can have the rows
-                    // copied across. One whose rows hold a nested model cannot:
-                    // the row would carry a reference into the tree the caller
-                    // holds, and the drawn tree keeps its own copy instead --
-                    // the same divergence the non-portable properties accept.
-                    //
-                    // The copy is a model of its own, not a throwaway
-                    // snapshot: the same one is updated in place on every
-                    // carry, so the drawn tree's repeater reuses its row
-                    // instances instead of dropping them all, and the rows the
-                    // user edits on screen -- a checkbox ticked in the drawn
-                    // tree -- are written back to the model the application
-                    // holds, where the sorted and filtered views read them.
+                    // A two-dimensional model whose cells are plain values:
+                    // the grid cannot travel as handles -- a row would carry
+                    // a reference into the tree the caller holds -- so the
+                    // cells travel as values and the drawn tree rebuilds a
+                    // grid of pooled row models of its own, updated in place
+                    // on every carry. A cell the user edits on screen -- a
+                    // spreadsheet cell typed into, say -- is handed back to
+                    // the application's grid through the write-back, with the
+                    // row and column it happened in.
                     let prop_access = access_member(&p.prop, ctx).unwrap();
                     let set_forwarded = quote! {
-                        #prop_access.set(sp::screen_tree_model_carry(
+                        #prop_access.set(sp::screen_tree_model_nested_carry(
                             &#prop_access.get(),
                             forwarded,
                             write_back,
@@ -2026,23 +2045,24 @@ fn public_api(
                     (
                         quote!(),
                         quote!(
-                            let forwarded = #prop_access.get().iter().collect::<sp::Vec<_>>();
-                            // The rows the user edits on screen belong to the
-                            // application's model, not to the drawn tree's
-                            // copy: the drawn tree's model hands every edited
-                            // row back through this, on the thread the
-                            // application runs on. The weak handle is a `Send`
-                            // one, which is what lets it travel with the model.
-                            //
-                            // `prop_access` pins against `_self`, which the
-                            // upgrade's closure names: the application's tree,
-                            // or its copy of the global.
+                            let forwarded = #prop_access
+                                .get()
+                                .iter()
+                                .map(|row| row.iter().collect::<sp::Vec<_>>())
+                                .collect::<sp::Vec<_>>();
+                            // The cells the user edits on screen belong to the
+                            // application's grid, not to the drawn tree's
+                            // copy: the drawn tree's grid hands every edited
+                            // cell back through this, on the thread the
+                            // application runs on.
                             let write_back = {
                                 #write_back_weak
-                                move |row, data| {
+                                move |row, col, data| {
                                     let _ = weak.upgrade_in_event_loop(move |handle| {
                                         #write_back_self
-                                        #prop_access.get().set_row_data(row, data);
+                                        if let Some(row_model) = #prop_access.get().row_data(row) {
+                                            row_model.set_row_data(col, data);
+                                        }
                                     });
                                 }
                             };
