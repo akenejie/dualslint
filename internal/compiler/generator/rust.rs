@@ -402,15 +402,30 @@ fn generate_public_component(
     // enough: when a backend takes the window over this component's timers
     // describe state nothing draws, so they have to go on the shelf too. A
     // callback is the same: the application's own handler lives on this thread's
-    // tree, so the drawn tree has to be pointed back at it.
+    // tree, so the drawn tree has to be pointed back at it. An exported global
+    // counts the same way: its state is carried to the drawn tree's copy, and
+    // its callbacks are pointed back at the application's handlers.
     let render_handover = if matches!(llr.top_level_type, llr::TopLevelComponentType::Window)
         && (has_portable_public_state(&llr.public_properties)
             || has_traveling_public_callback(&llr.public_properties)
+            || unit.globals.iter().any(|g| {
+                g.exported
+                    && (has_portable_public_state(&g.public_properties)
+                        || has_traveling_public_callback(&g.public_properties))
+            })
             || unit.sub_components.iter().any(|sc| !sc.timers.is_empty()))
     {
-        let body = render_handover_state(&llr.public_properties, &inner_component_id, &ctx);
+        let (global_weaks, body) =
+            render_handover_state(&llr.public_properties, &inner_component_id, &ctx, unit);
         quote!(
             let weak = slint::Weak::<#public_component_id>::new(sp::VRc::downgrade(&inner));
+            // The weak handles the global routes travel with are created
+            // here, on the thread the application runs on: a weak records the
+            // thread that made it, and an upgrade from another thread
+            // refuses, so one made inside the handover -- which a backend
+            // runs on the thread that draws -- would never upgrade on this
+            // thread, and the calls it forwards would be dropped silently.
+            #global_weaks
             sp::WindowInner::from_pub(window.window()).set_render_handover(Box::new(move || {
                 let Some(component) = weak.upgrade() else { return };
                 #body
@@ -1236,11 +1251,19 @@ fn is_thread_portable_type(ty: &Type) -> bool {
 ///
 /// The same moment the tree is handed over it is put on the shelf: its timers
 /// describe state the shelf does not draw, so they are stopped from now on.
+/// The handover body for a window-rooted component, plus the weak handles the
+/// global routes travel with.
+///
+/// The body runs inside the handover closure, which a backend invokes on the
+/// thread that draws. The weak handles are for the caller to declare outside
+/// that closure, on the thread the application runs on: a weak records the
+/// thread that made it, and these have to upgrade there.
 fn render_handover_state(
     public_properties: &llr::PublicProperties,
     inner_component_id: &proc_macro2::Ident,
     ctx: &EvaluationContext,
-) -> TokenStream {
+    root: &llr::CompilationUnit,
+) -> (TokenStream, TokenStream) {
     let carries = public_properties.iter().filter_map(|(_, p)| {
         let carried = match &p.ty {
             _ if !p.ty.is_property_type() || p.read_only() => false,
@@ -1364,7 +1387,177 @@ fn render_handover_state(
         })
     });
 
-    quote!(#(#carries)* #(#routes)*
+    // A global's state is carried and routed the same way. The application's
+    // copy of a global lives in the `SharedGlobals` of the tree it holds, and
+    // the drawn tree has its own copies of every global -- so a global's
+    // property is carried over on handover, and a global's callback the
+    // application replaced is pointed back at the application's handler. The
+    // member accesses resolve through `_self.globals()`, which names whichever
+    // tree `_self` belongs to: the application's on this thread, the drawn
+    // tree's inside the tasks posted to it.
+    let global_carries = root.globals.iter().filter_map(|global| {
+        if !global.exported {
+            return None;
+        }
+        let global_id = format_ident!("global_{}", ident(&global.name));
+        let carries = global.public_properties.values().filter_map(|p| {
+            let carried = match &p.ty {
+                _ if !p.ty.is_property_type() || p.read_only() => false,
+                Type::Array(element) => is_send_type(element),
+                other => is_thread_portable_type(other),
+            };
+            if !carried {
+                return None;
+            }
+            let prop_access = access_member(&p.prop, ctx).unwrap();
+            let (read, set_value) = if let Type::Array(_) = &p.ty {
+                (
+                    quote!(#prop_access.get().iter().collect::<Vec<_>>()),
+                    quote!(#prop_access.set(sp::ModelRc::new(sp::VecModel::from(value)))),
+                )
+            } else {
+                (
+                    primitive_property_value(&p.ty, MemberAccess::Direct(prop_access.clone())),
+                    property_set_value_tokens(&p.prop, quote!(value), ctx),
+                )
+            };
+            Some(quote! {
+                {
+                    let globals = sp::VRc::as_pin_ref(&component.0).globals().clone();
+                    let value = {
+                        let _self = globals.#global_id.as_ref();
+                        #read
+                    };
+                    let local_tree = sp::VRc::into_dyn(component.0.clone());
+                    slint::ComponentHandle::window(&component)
+                        .call_on_screen_tree(local_tree, move |tree| {
+                            let component = sp::VRc::map_dyn(tree.clone(), |tree| {
+                                sp::VRef::downcast_pin::<#inner_component_id>(tree).expect(
+                                    "the tree on screen is not the component the handover belongs to",
+                                )
+                            });
+                            let globals = component.as_pin_ref().globals().clone();
+                            let _self = globals.#global_id.as_ref();
+                            #set_value
+                        });
+                }
+            })
+        });
+        Some(quote!(#(#carries)*))
+    });
+
+    // A global's callbacks are routed the same way. The weak handles the
+    // routes travel with are declared outside the handover closure -- see the
+    // caller -- because a weak records the thread that made it, and these
+    // must upgrade on the application's thread. The declaration names the
+    // global's copy in the SharedGlobals of the tree the application holds;
+    // the route body below only clones it.
+    let global_weaks = root.globals.iter().enumerate().filter_map(|(global_index, global)| {
+        if !global.exported {
+            return None;
+        }
+        let travels = global
+            .public_properties
+            .values()
+            .any(|p| matches!(&p.ty, Type::Callback(callback) if callback_travels_back(callback)));
+        if !travels {
+            return None;
+        }
+        let global_id = format_ident!("global_{}", ident(&global.name));
+        let global_component_id = ident(&global.name);
+        let weak_ident = format_ident!("slint_global_weak_{}", global_index);
+        Some(quote! {
+            #[allow(unused)]
+            let #weak_ident = slint::Weak::<#global_component_id<'static>>::new(sp::Rc::downgrade(
+                &::core::pin::Pin::into_inner(
+                    sp::VRc::as_pin_ref(&inner).globals().clone().#global_id.clone(),
+                ),
+            ));
+        })
+    });
+
+    let global_routes = root.globals.iter().enumerate().filter_map(|(global_index, global)| {
+        if !global.exported {
+            return None;
+        }
+        let global_id = format_ident!("global_{}", ident(&global.name));
+        // The root's own callbacks count their handler notes from zero, so a
+        // global's notes start past every number the root could ever use.
+        let note_base = (global_index + 1) * 1_000_000;
+        let routes = global.public_properties.iter().enumerate().filter_map(|(index, (_, p))| {
+            let Type::Callback(callback) = &p.ty else { return None };
+            if !callback_travels_back(callback) {
+                return None;
+            }
+            let index = proc_macro2::Literal::u32_suffixed((note_base + index) as u32);
+            let callback_access = access_member(&p.prop, ctx).unwrap();
+            let arg_names = (0..callback.args.len())
+                .map(|i| format_ident!("route_arg_{}", i))
+                .collect::<Vec<_>>();
+            let arg_indices = (0..callback.args.len())
+                .map(proc_macro2::Literal::usize_unsuffixed)
+                .collect::<Vec<_>>();
+            let args_param =
+                if callback.args.is_empty() { quote!(_args) } else { quote!(args) };
+            let weak_ident = format_ident!("slint_global_weak_{}", global_index);
+            Some(quote! {
+                {
+                    let host_window = slint::ComponentHandle::window(&component);
+                    if sp::WindowInner::from_pub(host_window).has_host_callback(#index) {
+                        // The handler the application set lives on its copy of
+                        // the global. The weak to that copy -- declared on the
+                        // application's thread, outside this closure -- crosses
+                        // to the drawn tree inside the handler installed here,
+                        // and the calls it forwards run on the application's
+                        // thread, where the handler's captured state lives.
+                        let app_global = #weak_ident.clone();
+                        let local_tree = sp::VRc::into_dyn(component.0.clone());
+                        let local_identity = sp::item_tree_identity(&local_tree);
+                        let ui_thread = std::thread::current().id();
+                        host_window.call_on_screen_tree(local_tree, move |tree| {
+                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                ::std::eprintln!("[global-route] install idx={} same_tree={}",
+                                    #index, sp::item_tree_identity(tree) == local_identity);
+                            }
+                            if sp::item_tree_identity(tree) == local_identity {
+                                return;
+                            }
+                            let component = sp::VRc::map_dyn(tree.clone(), |tree| {
+                                sp::VRef::downcast_pin::<#inner_component_id>(tree).expect(
+                                    "the tree on screen is not the component the handover belongs to",
+                                )
+                            });
+                            let _self = component.as_pin_ref();
+                            #callback_access.set_handler(move |#args_param| {
+                                #(let #arg_names = args.#arg_indices.clone();)*
+                                if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                    ::std::eprintln!("[global-route] called idx={}", #index);
+                                }
+                                if std::thread::current().id() == ui_thread {
+                                    if let Some(global) = app_global.upgrade() {
+                                        let _self = global.0.as_ref();
+                                        #callback_access.call(&(#(#arg_names,)*));
+                                    }
+                                } else {
+                                    let routed = app_global.upgrade_in_event_loop(move |global| {
+                                        let _self = global.0.as_ref();
+                                        #callback_access.call(&(#(#arg_names,)*));
+                                    });
+                                    if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                        ::std::eprintln!("[global-route] upgrade idx={} -> {:?}",
+                                            #index, routed.err());
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
+            })
+        });
+        Some(quote!(#(#routes)*))
+    });
+
+    let route_body = quote!(#(#carries)* #(#global_carries)* #(#routes)* #(#global_routes)*
 
         // A backend drew a tree of its own for the window, so this component's
         // copy of the controls is a husk: the state it would compute is not what
@@ -1372,7 +1565,9 @@ fn render_handover_state(
         // state nothing draws and would otherwise go on firing on this thread.
         // The tree the backend draws carries its own timers, so the window keeps
         // animating without this thread even waking up.
-        sp::VRc::as_pin_ref(&component.0).globals().slint_shelve();)
+        sp::VRc::as_pin_ref(&component.0).globals().slint_shelve(););
+    let global_weaks = quote!(#(#global_weaks)*);
+    (global_weaks, route_body)
 }
 
 /// Whether a component has any public property whose value [`render_handover_state`]
@@ -1418,6 +1613,20 @@ enum CallTarget {
     /// component whose call carries nothing a thread cannot share can make the
     /// trip: the arguments cross with it and the return value comes back.
     ScreenTree { window: TokenStream, inner_component: TokenStream },
+    /// A call against a global singleton: the state lives in the
+    /// `SharedGlobals` of the tree the global belongs to, and a backend may
+    /// draw a tree of its own, whose `SharedGlobals` hold their own copies of
+    /// every global. A call has to be carried there to reach the bindings and
+    /// callbacks that decide what the window shows, the same way a component
+    /// call is. The drawn tree is reached through the `SharedGlobals` the
+    /// global sits in, which name the tree's root and its window adapter.
+    ///
+    /// The generated code downcasts the drawn tree's root to
+    /// `root_inner` to reach its `SharedGlobals`, and addresses the global's
+    /// own copy through the `global_id` field. `note_base` displaces the
+    /// callback numbers the global's handlers are noted under, past every
+    /// number a root component's own callbacks could use.
+    GlobalTree { root_inner: TokenStream, global_id: TokenStream, note_base: TokenStream },
 }
 
 impl CallTarget {
@@ -1439,6 +1648,46 @@ impl CallTarget {
                         #call
                     },
                 )
+            },
+            CallTarget::GlobalTree { root_inner, global_id, .. } => quote! {
+                let _self = self.0.as_ref();
+                match _self.globals().window_adapter_ref() {
+                    Ok(window_adapter) => {
+                        let Some(local_tree) = _self.globals().root_item_tree_weak.upgrade() else {
+                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                ::std::eprintln!("[global-invoke] no local tree; running locally");
+                            }
+                            return #call;
+                        };
+                        if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                            ::std::eprintln!("[global-invoke] posting local={:#x}",
+                                sp::item_tree_identity(&local_tree));
+                        }
+                        window_adapter.window().call_on_screen_tree(local_tree, move |tree| {
+                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                ::std::eprintln!("[global-invoke] runs tree={:#x}",
+                                    sp::item_tree_identity(tree));
+                            }
+                            // The tree on screen holds its own copy of the
+                            // global; reach it through its root. A root this
+                            // call does not belong to is left alone, and the
+                            // caller reads its own copy instead.
+                            let root_pinned =
+                                sp::VRef::downcast_pin::<#root_inner>(sp::VRc::borrow_pin(tree));
+                            let Some(root_pinned) = root_pinned else {
+                                return ::core::default::Default::default();
+                            };
+                            let _self = root_pinned.globals().#global_id.as_ref();
+                            #call
+                        })
+                    }
+                    Err(_) => {
+                        if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                            ::std::eprintln!("[global-invoke] no window adapter; running locally");
+                        }
+                        #call
+                    }
+                }
             },
         }
     }
@@ -1467,6 +1716,26 @@ impl CallTarget {
                         #call
                     },
                 )
+            },
+            CallTarget::GlobalTree { root_inner, global_id, .. } => quote! {
+                let _self = self.0.as_ref();
+                match _self.globals().window_adapter_ref() {
+                    Ok(window_adapter) => {
+                        let Some(local_tree) = _self.globals().root_item_tree_weak.upgrade() else {
+                            return;
+                        };
+                        window_adapter.window().post_on_screen_tree(local_tree, move |tree| {
+                            let Some(root_pinned) =
+                                sp::VRef::downcast_pin::<#root_inner>(sp::VRc::borrow_pin(tree))
+                            else {
+                                return;
+                            };
+                            let _self = root_pinned.globals().#global_id.as_ref();
+                            #call
+                        })
+                    }
+                    Err(_) => #call,
+                }
             },
         }
     }
@@ -1509,14 +1778,72 @@ impl CallTarget {
                     #call
                 })
             },
+            // The global's own copy on this thread was just assigned; the copy
+            // the drawn tree holds is the one whose bindings decide what is
+            // seen, so the value goes there too. The drawn tree is recognized
+            // by its identity, the same way a component carry is: a backend
+            // that draws the tree this global belongs to runs the task against
+            // that same tree, where the guard sees no work and changes
+            // nothing.
+            CallTarget::GlobalTree { root_inner, global_id, .. } => quote! {
+                match _self.globals().window_adapter_ref() {
+                    Ok(window_adapter) => {
+                        let Some(local_tree) = _self.globals().root_item_tree_weak.upgrade()
+                        else {
+                            return;
+                        };
+                        let local_identity = sp::item_tree_identity(&local_tree);
+                        window_adapter.window().post_on_screen_tree(local_tree, move |tree| {
+                            let tree_identity = sp::item_tree_identity(tree);
+                            if ::std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                ::std::eprintln!(
+                                    "[global-carry] task runs local={local_identity:#x} tree={tree_identity:#x} same={}",
+                                    tree_identity == local_identity,
+                                );
+                            }
+                            if tree_identity == local_identity {
+                                return;
+                            }
+                            let Some(root_pinned) =
+                                sp::VRef::downcast_pin::<#root_inner>(sp::VRc::borrow_pin(tree))
+                            else {
+                                return;
+                            };
+                            let _self = root_pinned.globals().#global_id.as_ref();
+                            #call
+                        })
+                    }
+                    Err(_) => {}
+                }
+            },
         }
     }
 
     /// Whether a call of these types can be moved to the tree on screen.
     fn takes(&self, args: &[Type], ret: &Type) -> bool {
-        matches!(self, CallTarget::ScreenTree { .. })
+        matches!(self, CallTarget::ScreenTree { .. } | CallTarget::GlobalTree { .. })
             && is_thread_portable_type(ret)
             && args.iter().all(is_thread_portable_type)
+    }
+
+    /// The statement that records the application's own handler for callback
+    /// number `index`, so a handover points the drawn tree's callback back at
+    /// it. Runs where the handler is set, with `_self` naming the tree the
+    /// application holds. A global's numbers are displaced by its `note_base`,
+    /// past every number a root component's own callbacks could use.
+    fn note_host(&self, index: TokenStream) -> TokenStream {
+        match self {
+            CallTarget::OwnTree => quote!(),
+            CallTarget::ScreenTree { window, .. } => quote!(
+                sp::WindowInner::from_pub(#window).note_host_callback(#index);
+            ),
+            CallTarget::GlobalTree { note_base, .. } => quote!(
+                if let Ok(window_adapter) = _self.globals().window_adapter_ref() {
+                    sp::WindowInner::from_pub(window_adapter.window())
+                        .note_host_callback(#note_base + #index);
+                }
+            ),
+        }
     }
 
     /// The expression that reaches the window these calls belong to, when there is one.
@@ -1524,11 +1851,12 @@ impl CallTarget {
     /// A component rooted in a window can ask that window which tree it shows;
     /// a tray or a component with no window has nothing to ask, and the code
     /// that tells the window something about the application's handlers needs
-    /// it for the same reason.
+    /// it for the same reason. A global reaches its window through the
+    /// `SharedGlobals` it sits in, which [`Self::note_host`] spells out.
     fn window_expr(&self) -> Option<&TokenStream> {
         match self {
             CallTarget::ScreenTree { window, .. } => Some(window),
-            CallTarget::OwnTree => None,
+            CallTarget::OwnTree | CallTarget::GlobalTree { .. } => None,
         }
     }
 }
@@ -1582,10 +1910,8 @@ fn public_api(
             // The declared handler is the one on the tree the application holds, but the
             // tree a backend draws was built from the declaration and still has that one.
             // Telling the window lets the handover point the drawn tree back here.
-            let note_host = call_target.window_expr().map(|window| {
-                let index = proc_macro2::Literal::u32_suffixed(index as u32);
-                quote!(sp::WindowInner::from_pub(#window).note_host_callback(#index);)
-            });
+            let index = proc_macro2::Literal::u32_suffixed(index as u32);
+            let note_host = call_target.note_host(quote!(#index));
             property_and_callback_accessors.push(quote!(
                 #[allow(dead_code)]
                 pub fn #on_ident(&self, mut f: impl FnMut(#(#callback_args),*) -> #return_type + 'static) {
@@ -1715,6 +2041,21 @@ fn public_api(
                         ));
                     };
                     let carry = call_target.wrap_carry(set_forwarded);
+                    // The weak handle the write-back travels with differs by
+                    // target: a component's handle is a `ComponentHandle`
+                    // weak, a global's is a `Global` weak -- both `Send`, so
+                    // the closure they travel in can cross to the thread the
+                    // application runs on.
+                    let (write_back_weak, write_back_self) = match call_target {
+                        CallTarget::GlobalTree { .. } => (
+                            quote!(let weak = slint::Global::as_weak(self);),
+                            quote!(let _self = handle.0.as_ref();),
+                        ),
+                        _ => (
+                            quote!(let weak = slint::ComponentHandle::as_weak(self);),
+                            quote!(let _self = sp::VRc::as_pin_ref(&handle.0);),
+                        ),
+                    };
                     (
                         quote!(),
                         quote!(
@@ -1727,12 +2068,13 @@ fn public_api(
                             // one, which is what lets it travel with the model.
                             //
                             // `prop_access` pins against `_self`, which the
-                            // upgrade's closure names: the application's tree.
+                            // upgrade's closure names: the application's tree,
+                            // or its copy of the global.
                             let write_back = {
-                                let weak = slint::ComponentHandle::as_weak(self);
+                                #write_back_weak
                                 move |row, data| {
-                                    let _ = weak.upgrade_in_event_loop(move |component| {
-                                        let _self = sp::VRc::as_pin_ref(&component.0);
+                                    let _ = weak.upgrade_in_event_loop(move |handle| {
+                                        #write_back_self
                                         #prop_access.get().set_row_data(row, data);
                                     });
                                 }
@@ -2758,11 +3100,33 @@ fn generate_global(
     };
 
     let public_interface = global.exported.then(|| {
+        // A global's state lives in the `SharedGlobals` of the tree the global
+        // belongs to, so its calls follow the tree the window draws, the same
+        // way a window-rooted component's calls do: the accessors reach the
+        // drawn tree through the `SharedGlobals` the global sits in, which
+        // name the tree's root and its window adapter. A global only used by
+        // components that are not windows has no drawn tree to reach, and
+        // keeps its calls on the tree the caller holds.
+        let call_target = root
+            .public_components
+            .iter()
+            .find(|c| matches!(c.top_level_type, llr::TopLevelComponentType::Window))
+            .map_or(CallTarget::OwnTree, |c| {
+                let root_inner = self::inner_component_id(&root.sub_components[c.item_tree.root]);
+                let global_id = format_ident!("global_{}", ident(&global.name));
+                let note_base =
+                    proc_macro2::Literal::u32_suffixed(((usize::from(global_idx) + 1) * 1_000_000) as u32);
+                CallTarget::GlobalTree {
+                    root_inner: quote!(#root_inner),
+                    global_id: quote!(#global_id),
+                    note_base: quote!(#note_base),
+                }
+            });
         let property_and_callback_accessors = public_api(
             &global.public_properties,
             &global.private_properties,
             quote!(self.0.as_ref()),
-            &CallTarget::OwnTree,
+            &call_target,
             &ctx,
         );
         let aliases = global.aliases.iter().map(|name| ident(name));

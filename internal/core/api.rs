@@ -1281,8 +1281,13 @@ mod weak_handle {
                 if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
                     std::eprintln!("[upgrade-in-event-loop] closure runs");
                 }
-                if let Some(h) = weak_handle.upgrade() {
-                    func(h);
+                match weak_handle.upgrade() {
+                    Some(h) => func(h),
+                    #[cfg(feature = "std")]
+                    None if std::env::var_os("SLINT_LOG_REPEATER").is_some() => {
+                        std::eprintln!("[upgrade-in-event-loop] upgrade failed");
+                    }
+                    None => {}
                 }
             })
         }
