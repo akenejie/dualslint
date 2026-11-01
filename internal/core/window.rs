@@ -90,6 +90,22 @@ pub trait WindowAdapter {
     /// Returns the window API.
     fn window(&self) -> &Window;
 
+    /// Whether the component the application holds in this adapter's window
+    /// is the component that gets drawn.
+    ///
+    /// The generated window constructor materializes every repeater of the
+    /// component it builds, because upstream's drawn tree is the tree the
+    /// application holds. A backend that draws a tree of its own -- a mirror
+    /// a render thread instantiated from the registered factory, say -- says
+    /// so by returning `false`: the application's copy then anchors only the
+    /// state the public API needs (properties, models, and the handlers
+    /// calls are routed back to), and building the row instances nothing
+    /// would read is work skipped. The tree the adapter draws materializes
+    /// itself, on the thread that draws.
+    fn hosts_drawn_tree(&self) -> bool {
+        true
+    }
+
     /// Show the window if the argument is true, hide otherwise.
     fn set_visible(&self, _visible: bool) -> Result<(), PlatformError> {
         Ok(())
@@ -764,6 +780,13 @@ pub struct WindowInner {
     #[cfg(feature = "std")]
     render_handover: RefCell<Option<Box<dyn Fn()>>>,
 
+    /// Set once [`Self::run_render_handover`] ran: a backend took the drawing
+    /// over, and this window's own component is on the shelf. Its repeaters
+    /// describe state nothing draws, so the materialization passes leave them
+    /// alone.
+    #[cfg(feature = "std")]
+    handed_over: core::cell::Cell<bool>,
+
     /// The callbacks of the root component whose handler the application replaced
     /// with one of its own, as the number each one carries in generated code. The
     /// tree a backend draws is built from the declaration and so starts with the
@@ -804,6 +827,8 @@ impl WindowInner {
 
         #[cfg(feature = "std")]
         let render_handover: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
+        #[cfg(feature = "std")]
+        let handed_over: core::cell::Cell<bool> = core::cell::Cell::new(false);
 
         let mut window_properties_tracker =
             PropertyTracker::new_with_dirty_handler(WindowPropertiesTracker {
@@ -862,6 +887,8 @@ impl WindowInner {
             #[cfg(feature = "std")]
             render_handover,
             #[cfg(feature = "std")]
+            handed_over,
+            #[cfg(feature = "std")]
             host_handled_callbacks: Default::default(),
             focus_affects_rendering: Cell::new(true),
             ime_affects_rendering: Cell::new(true),
@@ -916,13 +943,27 @@ impl WindowInner {
     pub fn ensure_tree_instantiated(&self) {
         // Instantiation runs first so that ListView's ensure_updated_listview
         // sees the model property before any change handler can reset it.
+        //
+        // A window whose drawing a backend took over keeps its component on
+        // the shelf: the tree that draws instantiated its own repeaters, and
+        // the ones here describe state nothing reads. Materializing them is
+        // work skipped, not work deferred. The adapter says so from the
+        // start -- a backend that draws a tree of its own never needs this
+        // tree's rows, however early the call comes -- and the handover
+        // marks it for adapters that decided later.
+        #[cfg(feature = "std")]
+        let materialize = !self.handed_over.get() && self.window_adapter().hosts_drawn_tree();
+        #[cfg(not(feature = "std"))]
+        let materialize = true;
         for _ in 0..10 {
             let mut changed = false;
-            if let Some(component) = self.try_component() {
-                changed |= crate::item_tree::ensure_item_tree_instantiated(&component);
-            }
-            for popup in self.active_popups.borrow().iter() {
-                changed |= crate::item_tree::ensure_item_tree_instantiated(&popup.component);
+            if materialize {
+                if let Some(component) = self.try_component() {
+                    changed |= crate::item_tree::ensure_item_tree_instantiated(&component);
+                }
+                for popup in self.active_popups.borrow().iter() {
+                    changed |= crate::item_tree::ensure_item_tree_instantiated(&popup.component);
+                }
             }
             changed |= crate::properties::ChangeTracker::run_change_handlers_once();
             if !changed {
@@ -1336,6 +1377,12 @@ impl WindowInner {
     #[doc(hidden)]
     pub fn run_render_handover(&self) {
         if let Some(handover) = self.render_handover.borrow().as_ref() {
+            // Mark the shelf before the handover body runs: the carries it
+            // posts may evaluate bindings on the tree this window hosts, and
+            // a change handler fired on the way may ask for the
+            // materialization pass -- which has nothing left to do for a tree
+            // nothing draws.
+            self.handed_over.set(true);
             handover();
         }
     }

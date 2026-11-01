@@ -2419,6 +2419,15 @@ impl WindowAdapter for WinitWindowAdapter {
         &self.window
     }
 
+    /// The tree this adapter holds is not the one that gets drawn: after the
+    /// handover the render thread draws a mirror it instantiated from the
+    /// registered factory, and the tree here anchors the application's state.
+    /// The mirror materializes its own repeaters; the ones here are never
+    /// built.
+    fn hosts_drawn_tree(&self) -> bool {
+        false
+    }
+
     /// Hand an application's call to the tree this thread draws.
     ///
     /// A call comes from application code, which runs where the application put

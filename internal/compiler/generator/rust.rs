@@ -473,7 +473,19 @@ fn generate_public_component(
             quote!(inner.globals.get().unwrap().create_window_from_context(ctx)?;),
             Some(quote!(
                 let window = inner.globals.get().unwrap().window_adapter_ref()?;
-                sp::WindowInner::from_pub(window.window()).ensure_tree_instantiated();
+                // Materializing this tree's repeaters is the job of whichever
+                // tree draws. A backend that hands the drawing over to a tree
+                // of its own -- a mirror a render thread built from the
+                // factory registered below -- leaves this tree on the shelf,
+                // where its row instances describe state nothing reads; the
+                // application's copy anchors the properties, models, and
+                // handlers the public API needs, and that is all it builds.
+                if sp::WindowInner::from_pub(window.window())
+                    .window_adapter()
+                    .hosts_drawn_tree()
+                {
+                    sp::WindowInner::from_pub(window.window()).ensure_tree_instantiated();
+                }
                 // Whether focus is worth a redraw was decided from the elements
                 // while this document compiled. A drawing thread that is never
                 // told otherwise has to assume it is.
@@ -2002,6 +2014,72 @@ fn public_api(
                             // the caller holds runs this against that same tree,
                             // where the guard in the carry sees no work and
                             // changes nothing.
+                            #carry
+                        ),
+                    )
+                } else if let Type::Array(element) = &p.ty
+                    && crate::llr::is_send_type(element)
+                {
+                    // A model whose rows are plain values can have the rows
+                    // copied across. One whose rows hold a nested model cannot:
+                    // the row would carry a reference into the tree the caller
+                    // holds, and the drawn tree keeps its own copy instead --
+                    // the same divergence the non-portable properties accept.
+                    //
+                    // The copy is a model of its own, not a throwaway
+                    // snapshot: the same one is updated in place on every
+                    // carry, so the drawn tree's repeater reuses its row
+                    // instances instead of dropping them all, and the rows the
+                    // user edits on screen -- a checkbox ticked in the drawn
+                    // tree -- are written back to the model the application
+                    // holds, where the sorted and filtered views read them.
+                    let prop_access = access_member(&p.prop, ctx).unwrap();
+                    let set_forwarded = quote! {
+                        #prop_access.set(sp::screen_tree_model_carry(
+                            &#prop_access.get(),
+                            forwarded,
+                            write_back,
+                        ));
+                    };
+                    let carry = call_target.wrap_carry(set_forwarded);
+                    // The weak handle the write-back travels with differs by
+                    // target: a component's handle is a `ComponentHandle`
+                    // weak, a global's is a `Global` weak -- both `Send`, so
+                    // the closure they travel in can cross to the thread the
+                    // application runs on.
+                    let (write_back_weak, write_back_self) = match call_target {
+                        CallTarget::GlobalTree { .. } => (
+                            quote!(let weak = slint::Global::as_weak(self);),
+                            quote!(let _self = handle.0.as_ref();),
+                        ),
+                        _ => (
+                            quote!(let weak = slint::ComponentHandle::as_weak(self);),
+                            quote!(let _self = sp::VRc::as_pin_ref(&handle.0);),
+                        ),
+                    };
+                    (
+                        quote!(),
+                        quote!(
+                            let forwarded = #prop_access.get().iter().collect::<sp::Vec<_>>();
+                            // The rows the user edits on screen belong to the
+                            // application's model, not to the drawn tree's
+                            // copy: the drawn tree's model hands every edited
+                            // row back through this, on the thread the
+                            // application runs on. The weak handle is a `Send`
+                            // one, which is what lets it travel with the model.
+                            //
+                            // `prop_access` pins against `_self`, which the
+                            // upgrade's closure names: the application's tree,
+                            // or its copy of the global.
+                            let write_back = {
+                                #write_back_weak
+                                move |row, data| {
+                                    let _ = weak.upgrade_in_event_loop(move |handle| {
+                                        #write_back_self
+                                        #prop_access.get().set_row_data(row, data);
+                                    });
+                                }
+                            };
                             #carry
                         ),
                     )

@@ -123,6 +123,7 @@ pub fn main() {
                 }));
             }
         });
+        std::mem::forget(timer);
     }
 
     main_window.run().unwrap();
