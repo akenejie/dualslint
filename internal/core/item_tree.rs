@@ -322,6 +322,23 @@ fn step_into_node(
 /// `dyn_index` of `parent` expands to. Used to tell two repeated instances of
 /// the same component apart when computing [`ItemRc::stable_id`].
 fn find_subtree_index(parent: &ItemTreeRc, dyn_index: u32, child: &ItemTreeRc) -> u32 {
+    // The child knows the row it was instantiated for: that is the index
+    // property the repeater gave it, exposed through the vtable. Asking is
+    // O(1) where the scan below is O(rows) -- and the scan runs per item per
+    // frame when the control table is encoded, which on a wide repeater is
+    // the difference between a frame and a stall. The answer is verified
+    // against the parent, so a tree whose model index does not map back to
+    // itself still falls through to the scan.
+    let reported = vtable::VRc::borrow_pin(child).as_ref().subtree_index();
+    if reported != usize::MAX {
+        let mut subtree: vtable::VWeak<ItemTreeVTable, Dyn> = Default::default();
+        vtable::VRc::borrow_pin(parent).as_ref().get_subtree(dyn_index, reported, &mut subtree);
+        if let Some(subtree) = subtree.upgrade()
+            && vtable::VRc::ptr_eq(&subtree, child)
+        {
+            return reported as u32;
+        }
+    }
     let parent_pin = vtable::VRc::borrow_pin(parent);
     let range = parent_pin.as_ref().get_subtree_range(dyn_index);
     for subindex in range.start..range.end {
