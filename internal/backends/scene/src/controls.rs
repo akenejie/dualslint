@@ -22,7 +22,7 @@ use i_slint_core::item_rendering::{
     RenderText,
 };
 use i_slint_core::item_tree::ItemRc;
-use i_slint_core::items::{Clip, Layer, Opacity};
+use i_slint_core::items::{Clip, ItemRef, Layer, Opacity};
 use i_slint_core::lengths::{
     LogicalBorderRadius, LogicalPoint, LogicalRect, LogicalSize, LogicalVector, ScaleFactor,
 };
@@ -249,7 +249,16 @@ impl<'a> ControlEncoder<'a> {
         i_slint_core::item_tree::visit_items(
             component,
             i_slint_core::item_tree::TraversalOrder::BackToFront,
-            |component, _item, index, _state| {
+            |component, item, index, _state| {
+                // A `visible: false` subtree holds no controls: the wrapper
+                // the compiler lowers it into is right here, and everything
+                // below it is off the screen.
+                if let Some(clip) = ItemRef::downcast_pin::<Clip>(item)
+                    && clip.is_visibility_clip()
+                    && clip.clip()
+                {
+                    return i_slint_core::item_tree::ItemVisitorResult::SkipChildren;
+                }
                 let item_rc = ItemRc::new(component.clone(), index);
                 // A control is something the user can act on: point at it, type
                 // into it, or tab to it.  A plain rectangle is painted but not
@@ -380,10 +389,21 @@ impl ItemRenderer for ControlEncoder<'_> {
 
     fn visit_clip(
         &mut self,
-        _clip_item: Pin<&Clip>,
+        clip_item: Pin<&Clip>,
         _item_rc: &ItemRc,
         size: LogicalSize,
     ) -> i_slint_core::items::RenderingResult {
+        // A visibility clip is what the compiler lowers `visible: false` into:
+        // the item and everything below it is not on the screen at all, so
+        // there is nothing here the user can point at, and walking the
+        // subtree would read the geometry bindings of every item it holds --
+        // for a spreadsheet's 2,600 invisible line edits, thousands of text
+        // measurements for a control table that would list none of them.
+        // The tree that draws skips the same subtree, so skipping here keeps
+        // the walk's work in line with what is actually on screen.
+        if clip_item.is_visibility_clip() && clip_item.clip() {
+            return i_slint_core::items::RenderingResult::ContinueRenderingWithoutChildren;
+        }
         // The clip does not hide anything here: a control behind one is still
         // a control, and deciding that belongs to the draw pass that would
         // have clipped it.
