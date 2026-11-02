@@ -4623,6 +4623,7 @@ version = "1.18.0"
 dependencies = [
  "i-slint-core",
  "lyon_path",
+ "vtable",
 ]
 
 [[package]]

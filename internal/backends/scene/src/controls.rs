@@ -21,13 +21,17 @@ use i_slint_core::item_rendering::{
     CachedRenderingData, ItemRenderer, RenderBorderRectangle, RenderImage, RenderRectangle,
     RenderText,
 };
-use i_slint_core::item_tree::ItemRc;
-use i_slint_core::items::{Clip, ItemRef, Layer, Opacity};
+use i_slint_core::item_tree::{ControlKind, ControlSlot, ItemRc, ItemTreeVTable};
+use i_slint_core::items::{
+    Clip, ContextMenu, DragArea, Flickable, FocusScope, Layer, Opacity, TextInput, TouchArea,
+    WindowMoveArea,
+};
 use i_slint_core::lengths::{
     LogicalBorderRadius, LogicalPoint, LogicalRect, LogicalSize, LogicalVector, ScaleFactor,
 };
 use i_slint_core::platform::PlatformError;
 use i_slint_core::window::WindowInner;
+use vtable::VRc;
 
 use crate::{ControlRegion, PressBehavior, PressTarget};
 
@@ -216,8 +220,7 @@ impl<'a> ControlEncoder<'a> {
     /// below it.  So the items that take a press are published on their own,
     /// in paint order, and the UI thread walks them to find the one the press
     /// lands on.
-    fn push_press_target(&mut self, item: &ItemRc, origin: LogicalPoint) {
-        let Some(behavior) = press_behavior(item) else { return };
+    fn push_press_target(&mut self, item: &ItemRc, behavior: PressBehavior, origin: LogicalPoint) {
         let geometry = item.geometry();
         if geometry.size.is_empty() {
             return;
@@ -246,36 +249,145 @@ impl<'a> ControlEncoder<'a> {
         component: &i_slint_core::item_tree::ItemTreeRc,
         origin: LogicalPoint,
     ) {
-        i_slint_core::item_tree::visit_items(
-            component,
-            i_slint_core::item_tree::TraversalOrder::BackToFront,
-            |component, item, index, _state| {
-                // A `visible: false` subtree holds no controls: the wrapper
-                // the compiler lowers it into is right here, and everything
-                // below it is off the screen.
-                if let Some(clip) = ItemRef::downcast_pin::<Clip>(item)
-                    && clip.is_visibility_clip()
-                    && clip.clip()
-                {
-                    return i_slint_core::item_tree::ItemVisitorResult::SkipChildren;
+        // The compiler lowered the control structure of this tree into slots:
+        // which items can be pointed at, where the `visible` wrappers sit,
+        // and where the repeated subtrees attach.  Enumerating the slots
+        // replaces walking the tree item by item and re-discovering that
+        // structure with a cast per item -- work nothing needs, since the
+        // geometry and the enabled / visible values are all the runtime has
+        // to answer anyway.
+        let pinned = VRc::borrow_pin(component);
+        let slots = pinned.as_ref().control_slots();
+        self.walk_control_slots(component, &slots, origin);
+    }
+
+    fn walk_control_slots(
+        &mut self,
+        component: &i_slint_core::item_tree::ItemTreeRc,
+        slots: &[ControlSlot],
+        origin: LogicalPoint,
+    ) {
+        let mut index = 0;
+        while index < slots.len() {
+            let mut advance = 1;
+            match slots[index] {
+                // A `visible: false` wrapper: the wrapped subtree is off the
+                // screen and holds no controls.  Its slots sit right after
+                // this one, up to the flat index where the subtree ends.
+                ControlSlot::Visibility { index, skip } => {
+                    let item_rc = ItemRc::new(component.clone(), index);
+                    let invisible = item_rc.downcast::<Clip>().is_some_and(|clip| {
+                        let clip = clip.as_pin_ref();
+                        clip.is_visibility_clip() && clip.clip()
+                    });
+                    if invisible {
+                        // The wrapped subtree's slots sit right here in the
+                        // list: the guard plus `skip` of them, all skipped.
+                        advance = 1 + skip as usize;
+                    }
                 }
-                let item_rc = ItemRc::new(component.clone(), index);
-                // A control is something the user can act on: point at it, type
-                // into it, or tab to it.  A plain rectangle is painted but not
-                // acted on, and it has no business in a control id space.  What
-                // is in the space is what the property protocol has to be able
-                // to name, so the two lists are kept together.
-                let interactive = item_rc.downcast::<i_slint_core::items::TouchArea>().is_some()
-                    || item_rc.downcast::<i_slint_core::items::FocusScope>().is_some()
-                    || item_rc.downcast::<i_slint_core::items::TextInput>().is_some();
-                if interactive {
-                    self.push_control(&item_rc, origin);
+                ControlSlot::Repeater { index } => {
+                    // Each instantiated row is a tree of its own, with a slot
+                    // table of its own: enumerate them in place.
+                    let pin = VRc::borrow_pin(component);
+                    let range = pin.as_ref().get_subtree_range(index);
+                    for row in range.start..range.end {
+                        let mut row_tree: vtable::VWeak<ItemTreeVTable, vtable::Dyn> =
+                            Default::default();
+                        pin.as_ref().get_subtree(index, row, &mut row_tree);
+                        if let Some(row_tree) = row_tree.upgrade() {
+                            self.collect_interactive_controls(&row_tree, origin);
+                        }
+                    }
                 }
-                self.push_press_target(&item_rc, origin);
-                i_slint_core::item_tree::ItemVisitorResult::Continue(())
-            },
-            (),
-        );
+                ControlSlot::Item { index, kind } => {
+                    let item_rc = ItemRc::new(component.clone(), index);
+                    match kind {
+                        ControlKind::TouchArea => {
+                            if let Some(item) = item_rc.downcast::<TouchArea>() {
+                                self.push_control(&item_rc, origin);
+                                let enabled = TouchArea::FIELD_OFFSETS
+                                    .enabled()
+                                    .apply_pin(item.as_pin_ref())
+                                    .get();
+                                if enabled {
+                                    self.push_press_target(&item_rc, PressBehavior::Takes, origin);
+                                }
+                            }
+                        }
+                        ControlKind::TextInput => {
+                            if let Some(item) = item_rc.downcast::<TextInput>() {
+                                self.push_control(&item_rc, origin);
+                                let enabled = TextInput::FIELD_OFFSETS
+                                    .enabled()
+                                    .apply_pin(item.as_pin_ref())
+                                    .get();
+                                if enabled {
+                                    self.push_press_target(&item_rc, PressBehavior::Takes, origin);
+                                }
+                            }
+                        }
+                        ControlKind::FocusScope => {
+                            if let Some(item) = item_rc.downcast::<FocusScope>() {
+                                self.push_control(&item_rc, origin);
+                                let item = item.as_pin_ref();
+                                let enabled =
+                                    FocusScope::FIELD_OFFSETS.enabled().apply_pin(item).get();
+                                let focus_on_click = FocusScope::FIELD_OFFSETS
+                                    .focus_on_click()
+                                    .apply_pin(item)
+                                    .get();
+                                if enabled && focus_on_click {
+                                    self.push_press_target(&item_rc, PressBehavior::Focus, origin);
+                                }
+                            }
+                        }
+                        ControlKind::Flickable => {
+                            if let Some(item) = item_rc.downcast::<Flickable>() {
+                                let item = item.as_pin_ref();
+                                if item.interactive() && item.mouse_drag_pan_enabled() {
+                                    self.push_press_target(&item_rc, PressBehavior::Takes, origin);
+                                }
+                            }
+                        }
+                        ControlKind::DragArea => {
+                            if let Some(item) = item_rc.downcast::<DragArea>() {
+                                let enabled = DragArea::FIELD_OFFSETS
+                                    .enabled()
+                                    .apply_pin(item.as_pin_ref())
+                                    .get();
+                                if enabled {
+                                    self.push_press_target(&item_rc, PressBehavior::Takes, origin);
+                                }
+                            }
+                        }
+                        ControlKind::ContextMenu => {
+                            if let Some(item) = item_rc.downcast::<ContextMenu>() {
+                                let enabled = ContextMenu::FIELD_OFFSETS
+                                    .enabled()
+                                    .apply_pin(item.as_pin_ref())
+                                    .get();
+                                if enabled {
+                                    self.push_press_target(&item_rc, PressBehavior::Takes, origin);
+                                }
+                            }
+                        }
+                        ControlKind::WindowMoveArea => {
+                            if let Some(item) = item_rc.downcast::<WindowMoveArea>() {
+                                let enabled = WindowMoveArea::FIELD_OFFSETS
+                                    .enabled()
+                                    .apply_pin(item.as_pin_ref())
+                                    .get();
+                                if enabled {
+                                    self.push_press_target(&item_rc, PressBehavior::Takes, origin);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            index += advance;
+        }
     }
 
     fn finish(self) -> ControlTable {
@@ -504,25 +616,22 @@ pub fn encode_window_controls(
 
     let mut encoder = ControlEncoder::new(window_inner);
 
-    window_inner.draw_contents(|components, post_render| {
+    window_inner.draw_contents(|components, _post_render| {
         // Every tree the window draws is walked for controls, not just its own:
         // a menu is a popup tree of its own, and its items are controls the user
         // points at like any other. They come after the window's own items, so
         // the hit-test takes them first and the menu is on top where it is drawn.
+        //
+        // One walk does this. The draw-shaped walk the real renderer runs is of
+        // no use here: every draw method on the encoder is empty, so the pass
+        // would visit every item, evaluate its geometry for translate and clip
+        // bookkeeping nothing consumes, and publish nothing. The collection
+        // walk below finds the controls on its own.
         for (component, origin) in components {
             if let Some(component) = i_slint_core::item_tree::ItemTreeWeak::upgrade(component) {
-                i_slint_core::item_rendering::render_component_items(
-                    &component,
-                    &mut encoder,
-                    *origin,
-                    &window_adapter,
-                );
-                // After that tree's draw pass, so that the interactive items are
-                // visited whether or not they contributed a draw command.
                 encoder.collect_interactive_controls(&component, *origin);
             }
         }
-        post_render(&mut encoder);
     });
 
     Ok(encoder.finish())

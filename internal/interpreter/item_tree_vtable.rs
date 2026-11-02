@@ -13,7 +13,7 @@ use i_slint_core::accessibility::{
     AccessibilityAction, AccessibleStringProperty, SupportedAccessibilityAction,
 };
 use i_slint_core::item_tree::{
-    IndexRange, ItemTree, ItemTreeNode, ItemTreeVTable, ItemVisitorVTable, ItemWeak,
+    ControlSlot, IndexRange, ItemTree, ItemTreeNode, ItemTreeVTable, ItemVisitorVTable, ItemWeak,
     TraversalOrder, VisitChildrenResult,
 };
 use i_slint_core::items::{AccessibleRole, ItemVTable};
@@ -154,6 +154,10 @@ impl i_slint_core::item_tree::ItemTree for Instance {
 
     fn get_item_tree(self: Pin<&Self>) -> Slice<'_, ItemTreeNode> {
         Slice::from(&*self.get_ref().tree_nodes)
+    }
+
+    fn control_slots(self: Pin<&Self>) -> Slice<'_, ControlSlot> {
+        Slice::from(&*self.get_ref().control_slots)
     }
 
     fn parent_node(self: Pin<&Self>, result: &mut ItemWeak) {

@@ -3424,6 +3424,7 @@ dependencies = [
  "lyon_path",
  "slint-interpreter",
  "spin_on",
+ "vtable",
 ]
 
 [[package]]

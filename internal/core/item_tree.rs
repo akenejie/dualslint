@@ -76,6 +76,12 @@ pub struct ItemTreeVTable {
     /// Return the item tree that is defined by this `ItemTree`.
     pub get_item_tree: extern "C" fn(::core::pin::Pin<VRef<ItemTreeVTable>>) -> Slice<ItemTreeNode>,
 
+    /// The control structure of this item tree, in back-to-front order -- the
+    /// order the item array holds the items in. See [`ControlSlot`]. The
+    /// publisher of the control table enumerates these instead of walking the
+    /// tree, whose structure the compiler already lowered into the slots.
+    pub control_slots: extern "C" fn(::core::pin::Pin<VRef<ItemTreeVTable>>) -> Slice<ControlSlot>,
+
     /// Return the node this ItemTree is a part of in the parent ItemTree.
     ///
     /// The return value is an item weak because it can be null if there is no parent.
@@ -1436,6 +1442,48 @@ impl ItemTreeNode {
     }
 }
 
+/// What the item a [`ControlSlot`] points at is, decided when the document
+/// compiles: the publisher reads exactly the properties this type's behavior
+/// needs, through one cast, instead of trying every candidate type in turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ControlKind {
+    TouchArea,
+    TextInput,
+    FocusScope,
+    Flickable,
+    DragArea,
+    ContextMenu,
+    WindowMoveArea,
+}
+
+/// One entry of the control structure the compiler lowers an item tree into.
+///
+/// The structure is static: which items can be pointed at or typed into,
+/// where the `visible` wrappers sit, and where the repeated subtrees attach
+/// are all decided when the document compiles. Only the geometry and the
+/// enabled / visible values live at runtime, so the publisher of the control
+/// table enumerates these slots instead of walking the tree and discovering
+/// the structure item by item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ControlSlot {
+    /// An item at `index` (its position in this tree's item array) of `kind`.
+    Item { index: u32, kind: ControlKind },
+    /// The compiler-lowered wrapper of a `visible` property, at `index`. While
+    /// its `clip` property is true the wrapped subtree is off the screen: the
+    /// publisher skips this slot and the `skip` slots that follow it -- the
+    /// wrapped subtree's own slots, which sit right here in the list.
+    Visibility { index: u32, skip: u32 },
+    /// A repeater (or an embedded component) at `index`: each instantiated
+    /// subtree is a tree of its own, with a slot table of its own.
+    Repeater { index: u32 },
+}
+
+/// The control slots of one item tree, as the control table's publisher
+/// enumerates them. See [`ControlSlot`].
+pub type ControlSlotVec = alloc::vec::Vec<ControlSlot>;
+
 /// The `ItemTreeNodeArray` provides tree walking code for the physical ItemTree stored in
 /// a `ItemTree` without stitching any inter-ItemTree links together!
 pub struct ItemTreeNodeArray<'a> {
@@ -2032,6 +2080,10 @@ mod tests {
 
         fn get_item_tree(self: core::pin::Pin<&Self>) -> Slice<'_, ItemTreeNode> {
             Slice::from_slice(&self.get_ref().item_tree)
+        }
+
+        fn control_slots(self: core::pin::Pin<&Self>) -> Slice<'_, ControlSlot> {
+            Slice::from_slice(&[])
         }
 
         fn parent_node(self: core::pin::Pin<&Self>, result: &mut ItemWeak) {
@@ -3159,6 +3211,10 @@ mod tests {
 
         fn get_item_tree(self: Pin<&Self>) -> Slice<'_, ItemTreeNode> {
             Slice::from_slice(&self.get_ref().item_tree)
+        }
+
+        fn control_slots(self: Pin<&Self>) -> Slice<'_, ControlSlot> {
+            Slice::from_slice(&[])
         }
 
         fn parent_node(self: Pin<&Self>, _result: &mut ItemWeak) {}

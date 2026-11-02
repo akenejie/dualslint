@@ -3376,6 +3376,27 @@ fn generate_item_tree(
     let mut item_tree_array: Vec<TokenStream> = Vec::new();
     let mut item_array = Vec::new();
     let mut z_sorted_nodes: Vec<(usize, &llr::TreeNode)> = Vec::new();
+    // The control structure the compiler lowers this tree into, recorded in
+    // the same visit: one entry per node, with the flat position, the direct
+    // children's range, and what the item is.  See [`ControlSlot`].
+    struct ControlNode {
+        index: u32,
+        parent: u32,
+        class: ControlSlotClass,
+    }
+    enum ControlSlotClass {
+        Repeater(TokenStream),
+        Clip,
+        TouchArea,
+        TextInput,
+        FocusScope,
+        Flickable,
+        DragArea,
+        ContextMenu,
+        WindowMoveArea,
+        Other,
+    }
+    let mut control_nodes: Vec<ControlNode> = Vec::new();
     sub_tree.tree.visit_in_array(&mut |node, children_offset, parent_index| {
         let parent_index = parent_index as u32;
         let (_, component) =
@@ -3393,6 +3414,11 @@ fn generate_item_tree(
                     repeater_index += sub_component.sub_components[*i].repeater_offset;
                     sub_component = &root.sub_components[sub_component.sub_components[*i].ty];
                 }
+                control_nodes.push(ControlNode {
+                    index: item_tree_array.len() as u32,
+                    parent: parent_index,
+                    class: ControlSlotClass::Repeater(quote!(#repeater_index)),
+                });
                 item_tree_array.push(quote!(
                     sp::ItemTreeNode::DynamicTree {
                         index: #repeater_index,
@@ -3402,6 +3428,22 @@ fn generate_item_tree(
             }
             Either::Left(item_index) => {
                 let item = &component.items[item_index];
+                let slot_class = match item.ty.class_name.as_str() {
+                    "Clip" => ControlSlotClass::Clip,
+                    "TouchArea" => ControlSlotClass::TouchArea,
+                    "TextInput" => ControlSlotClass::TextInput,
+                    "FocusScope" => ControlSlotClass::FocusScope,
+                    "Flickable" => ControlSlotClass::Flickable,
+                    "DragArea" => ControlSlotClass::DragArea,
+                    "ContextMenu" => ControlSlotClass::ContextMenu,
+                    "WindowMoveArea" => ControlSlotClass::WindowMoveArea,
+                    _ => ControlSlotClass::Other,
+                };
+                control_nodes.push(ControlNode {
+                    index: item_tree_array.len() as u32,
+                    parent: parent_index,
+                    class: slot_class,
+                });
 
                 let children_count = node.children.len() as u32;
                 let children_index = children_offset as u32;
@@ -3456,6 +3498,91 @@ fn generate_item_tree(
 
     let item_tree_array_len = item_tree_array.len();
     let item_array_len = item_array.len();
+
+    // The slot list, in tree pre-order -- the order the old tree walk visited
+    // items in, so a `visible` wrapper's subtree slots sit right after it and
+    // the publisher can skip them by count.  The visit emitted the nodes
+    // level-grouped, so the pre-order is rebuilt here from the parent links.
+    enum SlotPlan {
+        Item { index: u32, kind: &'static str },
+        Visibility { index: u32, skip: u32 },
+        Repeater { index: u32, repeater: TokenStream },
+    }
+    let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); control_nodes.len()];
+    for (position, node) in control_nodes.iter().enumerate() {
+        if position > 0 {
+            children_of[node.parent as usize].push(position);
+        }
+    }
+    fn plan_subtree(
+        control_nodes: &[ControlNode],
+        children_of: &[Vec<usize>],
+        position: usize,
+        plans: &mut Vec<SlotPlan>,
+    ) {
+        let index = control_nodes[position].index;
+        match &control_nodes[position].class {
+            // Not a control and not a wrapper: nothing to publish, but the
+            // subtree below it can hold controls of its own.
+            ControlSlotClass::Other => {
+                for child in &children_of[position] {
+                    plan_subtree(control_nodes, children_of, *child, plans);
+                }
+            }
+            ControlSlotClass::Clip => {
+                // The guard is pushed first; its skip is patched once the
+                // wrapped subtree's slots have all been counted.
+                let guard = plans.len();
+                plans.push(SlotPlan::Visibility { index, skip: 0 });
+                for child in &children_of[position] {
+                    plan_subtree(control_nodes, children_of, *child, plans);
+                }
+                let skip = (plans.len() - guard - 1) as u32;
+                plans[guard] = SlotPlan::Visibility { index, skip };
+                return;
+            }
+            ControlSlotClass::Repeater(repeater) => {
+                plans.push(SlotPlan::Repeater { index, repeater: repeater.clone() });
+                return; // a repeater's rows are trees of their own
+            }
+            class => {
+                let kind = match class {
+                    ControlSlotClass::TouchArea => "TouchArea",
+                    ControlSlotClass::TextInput => "TextInput",
+                    ControlSlotClass::FocusScope => "FocusScope",
+                    ControlSlotClass::Flickable => "Flickable",
+                    ControlSlotClass::DragArea => "DragArea",
+                    ControlSlotClass::ContextMenu => "ContextMenu",
+                    ControlSlotClass::WindowMoveArea => "WindowMoveArea",
+                    _ => unreachable!(),
+                };
+                plans.push(SlotPlan::Item { index, kind });
+                for child in &children_of[position] {
+                    plan_subtree(control_nodes, children_of, *child, plans);
+                }
+            }
+        }
+    }
+    let mut plans: Vec<SlotPlan> = Vec::new();
+    if let Some(root_position) = control_nodes.iter().position(|n| n.parent == 0 && n.index == 0) {
+        plan_subtree(&control_nodes, &children_of, root_position, &mut plans);
+    }
+    let control_slot_tokens: Vec<TokenStream> = plans
+        .iter()
+        .map(|plan| match plan {
+            SlotPlan::Item { index, kind } => {
+                let kind = quote::format_ident!("{}", kind);
+                quote!(sp::ControlSlot::Item { index: #index, kind: sp::ControlKind::#kind })
+            }
+            SlotPlan::Visibility { index, skip } => {
+                quote!(sp::ControlSlot::Visibility { index: #index, skip: #skip })
+            }
+            SlotPlan::Repeater { index, repeater } => {
+                let _ = index;
+                quote!(sp::ControlSlot::Repeater { index: #repeater })
+            }
+        })
+        .collect();
 
     let element_info_body = if root.has_debug_info {
         quote!(
@@ -3632,6 +3759,17 @@ fn generate_item_tree(
                 self: ::core::pin::Pin<&Self>) -> sp::Slice<'_, sp::ItemTreeNode>
             {
                 Self::item_tree().into()
+            }
+
+            fn control_slots(
+                self: ::core::pin::Pin<&Self>) -> sp::Slice<'_, sp::ControlSlot>
+            {
+                // The control structure the compiler lowered this tree into:
+                // which items can be pointed at, where the `visible` wrappers
+                // are, and where the repeated subtrees attach. Only the
+                // geometry and the enabled / visible values live at runtime.
+                const SLOTS: &'static [sp::ControlSlot] = &[ #(#control_slot_tokens),* ];
+                sp::Slice::from(SLOTS)
             }
 
             fn get_subtree_range(

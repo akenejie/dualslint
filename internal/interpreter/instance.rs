@@ -205,6 +205,10 @@ pub struct Instance {
     pub root_sub_component: Pin<Rc<SubComponentInstance>>,
     /// Flat `ItemTreeNode` slice returned by the `get_item_tree` vtable entry.
     pub tree_nodes: Box<[ItemTreeNode]>,
+    /// The control structure the compiler lowered this tree into, in the same
+    /// flat order as `tree_nodes`. See
+    /// [`i_slint_core::item_tree::ControlSlot`].
+    pub control_slots: Box<[i_slint_core::item_tree::ControlSlot]>,
     /// Parallel table mapping each `DynamicTree` flat index to the
     /// `(sub_component_path, RepeatedElementIdx)` that owns the repeater.
     /// `None` entries correspond to non-dynamic nodes.
@@ -788,10 +792,12 @@ fn build_instance(
     let root_sub_component =
         build_sub_component_instance(compilation_unit, item_tree.root, parent_for_root);
     let (tree_nodes, dynamic_table, item_table, z_sort_table) = build_tree_nodes(&item_tree.tree);
+    let control_slots = build_control_slots(compilation_unit, &item_tree.tree, item_tree.root);
 
     let vrc = VRc::new(Instance {
         root_sub_component,
         tree_nodes: tree_nodes.into_boxed_slice(),
+        control_slots: control_slots.into_boxed_slice(),
         dynamic_table: dynamic_table.into_boxed_slice(),
         item_table: item_table.into_boxed_slice(),
         z_sort_table: z_sort_table.into_boxed_slice(),
@@ -1050,6 +1056,88 @@ type ZSortEntry = Option<Vec<llr::ZSource>>;
 /// mapping flat indices whose children are dynamically z-ordered to the per-child
 /// z sources.
 ///
+/// The control structure of the tree the interpreter instantiates, in the
+/// same flat pre-order the item array is laid out in. The type of each item
+/// is read off the lowered definition -- exactly what the generated code
+/// bakes into its static table; only the geometry and the enabled / visible
+/// values are answered at runtime.
+fn build_control_slots(
+    compilation_unit: &CompilationUnit,
+    root: &llr::TreeNode,
+    root_sub_component: llr::SubComponentIdx,
+) -> Vec<i_slint_core::item_tree::ControlSlot> {
+    use i_slint_core::item_tree::{ControlKind, ControlSlot};
+
+    fn control_kind(class_name: &str) -> Option<ControlKind> {
+        Some(match class_name {
+            "TouchArea" => ControlKind::TouchArea,
+            "TextInput" => ControlKind::TextInput,
+            "FocusScope" => ControlKind::FocusScope,
+            "Flickable" => ControlKind::Flickable,
+            "DragArea" => ControlKind::DragArea,
+            "ContextMenu" => ControlKind::ContextMenu,
+            "WindowMoveArea" => ControlKind::WindowMoveArea,
+            _ => return None,
+        })
+    }
+
+    fn item_class_name<'a>(
+        compilation_unit: &'a CompilationUnit,
+        root_sub_component: llr::SubComponentIdx,
+        node: &llr::TreeNode,
+    ) -> &'a str {
+        let itertools::Either::Left(item_idx) = node.item_index else { return "" };
+        let mut sub_component = &compilation_unit.sub_components[root_sub_component];
+        for i in &node.sub_component_path {
+            sub_component = &compilation_unit.sub_components[sub_component.sub_components[*i].ty];
+        }
+        sub_component.items[item_idx].ty.class_name.as_str()
+    }
+
+    fn class_of<'a>(
+        compilation_unit: &'a CompilationUnit,
+        root_sub_component: llr::SubComponentIdx,
+        node: &llr::TreeNode,
+    ) -> &'a str {
+        item_class_name(compilation_unit, root_sub_component, node)
+    }
+
+    fn visit(
+        compilation_unit: &CompilationUnit,
+        root_sub_component: llr::SubComponentIdx,
+        node: &llr::TreeNode,
+        flat: &mut u32,
+        slots: &mut Vec<ControlSlot>,
+    ) {
+        let my_flat = *flat;
+        *flat += 1;
+        let class_name = class_of(compilation_unit, root_sub_component, node);
+        if class_name == "Clip" {
+            slots.push(ControlSlot::Visibility { index: my_flat, skip: 0 });
+            let guard = slots.len() - 1;
+            for child in &node.children {
+                visit(compilation_unit, root_sub_component, child, flat, slots);
+            }
+            let skip = (slots.len() - guard - 1) as u32;
+            slots[guard] = ControlSlot::Visibility { index: my_flat, skip };
+        } else if let Some(kind) = control_kind(class_name) {
+            slots.push(ControlSlot::Item { index: my_flat, kind });
+            for child in &node.children {
+                visit(compilation_unit, root_sub_component, child, flat, slots);
+            }
+        } else {
+            for child in &node.children {
+                visit(compilation_unit, root_sub_component, child, flat, slots);
+            }
+        }
+    }
+
+    let mut slots = Vec::new();
+    let mut flat = 0;
+    visit(compilation_unit, root_sub_component, root, &mut flat, &mut slots);
+    slots
+}
+
 /// Walks in the same order as [`llr::TreeNode::visit_in_array`], so flat
 /// indices match what the rest of the runtime expects.
 fn build_tree_nodes(

@@ -29,6 +29,7 @@ svg = ["i-slint-core/svg"]
 [dependencies]
 i-slint-core = { workspace = true, features = ["default", "box-shadow-cache"] }
 lyon_path = { workspace = true }
+vtable = { workspace = true }
 
 [dev-dependencies]
 # A headless window to encode, and a way to build a component with real widgets
