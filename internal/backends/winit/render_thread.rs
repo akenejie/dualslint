@@ -338,6 +338,12 @@ pub enum RenderMessage {
     /// only then: a window that maps before the first present shows whatever
     /// the compositor has, which on X11 is nothing at all.
     NotifyFirstPresent(std::sync::mpsc::Sender<()>),
+    /// Ask this thread to produce one more frame.  The UI thread requests it
+    /// right after mapping the window: the first frame was presented into a
+    /// window that was not mapped yet, and a swap into an unmapped window
+    /// does not reach the screen, so the mapped window starts from the
+    /// compositor's nothing and needs a frame of its own.
+    RedrawOnce,
     /// Instantiate the app's component on the render thread.  `factory` runs on
     /// the render thread (it must call the component's `new()` *there*, since
     /// ItemTree/Property are single-threaded) and returns the component's
@@ -1354,6 +1360,13 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::NotifyFirstPresent(tx));
     }
 
+    /// Ask for one more frame.  The UI thread calls this right after mapping
+    /// the window: the frame presented before the map went into an unmapped
+    /// window, and a swap into an unmapped window does not reach the screen.
+    pub fn redraw_once(&self) {
+        let _ = self.sender.send(RenderMessage::RedrawOnce);
+    }
+
     /// Ask the render thread to quit.
     pub fn send_quit(&self) {
         let _ = self.sender.send(RenderMessage::Quit);
@@ -1912,6 +1925,9 @@ impl RenderCore {
                     }
                     RenderMessage::NotifyFirstPresent(tx) => {
                         self.first_present_notify = Some(tx);
+                    }
+                    RenderMessage::RedrawOnce => {
+                        frame_request.set(true);
                     }
                     // A mirror needs a GL context to present into, so it exists
                     // only on the GPU renderers; the software build keeps replaying

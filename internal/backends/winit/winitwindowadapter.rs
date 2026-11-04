@@ -2355,6 +2355,18 @@ impl WinitWindowAdapter {
 
             winit_window.set_visible(true);
 
+            // The frame presented before the map went into an unmapped window,
+            // and a swap into an unmapped window does not reach the screen --
+            // the compositor's nothing is what the map exposes. Ask for one
+            // more frame now that the window can show it.
+            if matches!(visibility, WindowVisibility::ShownFirstTime)
+                && !self.shared_backend_data.is_wayland
+                && let Some(host) = self.render_host()
+                && host.has_attached_component()
+            {
+                host.redraw_once();
+            }
+
             // Refresh the SlintContext color-scheme now that the window is mapped: on some platforms
             // `winit_window.theme()` only reports a real value once the window is shown.
             if let Some(theme) = winit_window.theme() {
