@@ -81,6 +81,27 @@ pub(crate) struct SlintContextInner {
 #[derive(Clone)]
 pub struct SlintContext(pub(crate) core::pin::Pin<Rc<SlintContextInner>>);
 
+#[cfg(feature = "shared-parley")]
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// A font collection another thread already scanned, handed over so this
+    /// thread's context shares it instead of scanning the system fonts again.
+    static PENDING_FONT_COLLECTION: core::cell::RefCell<
+        Option<crate::textlayout::sharedparley::SharedFontData>,
+    > = const { core::cell::RefCell::new(None) };
+}
+
+/// Hand this thread a font collection another thread already built, so the
+/// context created here next shares it rather than scanning the system fonts
+/// a second time. The duplicate scan is the deterministic kind of work two
+/// threads must not each pay for: the collection describes the same system
+/// fonts either way.
+#[cfg(feature = "shared-parley")]
+#[doc(hidden)]
+pub fn set_pending_font_collection(data: crate::textlayout::sharedparley::SharedFontData) {
+    PENDING_FONT_COLLECTION.with(|pending| *pending.borrow_mut() = Some(data));
+}
+
 impl SlintContext {
     /// Create a new context with a given platform.
     ///
@@ -91,11 +112,30 @@ impl SlintContext {
     /// context has to be explicit about it (e.g. [`Self::new_timer`]).
     pub fn new(platform: Box<dyn Platform + 'static>) -> Self {
         #[cfg(feature = "shared-parley")]
-        let collection = i_slint_common::sharedfontique::create_collection(true);
+        let font_data = PENDING_FONT_COLLECTION.with(|pending| pending.borrow_mut().take());
+        #[cfg(feature = "shared-parley")]
+        let font_context = core::cell::RefCell::new(match font_data {
+            // Another thread's context already scanned the system fonts: the
+            // collection describes the same set either way, so share it rather
+            // than scan it twice.
+            Some(data) => crate::textlayout::sharedparley::FontContext::new(parley::FontContext {
+                collection: data.collection,
+                source_cache: data.source_cache,
+            }),
+            None => {
+                let collection = i_slint_common::sharedfontique::create_collection(true);
+                crate::textlayout::sharedparley::FontContext::new(parley::FontContext {
+                    collection: collection.inner,
+                    source_cache: collection.source_cache,
+                })
+            }
+        });
 
         let this = Self(Rc::pin(SlintContextInner {
             platform,
             window_count: 0.into(),
+            #[cfg(feature = "shared-parley")]
+            font_context,
 
             translations_dirty: Property::new_named(0, "SlintContext::translations"),
             translations_bundle: Default::default(),
@@ -117,16 +157,6 @@ impl SlintContext {
             log_message_handler: Default::default(),
             #[cfg(all(unix, not(target_os = "macos")))]
             xdg_app_id: Default::default(),
-            #[cfg(feature = "shared-parley")]
-            font_context: {
-                let font_context = parley::FontContext {
-                    collection: collection.inner,
-                    source_cache: collection.source_cache,
-                };
-                core::cell::RefCell::new(crate::textlayout::sharedparley::FontContext::new(
-                    font_context,
-                ))
-            },
             #[cfg(feature = "shared-swash")]
             swash_scale_context: core::cell::RefCell::new(swash::scale::ScaleContext::new()),
             modifiers: Cell::new(Default::default()),

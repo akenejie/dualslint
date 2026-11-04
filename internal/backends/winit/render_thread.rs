@@ -338,6 +338,10 @@ pub enum RenderMessage {
     /// only then: a window that maps before the first present shows whatever
     /// the compositor has, which on X11 is nothing at all.
     NotifyFirstPresent(std::sync::mpsc::Sender<()>),
+    /// Hand this thread the font collection the UI thread's context already
+    /// scanned, so the mirror's context shares it instead of scanning the
+    /// system fonts a second time.
+    SetFontCollection(SharedFontData),
     /// Ask this thread to produce one more frame.  The UI thread requests it
     /// right after mapping the window: the first frame was presented into a
     /// window that was not mapped yet, and a swap into an unmapped window
@@ -1367,6 +1371,12 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::RedrawOnce);
     }
 
+    /// Hand the render thread the font collection the UI thread's context
+    /// already scanned, so the mirror's context shares it.
+    pub fn send_font_collection(&self, data: SharedFontData) {
+        let _ = self.sender.send(RenderMessage::SetFontCollection(data));
+    }
+
     /// Ask the render thread to quit.
     pub fn send_quit(&self) {
         let _ = self.sender.send(RenderMessage::Quit);
@@ -1464,6 +1474,9 @@ pub(crate) struct RenderCore {
     /// The UI thread waits for this thread's first frame before it maps the
     /// window; signaled once, after the first successful present.
     first_present_notify: Option<std::sync::mpsc::Sender<()>>,
+    /// The UI thread's font collection, received before the attach: the
+    /// mirror's context shares it instead of scanning the system fonts again.
+    font_collection: Option<SharedFontData>,
 }
 
 /// A parked call, together with the reply half the blocking caller waits on.
@@ -1686,12 +1699,16 @@ impl RenderCore {
             channel_id,
             pending_on_screen_tree: Vec::new(),
             first_present_notify: None,
+            font_collection: None,
         }
     }
 
     /// Run the render-thread event loop.  Blocks until `Quit`.
     pub(crate) fn run(&mut self) {
         ON_RENDER_THREAD.with(|on| on.set(true));
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[render-thread] loop starts");
+        }
         // The loop is done when it returns; clear the state a peer call reads
         // so a later call on this thread posts a message instead.
         struct ClearOnExit;
@@ -1926,6 +1943,9 @@ impl RenderCore {
                     RenderMessage::NotifyFirstPresent(tx) => {
                         self.first_present_notify = Some(tx);
                     }
+                    RenderMessage::SetFontCollection(collection) => {
+                        self.font_collection = Some(collection);
+                    }
                     RenderMessage::RedrawOnce => {
                         frame_request.set(true);
                     }
@@ -1936,6 +1956,9 @@ impl RenderCore {
                     RenderMessage::AttachComponent { factory, property_access } => {
                         #[cfg(render_thread_can_draw)]
                         let attach_started = std::time::Instant::now();
+                        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                            std::eprintln!("[render-thread] attach message received");
+                        }
                         // The factory runs *after* the headless platform is seeded:
                         // it instantiates the app's component, which needs this
                         // thread's `GLOBAL_CONTEXT` to already be claimed.
@@ -1945,9 +1968,23 @@ impl RenderCore {
                             // frame, and the adapter that hosts it reports the ones
                             // that follow.
                             frame_request = Rc::new(Cell::new(true));
+                            // The mirror's context shares the UI thread's font
+                            // collection: the scan is the same system fonts
+                            // either way, and doing it twice is the deterministic
+                            // kind of work two threads must not each pay for.
+                            if let Some(collection) = self.font_collection.take() {
+                                i_slint_core::context::set_pending_font_collection(collection);
+                            }
+                            let platform_started = std::time::Instant::now();
                             let _ = i_slint_core::platform::set_platform(Box::new(
                                 RenderMirrorPlatform::new(frame_request.clone()),
                             ));
+                            if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                std::eprintln!(
+                                    "[attach] mirror platform seed: {:?}",
+                                    platform_started.elapsed()
+                                );
+                            }
                             let mirror_built = std::time::Instant::now();
                             render_component.borrow_mut().replace(factory());
                             if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
@@ -2001,7 +2038,14 @@ impl RenderCore {
                                             self.channel_id
                                         );
                                     }
+                                    let parked_started = std::time::Instant::now();
                                     (parked.task)(&tree);
+                                    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                        std::eprintln!(
+                                            "[attach] parked carry (row materialization): {:?}",
+                                            parked_started.elapsed()
+                                        );
+                                    }
                                 }
                                 // The reply closes whether the tree was there or
                                 // not, so a caller waiting for a value learns of
@@ -2429,11 +2473,14 @@ fn publish_mirror_controls(
     // The mirror has no event loop of its own, so its timers and
     // `.slint`-declared animations must be advanced on this thread before
     // encoding; otherwise the render-owned tree would show a frozen clock.
+    let encode_started = std::time::Instant::now();
     i_slint_core::platform::update_timers_and_animations();
     let Ok(table) = i_slint_backend_scene::controls::encode_window_controls(adapter.window())
     else {
         return false;
     };
+    let encoded = encode_started.elapsed();
+    let maps_started = std::time::Instant::now();
     *render_controls = table.controls.iter().map(|r| (r.id, r.clone())).collect();
     render_control_order.clear();
     render_control_order.extend(table.controls.iter().map(|r| r.id));
@@ -2441,6 +2488,13 @@ fn publish_mirror_controls(
     // running on this same thread; no separate publish step is needed.
     *render_item_rcs.borrow_mut() = table.item_refs.into_iter().collect();
     interaction.retain(&table.controls);
+    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+        std::eprintln!(
+            "[encode] timers+walk={encoded:?} maps={:?} slots={}",
+            maps_started.elapsed(),
+            table.controls.len()
+        );
+    }
     // The only publish on the GPU path. `render_scene`, which publishes as a
     // side effect of compositing an encoded frame, does not run there, and
     // without this the UI thread would hit-test an empty table and no pointer
@@ -3229,6 +3283,10 @@ pub(crate) fn set_active_host(host: &RenderHost) {
 /// Called by the window adapter that owns the surface, because a render thread
 /// is only worth starting for a window that exists: the window itself arrives
 /// later as [`RenderMessage::Configure`], and until then the thread waits.
+/// The font data the UI thread's context scanned, handed to the mirror's
+/// context so the second context shares the collection instead of re-scanning.
+pub use i_slint_core::textlayout::sharedparley::SharedFontData;
+
 pub(crate) fn create_host(
     event_loop_proxy: &winit::event_loop::EventLoopProxy<crate::SlintEvent>,
 ) -> RenderHost {
@@ -3902,8 +3960,18 @@ impl DrawTarget {
         match self {
             #[cfg(feature = "renderer-femtovg")]
             Self::Gl(state) => {
+                let started = std::time::Instant::now();
                 state.ensure_upstream(window_adapter)?;
-                state.render_upstream()
+                let ensured = started.elapsed();
+                let rendered = state.render_upstream()?;
+                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                    let total = started.elapsed();
+                    std::eprintln!(
+                        "[draw] gl-ensure={ensured:?} render={:?} total={total:?}",
+                        total - ensured
+                    );
+                }
+                Ok(())
             }
             #[cfg(all(not(feature = "renderer-femtovg"), feature = "renderer-software"))]
             Self::Software(state) => state.present(window_adapter),

@@ -29,6 +29,15 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// The font data a context needs, extractable from one thread's context and
+/// handed to another thread's, so the second context shares the collection
+/// instead of scanning the system fonts a second time.
+#[derive(Clone)]
+pub struct SharedFontData {
+    pub collection: fontique::Collection,
+    pub source_cache: fontique::SourceCache,
+}
+
 #[derive(derive_more::Deref, derive_more::DerefMut)]
 pub struct FontContext {
     #[deref]

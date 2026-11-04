@@ -17,8 +17,12 @@ use std::sync::Arc;
 /// When `shared` is true, the collection uses `Arc`-based internal sharing,
 /// so that clones share the underlying data and mutations are visible across clones.
 pub fn create_collection(shared: bool) -> Collection {
+    let started = std::time::Instant::now();
     let mut collection =
         fontique::Collection::new(fontique::CollectionOptions { shared, system_fonts: true });
+    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+        std::eprintln!("[fonts] collection base created: {:?}", started.elapsed());
+    }
     let mut source_cache =
         if shared { fontique::SourceCache::new_shared() } else { fontique::SourceCache::default() };
 

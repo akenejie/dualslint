@@ -173,6 +173,8 @@ const MAX_EAGER_INSTANCE_COUNT: usize = 1 << 20;
 
 /// Update all instances in the repeater, creating any that are missing.
 fn update_all_instances(ops: &mut impl RepeaterInstanceOps, offset: usize, count: usize) {
+    #[cfg(feature = "std")]
+    let materialize_started = if count > 0 { Some(std::time::Instant::now()) } else { None };
     let count = if count > MAX_EAGER_INSTANCE_COUNT {
         crate::debug_log!("A repeater's model has {count} rows: too many to instantiate");
         0
@@ -187,6 +189,12 @@ fn update_all_instances(ops: &mut impl RepeaterInstanceOps, offset: usize, count
     }
     for i in 0..count {
         ops.ensure_updated(i, i + offset);
+    }
+    #[cfg(feature = "std")]
+    if let Some(started) = materialize_started
+        && std::env::var_os("SLINT_LOG_REPEATER").is_some()
+    {
+        std::eprintln!("[repeater] update_all count={count} took {:?}", started.elapsed());
     }
 }
 

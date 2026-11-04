@@ -956,8 +956,29 @@ impl WinitWindowAdapter {
             return Ok(());
         }
 
-        let host = self.render_host();
-        if !crate::render_thread::take_over_drawing_of(self.window(), host.as_ref()) {
+        let Some(host) = self.render_host() else {
+            return Ok(());
+        };
+        // The mirror's context shares this thread's font collection: the scan
+        // describes the same system fonts either way, and doing it twice is
+        // the deterministic kind of work two threads must not each pay for.
+        host.send_font_collection(crate::render_thread::SharedFontData {
+            collection: WindowInner::from_pub(self.window())
+                .context()
+                .font_context()
+                .borrow()
+                .inner
+                .collection
+                .clone(),
+            source_cache: WindowInner::from_pub(self.window())
+                .context()
+                .font_context()
+                .borrow()
+                .inner
+                .source_cache
+                .clone(),
+        });
+        if !crate::render_thread::take_over_drawing_of(self.window(), Some(&host)) {
             return Ok(());
         }
 
