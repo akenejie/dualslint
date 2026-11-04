@@ -1894,6 +1894,8 @@ impl RenderCore {
                     // the UI-side tree and has no use for the component.
                     #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))]
                     RenderMessage::AttachComponent { factory, property_access } => {
+                        #[cfg(render_thread_can_draw)]
+                        let attach_started = std::time::Instant::now();
                         // The factory runs *after* the headless platform is seeded:
                         // it instantiates the app's component, which needs this
                         // thread's `GLOBAL_CONTEXT` to already be claimed.
@@ -1906,7 +1908,14 @@ impl RenderCore {
                             let _ = i_slint_core::platform::set_platform(Box::new(
                                 RenderMirrorPlatform::new(frame_request.clone()),
                             ));
+                            let mirror_built = std::time::Instant::now();
                             render_component.borrow_mut().replace(factory());
+                            if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                                std::eprintln!(
+                                    "[attach] mirror instantiation: {:?}",
+                                    mirror_built.elapsed()
+                                );
+                            }
                             *render_property_access.borrow_mut() = property_access;
                             render_window_adapter =
                                 HEADLESS_ADAPTER_SLOT.with(|slot| slot.get().cloned());
