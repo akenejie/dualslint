@@ -2332,6 +2332,27 @@ impl WinitWindowAdapter {
                 let _ = self.draw();
             }
 
+            // The drawing is the render thread's now, and its first frame for
+            // this window takes the mirror build, the state carry, and one
+            // encode-and-present. Mapping before that frame shows whatever the
+            // compositor has, which on X11 is nothing at all -- the transparent
+            // window the user watches until the frame lands. So wait for the
+            // render thread's first present, bounded: a render thread that
+            // cannot present maps the window blank rather than hanging the
+            // startup. Wayland maps up front, where the surface flow differs.
+            if matches!(visibility, WindowVisibility::ShownFirstTime)
+                && !self.shared_backend_data.is_wayland
+                && let Some(host) = self.render_host()
+                && host.has_attached_component()
+            {
+                let (first_frame_tx, first_frame_rx) = std::sync::mpsc::channel();
+                host.notify_first_present(first_frame_tx);
+                // The handover and the attach are already in the render
+                // thread's queue; the frame it produces first is the one this
+                // wait is for.
+                let _ = first_frame_rx.recv_timeout(std::time::Duration::from_secs(3));
+            }
+
             winit_window.set_visible(true);
 
             // Refresh the SlintContext color-scheme now that the window is mapped: on some platforms

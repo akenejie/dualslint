@@ -333,6 +333,11 @@ pub enum RenderMessage {
     },
     /// Execute an arbitrary closure on the render thread.
     User(Box<dyn FnOnce() + Send>),
+    /// Ask this thread to signal the UI thread once its first frame for the
+    /// attached component is on the screen.  The UI thread maps the window
+    /// only then: a window that maps before the first present shows whatever
+    /// the compositor has, which on X11 is nothing at all.
+    NotifyFirstPresent(std::sync::mpsc::Sender<()>),
     /// Instantiate the app's component on the render thread.  `factory` runs on
     /// the render thread (it must call the component's `new()` *there*, since
     /// ItemTree/Property are single-threaded) and returns the component's
@@ -1342,6 +1347,13 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::User(Box::new(f)));
     }
 
+    /// Ask the render thread to signal `tx` once its first frame for the
+    /// attached component has been presented.  The UI thread maps the window
+    /// on that signal, so the window never shows the compositor's nothing.
+    pub fn notify_first_present(&self, tx: std::sync::mpsc::Sender<()>) {
+        let _ = self.sender.send(RenderMessage::NotifyFirstPresent(tx));
+    }
+
     /// Ask the render thread to quit.
     pub fn send_quit(&self) {
         let _ = self.sender.send(RenderMessage::Quit);
@@ -1436,6 +1448,9 @@ pub(crate) struct RenderCore {
     /// reached is dropped, so a caller of the blocking variant still learns of
     /// the loss as a default instead of hanging when no tree ever comes.
     pending_on_screen_tree: Vec<PendingScreenTreeCall>,
+    /// The UI thread waits for this thread's first frame before it maps the
+    /// window; signaled once, after the first successful present.
+    first_present_notify: Option<std::sync::mpsc::Sender<()>>,
 }
 
 /// A parked call, together with the reply half the blocking caller waits on.
@@ -1652,7 +1667,13 @@ impl RenderCore {
         coords: Arc<Mutex<PublishedControls>>,
         channel_id: usize,
     ) -> Self {
-        Self { rx, coords, channel_id, pending_on_screen_tree: Vec::new() }
+        Self {
+            rx,
+            coords,
+            channel_id,
+            pending_on_screen_tree: Vec::new(),
+            first_present_notify: None,
+        }
     }
 
     /// Run the render-thread event loop.  Blocks until `Quit`.
@@ -1888,6 +1909,9 @@ impl RenderCore {
                     }
                     RenderMessage::User(f) => {
                         f();
+                    }
+                    RenderMessage::NotifyFirstPresent(tx) => {
+                        self.first_present_notify = Some(tx);
                     }
                     // A mirror needs a GL context to present into, so it exists
                     // only on the GPU renderers; the software build keeps replaying
@@ -2354,6 +2378,11 @@ impl RenderCore {
                     &mut interaction,
                 );
                 last_iteration_work = frame_started.elapsed();
+                // The first frame for this attachment is up: the UI thread,
+                // which is waiting on it, may map the window now.
+                if let Some(tx) = self.first_present_notify.take() {
+                    let _ = tx.send(());
+                }
             } else {
                 // An iteration that only ran messages spent almost nothing on
                 // the frame budget.
