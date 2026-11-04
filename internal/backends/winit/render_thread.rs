@@ -1718,10 +1718,20 @@ impl RenderCore {
         // that set it, not to this thread.
         #[cfg(render_thread_can_draw)]
         let mut frame_request: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // How long the previous iteration took, work included.  The animation
+        // pacing subtracts it from the next wait, so a frame that runs long
+        // delays the next one by the interval alone instead of interval plus
+        // the work -- the difference between a 17ms frame costing 27ms and
+        // costing 17ms.
+        #[cfg(render_thread_can_draw)]
+        let mut last_iteration_work = std::time::Duration::ZERO;
+        #[cfg(not(render_thread_can_draw))]
+        let mut last_iteration_work = std::time::Duration::ZERO;
 
         loop {
             // How long this thread may sleep.  A running animation is not a
-            // timer, so while one plays the wait is capped at a frame interval;
+            // timer, so while one plays the wait is capped at a frame interval
+            // less the time the previous frame's work already consumed;
             // otherwise the answer is when the tree's next timer is due.  This
             // is the shape the android-activity loop uses.
             #[cfg(render_thread_can_draw)]
@@ -1735,7 +1745,11 @@ impl RenderCore {
                 let frame = std::time::Duration::from_millis(RENDER_FRAME_INTERVAL_MS);
                 let next_timer = i_slint_core::platform::duration_until_next_timer_update();
                 if animating(&render_window_adapter) {
-                    Some(next_timer.map_or(frame, |timer| timer.min(frame)))
+                    // The previous iteration's work ate into this interval:
+                    // pace to the interval from the frame's start, not from
+                    // its end.
+                    let budget = frame.saturating_sub(last_iteration_work);
+                    Some(next_timer.map_or(budget, |timer| timer.min(budget)))
                 } else {
                     next_timer
                 }
@@ -2317,6 +2331,10 @@ impl RenderCore {
                 && (present || frame_requested || animating_now)
                 && let Some(state) = surface.obtain()
             {
+                // The frame's work is what the animation pacing subtracts from
+                // the next wait, so the gap between frames stays at the frame
+                // interval instead of interval plus the work.
+                let frame_started = std::time::Instant::now();
                 present_render_owned(
                     state,
                     &self.coords,
@@ -2326,6 +2344,11 @@ impl RenderCore {
                     &render_item_rcs,
                     &mut interaction,
                 );
+                last_iteration_work = frame_started.elapsed();
+            } else {
+                // An iteration that only ran messages spent almost nothing on
+                // the frame budget.
+                last_iteration_work = std::time::Duration::ZERO;
             }
         }
     }
@@ -2445,7 +2468,11 @@ fn present_render_owned(
     }
     if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
         let swap = swap_started.elapsed();
-        if swap > std::time::Duration::from_millis(50) {
+        let gate = std::env::var_os("SLINT_FRAME_LOG_MS")
+            .and_then(|v| v.into_string().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(50);
+        if swap > std::time::Duration::from_millis(gate) {
             std::eprintln!("[frame] slow present: swap={swap:?} encode={encoded:?}");
         }
     }
