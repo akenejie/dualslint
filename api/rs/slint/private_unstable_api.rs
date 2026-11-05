@@ -193,6 +193,7 @@ pub mod re_exports {
     pub use i_slint_core::api::LogicalPosition;
     pub use i_slint_core::callbacks::Callback;
     pub use i_slint_core::context::SlintContext;
+    pub use i_slint_core::context::ui_property_bindings_enabled;
     pub use i_slint_core::cursor::MouseCursorInner;
     pub use i_slint_core::data_transfer::DataTransfer;
     pub use i_slint_core::date_time::*;
