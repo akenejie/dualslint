@@ -1968,11 +1968,6 @@ impl RenderCore {
                             // frame, and the adapter that hosts it reports the ones
                             // that follow.
                             frame_request = Rc::new(Cell::new(true));
-                            // This thread builds mirror trees from here on:
-                            // their Ui-owned values live in the UI thread's
-                            // store, so the installs of bindings for values
-                            // nothing on this thread reads are skipped.
-                            i_slint_core::context::set_ui_property_bindings_enabled(false);
                             // The mirror's context shares the UI thread's font
                             // collection: the scan is the same system fonts
                             // either way, and doing it twice is the deterministic

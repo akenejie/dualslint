@@ -1056,57 +1056,6 @@ fn handle_property_init(
     let rust_property = access_member(prop, ctx).unwrap();
     let prop_type = ctx.property_ty(prop);
 
-    // The ownership pass classified every property: a Ui-owned property's
-    // value is held by the UI thread's store, and the drawing thread never
-    // reads the tree's own copy.  When this thread builds mirror trees, the
-    // install of such a binding is work for a value nothing here reads, so
-    // the generated install is gated on the thread's role flag.
-    let ui_owned = {
-        let class_name = match prop {
-            llr::MemberReference::Relative { local_reference, .. } => {
-                match &local_reference.reference {
-                    llr::LocalMemberIndex::Native { item_index, .. } => ctx
-                        .current_sub_component()
-                        .and_then(|sc| sc.items.get(*item_index))
-                        .map(|item| item.ty.class_name.clone()),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        let prop_name = match prop {
-            llr::MemberReference::Relative { local_reference, .. } => {
-                match &local_reference.reference {
-                    llr::LocalMemberIndex::Native { prop_name, .. } => Some(prop_name.clone()),
-                    llr::LocalMemberIndex::Property(idx) => ctx
-                        .current_sub_component()
-                        .and_then(|sc| sc.properties.get(idx.clone()))
-                        .map(|prop| prop.name.clone()),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        match (class_name.as_deref(), prop_name.as_deref()) {
-            (Some(builtin), Some(name)) => {
-                crate::passes::property_ownership::classify(Some(builtin), name)
-                    == crate::object_tree::PropertyOwnership::Ui
-            }
-            (None, Some(name)) => {
-                crate::passes::property_ownership::classify(None, name)
-                    == crate::object_tree::PropertyOwnership::Ui
-            }
-            _ => false,
-        }
-    };
-    let push_init = |init: &mut Vec<TokenStream>, stmt: TokenStream| {
-        if ui_owned {
-            init.push(quote!(if sp::ui_property_bindings_enabled() { #stmt }));
-        } else {
-            init.push(stmt);
-        }
-    };
-
     // Components use the type-erased helpers, so the binding machinery is
     // instantiated once per property type instead of per (property type,
     // component). Globals are behind a plain Rc without a type-erased weak
@@ -1139,13 +1088,10 @@ fn handle_property_init(
         let as_ = if matches!(callback.return_type, Type::Void) { quote!(;) } else { quote!(as _) };
         let set_callback_handler = helper("set_callback_handler");
         let handler = self_closure(quote!(, args), quote!({ (#tokens_for_expression) #as_ }));
-        push_init(
-            &mut *init,
-            quote!({
-                #[allow(unreachable_code, unused)]
-                #set_callback_handler(#rust_property, &self_rc, { #handler });
-            }),
-        );
+        init.push(quote!({
+            #[allow(unreachable_code, unused)]
+            #set_callback_handler(#rust_property, &self_rc, { #handler });
+        }));
     } else {
         let tokens_for_expression = compile_expression(&binding_expression.expression.read(), ctx);
 
@@ -1161,65 +1107,56 @@ fn handle_property_init(
         // The erased helpers take functions with an extra unused `&()` argument, so that
         // erasing them does not change their arity. The global (non-erased) helpers don't.
         let unit_arg = if erased { quote!(, _: &()) } else { quote!() };
-        push_init(
-            &mut *init,
-            match binding_expression.kind {
-                llr::BindingKind::Constant => {
-                    let t = rust_property_type(prop_type).unwrap_or(quote!(_));
-                    quote! { #rust_property.set({ (#tokens_for_expression) as #t }); }
-                }
-                llr::BindingKind::State => {
-                    let binding_tokens = self_closure(
-                        unit_arg.clone(),
-                        quote!((#tokens_for_expression) #maybe_cast),
-                    );
-                    let set_property_state_binding = helper("set_property_state_binding");
-                    quote! { {
-                        #set_property_state_binding(#rust_property, &self_rc, #binding_tokens);
-                    } }
-                }
-                llr::BindingKind::Normal => {
-                    let binding_tokens = self_closure(
-                        unit_arg.clone(),
-                        quote!((#tokens_for_expression) #maybe_cast),
-                    );
-                    match &binding_expression.animation {
-                        Some(llr::Animation::Static(anim)) => {
-                            let anim = compile_expression(anim, ctx);
-                            let set_animated_property_binding =
-                                helper("set_animated_property_binding");
-                            let details = self_closure(unit_arg.clone(), quote!((#anim, None)));
-                            quote! { {
-                                #set_animated_property_binding(
-                                    #rust_property, &self_rc, #binding_tokens, #details);
-                            } }
-                        }
-                        Some(llr::Animation::Transition(animation)) => {
-                            let animation = compile_expression(animation, ctx);
-                            let set_animated_property_binding =
-                                helper("set_animated_property_binding");
-                            let details = self_closure(
-                                unit_arg.clone(),
-                                quote!({
-                                    let (animation, change_time) = #animation;
-                                    (animation, Some(change_time))
-                                }),
-                            );
-                            quote! { {
-                                #set_animated_property_binding(
-                                    #rust_property, &self_rc, #binding_tokens, #details);
-                            } }
-                        }
-                        None => {
-                            let set_property_binding = helper("set_property_binding");
-                            quote! { {
-                                #set_property_binding(#rust_property, &self_rc, #binding_tokens);
-                            } }
-                        }
+        init.push(match binding_expression.kind {
+            llr::BindingKind::Constant => {
+                let t = rust_property_type(prop_type).unwrap_or(quote!(_));
+                quote! { #rust_property.set({ (#tokens_for_expression) as #t }); }
+            }
+            llr::BindingKind::State => {
+                let binding_tokens =
+                    self_closure(unit_arg.clone(), quote!((#tokens_for_expression) #maybe_cast));
+                let set_property_state_binding = helper("set_property_state_binding");
+                quote! { {
+                    #set_property_state_binding(#rust_property, &self_rc, #binding_tokens);
+                } }
+            }
+            llr::BindingKind::Normal => {
+                let binding_tokens =
+                    self_closure(unit_arg.clone(), quote!((#tokens_for_expression) #maybe_cast));
+                match &binding_expression.animation {
+                    Some(llr::Animation::Static(anim)) => {
+                        let anim = compile_expression(anim, ctx);
+                        let set_animated_property_binding = helper("set_animated_property_binding");
+                        let details = self_closure(unit_arg.clone(), quote!((#anim, None)));
+                        quote! { {
+                            #set_animated_property_binding(
+                                #rust_property, &self_rc, #binding_tokens, #details);
+                        } }
+                    }
+                    Some(llr::Animation::Transition(animation)) => {
+                        let animation = compile_expression(animation, ctx);
+                        let set_animated_property_binding = helper("set_animated_property_binding");
+                        let details = self_closure(
+                            unit_arg.clone(),
+                            quote!({
+                                let (animation, change_time) = #animation;
+                                (animation, Some(change_time))
+                            }),
+                        );
+                        quote! { {
+                            #set_animated_property_binding(
+                                #rust_property, &self_rc, #binding_tokens, #details);
+                        } }
+                    }
+                    None => {
+                        let set_property_binding = helper("set_property_binding");
+                        quote! { {
+                            #set_property_binding(#rust_property, &self_rc, #binding_tokens);
+                        } }
                     }
                 }
-            },
-        );
+            }
+        });
     }
 }
 

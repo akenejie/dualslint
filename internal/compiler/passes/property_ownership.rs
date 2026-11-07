@@ -16,7 +16,7 @@ use smol_str::SmolStr;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-pub(crate) fn classify(builtin_name: Option<&str>, prop: &str) -> PropertyOwnership {
+fn classify(builtin_name: Option<&str>, prop: &str) -> PropertyOwnership {
     match prop {
         // OS communication / input routing / IME - UI owns
         "has-focus" => PropertyOwnership::Ui,
@@ -39,29 +39,16 @@ pub(crate) fn classify(builtin_name: Option<&str>, prop: &str) -> PropertyOwners
             Some("TextInput") => PropertyOwnership::Shared,
             _ => PropertyOwnership::Render,
         },
-        "font-family"
-        | "font-size"
-        | "font-weight"
-        | "font-italic"
-        | "letter-spacing"
-        | "word-spacing"
-        | "horizontal-alignment"
-        | "vertical-alignment"
-        | "wrap"
-        | "overflow"
-        | "text-overflow"
-        | "single-line"
-        | "multiline"
-        | "stroke-width"
+        "font-family" | "font-size" | "font-weight" | "font-italic" | "letter-spacing"
+        | "word-spacing" | "horizontal-alignment" | "vertical-alignment" | "wrap"
+        | "overflow" | "text-overflow" | "single-line" | "multiline" | "stroke-width"
         | "stroke-color" => PropertyOwnership::Render,
         "color" | "background" | "foreground" | "highlight-color" => PropertyOwnership::Render,
         "opacity" | "visible" | "clip" | "cache-rendering-hint" => PropertyOwnership::Render,
         "x" | "y" | "width" | "height" | "min-width" | "min-height" | "max-width"
         | "max-height" | "preferred-width" | "preferred-height" => PropertyOwnership::Render,
         "border-width" | "border-color" | "border-radius" => PropertyOwnership::Render,
-        "drop-shadow-blur"
-        | "drop-shadow-color"
-        | "drop-shadow-offset-x"
+        "drop-shadow-blur" | "drop-shadow-color" | "drop-shadow-offset-x"
         | "drop-shadow-offset-y" => PropertyOwnership::Render,
         "drop-shadow" | "box-shadow" => PropertyOwnership::Render,
         "source" | "image-fit" | "image-rendering" => PropertyOwnership::Render,
@@ -78,17 +65,7 @@ fn is_focus_drawn(elem: &ElementRc) -> bool {
     if e.change_callbacks.contains_key("has-focus") {
         return true;
     }
-    for cb in [
-        "focus-gained",
-        "focus-lost",
-        "focus-changed-event",
-        "clicked",
-        "pointer-event",
-        "toggled",
-        "pressed",
-        "released",
-        "accepted",
-    ] {
+    for cb in ["focus-gained", "focus-lost", "focus-changed-event", "clicked", "pointer-event", "toggled", "pressed", "released", "accepted"] {
         if e.binding(cb).is_some() {
             return true;
         }
@@ -100,7 +77,10 @@ fn is_focus_drawn(elem: &ElementRc) -> bool {
         return false;
     }
     e.named_references.is_referenced("has-focus")
-        || e.property_analysis.borrow().get("has-focus").is_some_and(|a| a.is_used())
+        || e.property_analysis
+            .borrow()
+            .get("has-focus")
+            .is_some_and(|a| a.is_used())
         || b.name != "FocusScope"
 }
 
@@ -114,7 +94,10 @@ fn is_ime_ui(elem: &ElementRc) -> bool {
     }
     e.binding("input-method-hints").is_some()
         || e.named_references.is_referenced("input-method-hints")
-        || e.property_analysis.borrow().get("input-method-hints").is_some_and(|a| a.is_used())
+        || e.property_analysis
+            .borrow()
+            .get("input-method-hints")
+            .is_some_and(|a| a.is_used())
 }
 
 fn is_pointer_drawn(elem: &ElementRc) -> bool {
@@ -175,7 +158,8 @@ pub fn property_ownership(doc: &Document) {
                 map.insert(prop.clone(), classify(bname.as_deref(), prop));
             }
             for (prop, _) in e.bindings_including_synthetic() {
-                map.entry(prop.clone()).or_insert_with(|| classify(bname.as_deref(), &prop));
+                map.entry(prop.clone())
+                    .or_insert_with(|| classify(bname.as_deref(), &prop));
             }
             drop(e);
             elem.borrow_mut().property_ownership = std::cell::RefCell::new(map);

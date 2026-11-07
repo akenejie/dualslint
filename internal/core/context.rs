@@ -91,31 +91,6 @@ std::thread_local! {
     > = const { core::cell::RefCell::new(None) };
 }
 
-std::thread_local! {
-    /// Whether this thread's trees install bindings for Ui-owned properties.
-    /// True on UI threads (and any thread whose trees are the ones the user
-    /// reads), false on a render thread building mirrors: the mirror's
-    /// Ui-owned values live in the UI thread's store, so installing bindings
-    /// for values nothing on this thread reads is the deterministic kind of
-    /// work two threads must not each pay for.
-    static UI_PROPERTY_BINDINGS: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
-}
-
-/// Whether bindings for Ui-owned properties are installed on this thread's
-/// trees.  See [`set_ui_property_bindings_enabled`].
-#[doc(hidden)]
-pub fn ui_property_bindings_enabled() -> bool {
-    UI_PROPERTY_BINDINGS.with(|flag| flag.get())
-}
-
-/// Set whether bindings for Ui-owned properties are installed on this
-/// thread's trees.  A render thread building mirrors calls this with `false`
-/// before instantiating them.
-#[doc(hidden)]
-pub fn set_ui_property_bindings_enabled(enabled: bool) {
-    UI_PROPERTY_BINDINGS.with(|flag| flag.set(enabled));
-}
-
 /// Hand this thread a font collection another thread already built, so the
 /// context created here next shares it rather than scanning the system fonts
 /// a second time. The duplicate scan is the deterministic kind of work two
