@@ -9,9 +9,11 @@
 //! hold only what they must; properties not affecting drawing live on the
 //! UI side where OS communication happens.
 
+use crate::expression_tree::Expression;
 use crate::object_tree::{Document, ElementRc};
 use crate::object_tree::{PropertyOwnership, recurse_elem_including_sub_components_no_borrow};
 use smol_str::SmolStr;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 pub(crate) fn classify(builtin_name: Option<&str>, prop: &str) -> PropertyOwnership {
@@ -177,7 +179,13 @@ pub fn property_ownership(doc: &Document) {
             }
             drop(e);
             elem.borrow_mut().property_ownership = std::cell::RefCell::new(map);
+        });
+    });
 
+    promote_cross_ownership_reads(doc);
+
+    doc.visit_all_used_components(|component| {
+        recurse_elem_including_sub_components_no_borrow(component, &(), &mut |elem, _| {
             let focus_draws = is_focus_drawn(elem);
             let ime_ui = is_ime_ui(elem);
             let pointer_draws = is_pointer_drawn(elem);
@@ -194,4 +202,64 @@ pub fn property_ownership(doc: &Document) {
     });
     doc.focus_affects_rendering.set(Some(doc_focus_affects));
     doc.ime_affects_rendering.set(Some(doc_ime_affects));
+}
+
+/// A property the UI owns whose value a drawing-side binding reads must live
+/// on both threads: the mirror evaluates the binding, and the value it reads
+/// has to be the one the UI thread keeps current.  The compiler walks every
+/// binding and promotes the referenced Ui-owned properties to `Shared`, so
+/// the value crosses instead of the mirror reading a default that nothing
+/// updates.
+fn promote_cross_ownership_reads(doc: &Document) {
+    let mut elements: Vec<ElementRc> = Vec::new();
+    doc.visit_all_used_components(|component| {
+        recurse_elem_including_sub_components_no_borrow(component, &(), &mut |elem, _| {
+            elements.push(elem.clone());
+        });
+    });
+
+    let mut changed = true;
+    let mut rounds = 0;
+    while changed && rounds < 8 {
+        changed = false;
+        rounds += 1;
+        for elem in &elements {
+            let bindings: Vec<(SmolStr, Expression)> = {
+                let e = elem.borrow();
+                e.bindings_including_synthetic()
+                    .map(|(n, b)| (n.clone(), b.borrow().expression.clone()))
+                    .collect()
+            };
+            for (prop, binding) in &bindings {
+                let bound_ownership = elem
+                    .borrow()
+                    .property_ownership
+                    .borrow()
+                    .get(prop)
+                    .copied()
+                    .unwrap_or(PropertyOwnership::Render);
+                if bound_ownership == PropertyOwnership::Ui {
+                    continue;
+                }
+                let mut refs: Vec<(ElementRc, SmolStr)> = Vec::new();
+                binding.visit_recursive(&mut |sub: &Expression| {
+                    if let Expression::PropertyReference(nr) = sub {
+                        refs.push((nr.element(), nr.name().clone()));
+                    }
+                });
+                for (target, name) in refs {
+                    let owner_map = target.borrow().property_ownership.borrow().clone();
+                    if owner_map.get(&name).copied() == Some(PropertyOwnership::Ui) {
+                        drop(owner_map);
+                        target
+                            .borrow()
+                            .property_ownership
+                            .borrow_mut()
+                            .insert(name, PropertyOwnership::Shared);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
 }
