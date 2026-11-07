@@ -208,7 +208,8 @@ impl<'a> ControlEncoder<'a> {
             focus_on_tab: focus_on_tab(item),
             focus_draws: item.focus_draws(),
             ime_ui_owned: item.ime_ui_owned(),
-            pointer_draws: item.pointer_draws(),
+            hover_draws: item.hover_draws(),
+            press_draws: item.press_draws(),
         });
         self.item_refs.push((id, item.clone()));
     }
@@ -232,6 +233,7 @@ impl<'a> ControlEncoder<'a> {
             behavior,
             focus_on_click: focus_on_click(item),
             pointer_reacts: item.pointer_reacts(),
+            press_draws: item.press_draws(),
         });
     }
 

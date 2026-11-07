@@ -906,7 +906,8 @@ impl RenderHost {
                         focus_on_tab: c.focus_on_tab,
                         focus_draws: c.focus_draws,
                         ime_ui_owned: c.ime_ui_owned,
-                        pointer_draws: c.pointer_draws,
+                        hover_draws: c.hover_draws,
+                        press_draws: c.press_draws,
                     })
                 };
                 let adapter = tl.adapter.borrow().clone();
@@ -3775,7 +3776,8 @@ fn publish_control_coords(
                 focus_on_tab: c.focus_on_tab,
                 focus_draws: c.focus_draws,
                 ime_ui_owned: c.ime_ui_owned,
-                pointer_draws: c.pointer_draws,
+                hover_draws: c.hover_draws,
+                press_draws: c.press_draws,
             },
         );
     }

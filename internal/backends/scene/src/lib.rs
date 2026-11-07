@@ -214,7 +214,8 @@ pub struct ControlRegion {
     /// platform's input method is told and nothing draws has it read from the
     /// UI thread's own tree rather than being handed it from here.
     pub ime_ui_owned: bool,
-    pub pointer_draws: bool,
+    pub hover_draws: bool,
+    pub press_draws: bool,
 }
 
 /// What an item does with a pointer press.
@@ -250,6 +251,10 @@ pub struct PressTarget {
     /// publishes it.  A press on an item that changes nothing on screen needs
     /// not be sent on at all.
     pub pointer_reacts: bool,
+    /// Whether this item's pressed state shows on screen: the pressed-state
+    /// update is only sent for items whose visuals react to it.  The compiler
+    /// worked this out per element, like `pointer_reacts`.
+    pub press_draws: bool,
 }
 
 /// Logical-coordinate entry in the shared coordinate table.  Published by the
@@ -281,7 +286,8 @@ pub struct ControlCoord {
     /// Whether this control has an input-method value the UI thread owns, so the
     /// UI thread reads it from its own tree rather than from the drawing side.
     pub ime_ui_owned: bool,
-    pub pointer_draws: bool,
+    pub hover_draws: bool,
+    pub press_draws: bool,
 }
 
 impl ControlCoord {

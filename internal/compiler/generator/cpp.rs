@@ -1772,7 +1772,8 @@ fn generate_item_tree(
                     node.focus_draws,
                     node.ime_ui_owned,
                     node.pointer_reacts,
-                    node.pointer_draws,
+                    node.hover_draws,
+                    node.press_draws,
                     item_tree_array.len() as u32
                 ));
                 item_array.push(format!(
@@ -3849,14 +3850,20 @@ fn screen_tree_call_code(
         // `-Wmissing-field-initializers` build counts a partial one an error.
         code.push(format!(
             "SlintScreenTreeCallData call_data{{ {} }};",
-            arg_sources.iter().map(String::as_str).chain(std::iter::once("{}")).collect::<Vec<_>>().join(", ")
+            arg_sources
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once("{}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         code.push("slint::cbindgen_private::slint_windowrc_run_on_screen_tree(".to_string());
         code.push("    &self->m_globals.window().window_handle().handle(),".to_string());
         code.push("    &local_tree->into_dyn(),".to_string());
         code.push("    &call_data,".to_string());
         code.push(
-            "    [](void *user_data, const slint::cbindgen_private::ItemTreeRc *tree) {".to_string(),
+            "    [](void *user_data, const slint::cbindgen_private::ItemTreeRc *tree) {"
+                .to_string(),
         );
         code.push(
             "        auto *data = static_cast<SlintScreenTreeCallData *>(user_data);".to_string(),

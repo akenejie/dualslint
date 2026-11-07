@@ -37,16 +37,29 @@ fn classify(builtin_name: Option<&str>, prop: &str) -> PropertyOwnership {
             Some("TextInput") => PropertyOwnership::Shared,
             _ => PropertyOwnership::Render,
         },
-        "font-family" | "font-size" | "font-weight" | "font-italic" | "letter-spacing"
-        | "word-spacing" | "horizontal-alignment" | "vertical-alignment" | "wrap"
-        | "overflow" | "text-overflow" | "single-line" | "multiline" | "stroke-width"
+        "font-family"
+        | "font-size"
+        | "font-weight"
+        | "font-italic"
+        | "letter-spacing"
+        | "word-spacing"
+        | "horizontal-alignment"
+        | "vertical-alignment"
+        | "wrap"
+        | "overflow"
+        | "text-overflow"
+        | "single-line"
+        | "multiline"
+        | "stroke-width"
         | "stroke-color" => PropertyOwnership::Render,
         "color" | "background" | "foreground" | "highlight-color" => PropertyOwnership::Render,
         "opacity" | "visible" | "clip" | "cache-rendering-hint" => PropertyOwnership::Render,
         "x" | "y" | "width" | "height" | "min-width" | "min-height" | "max-width"
         | "max-height" | "preferred-width" | "preferred-height" => PropertyOwnership::Render,
         "border-width" | "border-color" | "border-radius" => PropertyOwnership::Render,
-        "drop-shadow-blur" | "drop-shadow-color" | "drop-shadow-offset-x"
+        "drop-shadow-blur"
+        | "drop-shadow-color"
+        | "drop-shadow-offset-x"
         | "drop-shadow-offset-y" => PropertyOwnership::Render,
         "drop-shadow" | "box-shadow" => PropertyOwnership::Render,
         "source" | "image-fit" | "image-rendering" => PropertyOwnership::Render,
@@ -63,7 +76,17 @@ fn is_focus_drawn(elem: &ElementRc) -> bool {
     if e.change_callbacks.contains_key("has-focus") {
         return true;
     }
-    for cb in ["focus-gained", "focus-lost", "focus-changed-event", "clicked", "pointer-event", "toggled", "pressed", "released", "accepted"] {
+    for cb in [
+        "focus-gained",
+        "focus-lost",
+        "focus-changed-event",
+        "clicked",
+        "pointer-event",
+        "toggled",
+        "pressed",
+        "released",
+        "accepted",
+    ] {
         if e.binding(cb).is_some() {
             return true;
         }
@@ -75,10 +98,7 @@ fn is_focus_drawn(elem: &ElementRc) -> bool {
         return false;
     }
     e.named_references.is_referenced("has-focus")
-        || e.property_analysis
-            .borrow()
-            .get("has-focus")
-            .is_some_and(|a| a.is_used())
+        || e.property_analysis.borrow().get("has-focus").is_some_and(|a| a.is_used())
         || b.name != "FocusScope"
 }
 
@@ -92,13 +112,10 @@ fn is_ime_ui(elem: &ElementRc) -> bool {
     }
     e.binding("input-method-hints").is_some()
         || e.named_references.is_referenced("input-method-hints")
-        || e.property_analysis
-            .borrow()
-            .get("input-method-hints")
-            .is_some_and(|a| a.is_used())
+        || e.property_analysis.borrow().get("input-method-hints").is_some_and(|a| a.is_used())
 }
 
-fn is_pointer_drawn(elem: &ElementRc) -> bool {
+fn is_hover_drawn(elem: &ElementRc) -> bool {
     let e = elem.borrow();
     let Some(b) = e.builtin_type() else {
         return false;
@@ -106,16 +123,24 @@ fn is_pointer_drawn(elem: &ElementRc) -> bool {
     if b.name != "TouchArea" && b.name != "FocusScope" && b.name != "TextInput" {
         return false;
     }
-    if e.named_references.is_referenced("has-hover") || e.named_references.is_referenced("pressed")
-    {
+    if e.named_references.is_referenced("has-hover") {
         return true;
     }
-    for (p, a) in e.property_analysis.borrow().iter() {
-        if (p == "has-hover" || p == "pressed") && a.is_used() {
-            return true;
-        }
+    e.property_analysis.borrow().get("has-hover").is_some_and(|a| a.is_used())
+}
+
+fn is_press_drawn(elem: &ElementRc) -> bool {
+    let e = elem.borrow();
+    let Some(b) = e.builtin_type() else {
+        return false;
+    };
+    if b.name != "TouchArea" && b.name != "FocusScope" && b.name != "TextInput" {
+        return false;
     }
-    false
+    if e.named_references.is_referenced("pressed") {
+        return true;
+    }
+    e.property_analysis.borrow().get("pressed").is_some_and(|a| a.is_used())
 }
 
 fn is_pointer_handled(elem: &ElementRc) -> bool {
@@ -141,7 +166,7 @@ fn is_pointer_handled(elem: &ElementRc) -> bool {
     if b.name == "TextInput" {
         return true;
     }
-    is_pointer_drawn(elem)
+    is_hover_drawn(elem) || is_press_drawn(elem)
 }
 
 pub fn property_ownership(doc: &Document) {
@@ -156,20 +181,21 @@ pub fn property_ownership(doc: &Document) {
                 map.insert(prop.clone(), classify(bname.as_deref(), prop));
             }
             for (prop, _) in e.bindings_including_synthetic() {
-                map.entry(prop.clone())
-                    .or_insert_with(|| classify(bname.as_deref(), &prop));
+                map.entry(prop.clone()).or_insert_with(|| classify(bname.as_deref(), &prop));
             }
             drop(e);
             elem.borrow_mut().property_ownership = std::cell::RefCell::new(map);
 
             let focus_draws = is_focus_drawn(elem);
             let ime_ui = is_ime_ui(elem);
-            let pointer_draws = is_pointer_drawn(elem);
+            let hover_draws = is_hover_drawn(elem);
+            let press_draws = is_press_drawn(elem);
             let pointer_handled = is_pointer_handled(elem);
             let mut emut = elem.borrow_mut();
             emut.focus_draws = focus_draws;
             emut.ime_ui_owned = ime_ui;
-            emut.pointer_draws = pointer_draws;
+            emut.hover_draws = hover_draws;
+            emut.press_draws = press_draws;
             emut.pointer_reacts = pointer_handled;
             drop(emut);
             doc_focus_affects |= focus_draws;

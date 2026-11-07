@@ -54,7 +54,9 @@ fn create_repeater_components(component: &Rc<Component>) {
                 focus_draws: original_elem.focus_draws,
                 ime_ui_owned: original_elem.ime_ui_owned,
                 pointer_reacts: original_elem.pointer_reacts,
-                pointer_draws: original_elem.pointer_draws,
+                hover_draws: original_elem.hover_draws,
+
+                press_draws: original_elem.press_draws,
                 property_ownership: original_elem.property_ownership.clone(),
                 enclosing_component: Default::default(),
                 states: std::mem::take(&mut original_elem.states),

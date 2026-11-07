@@ -1676,7 +1676,7 @@ impl WinitWindowAdapter {
             return;
         }
         if let Some(previous) = self.render_hovered.replace(target) {
-            if host.control_coord(previous).is_some_and(|c| c.pointer_draws) {
+            if host.control_coord(previous).is_some_and(|c| c.hover_draws) {
                 host.apply_control_state(
                     previous,
                     false,
@@ -1685,19 +1685,23 @@ impl WinitWindowAdapter {
             }
         }
         if let Some(target) = target {
-            if host.control_coord(target).is_some_and(|c| c.pointer_draws) {
+            if host.control_coord(target).is_some_and(|c| c.hover_draws) {
                 host.apply_control_state(target, true, self.render_pressed.get() == Some(target));
             }
         }
     }
 
-    /// Move the press, which is a property too.
+    /// Move the press, which is a property too.  The pressed-state update is
+    /// gated on the compiler's per-element decision that the pressed state
+    /// shows on screen; hover and press are decided separately, so a control
+    /// whose colors react to a press but not to a hover receives only the
+    /// press updates.
     fn set_render_pressed(&self, host: &crate::render_thread::RenderHost, target: Option<u64>) {
         if self.render_pressed.get() == target {
             return;
         }
         if let Some(previous) = self.render_pressed.replace(target) {
-            if host.control_coord(previous).is_some_and(|c| c.pointer_draws) {
+            if host.control_coord(previous).is_some_and(|c| c.press_draws) {
                 host.apply_control_state(
                     previous,
                     self.render_hovered.get() == Some(previous),
@@ -1706,7 +1710,7 @@ impl WinitWindowAdapter {
             }
         }
         if let Some(target) = target {
-            if host.control_coord(target).is_some_and(|c| c.pointer_draws) {
+            if host.control_coord(target).is_some_and(|c| c.press_draws) {
                 host.apply_control_state(target, self.render_hovered.get() == Some(target), true);
             }
         }

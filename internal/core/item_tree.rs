@@ -727,13 +727,28 @@ impl ItemRc {
         }
     }
 
-    pub fn pointer_draws(&self) -> bool {
+    pub fn hover_draws(&self) -> bool {
         let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
         let item_tree = crate::item_tree::ItemTreeNodeArray::new(&comp_ref_pin);
 
         if let Some(n) = &item_tree.get(self.index) {
             match n {
-                ItemTreeNode::Item { pointer_draws, .. } => *pointer_draws,
+                ItemTreeNode::Item { hover_draws, .. } => *hover_draws,
+                ItemTreeNode::DynamicTree { .. } => false,
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Whether the pressed state of this item shows on screen.
+    pub fn press_draws(&self) -> bool {
+        let comp_ref_pin = vtable::VRc::borrow_pin(&self.item_tree);
+        let item_tree = crate::item_tree::ItemTreeNodeArray::new(&comp_ref_pin);
+
+        if let Some(n) = &item_tree.get(self.index) {
+            match n {
+                ItemTreeNode::Item { press_draws, .. } => *press_draws,
                 ItemTreeNode::DynamicTree { .. } => false,
             }
         } else {
@@ -1405,7 +1420,8 @@ pub enum ItemTreeNode {
         pointer_reacts: bool,
 
         /// True when pointer state (hover/press) affects what is drawn.
-        pointer_draws: bool,
+        hover_draws: bool,
+        press_draws: bool,
 
         /// number of children
         children_count: u32,

@@ -524,7 +524,9 @@ pub struct TreeNode {
     /// the drawing thread at all.
     pub pointer_reacts: bool,
     /// Whether this node's pointer state shows on screen.
-    pub pointer_draws: bool,
+    pub hover_draws: bool,
+    /// Whether the pressed state of this node's item shows on screen.
+    pub press_draws: bool,
     /// If set, this node's children have dynamic z-ordering.
     /// Each entry corresponds to a child (by index) and gives its z value.
     /// The code generator will evaluate these on every children visit and sort the
