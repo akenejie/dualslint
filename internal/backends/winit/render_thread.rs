@@ -2502,6 +2502,10 @@ impl RenderCore {
             // Only a window this thread has a tree for is drawn here.  Without
             // one the render thread stays out of the way, and its context must
             // never be taken from a window the UI thread draws itself.
+            // The window id is read before the presentation borrows the
+            // surface: the notifications below name the window while `state`
+            // still holds the borrow.
+            let window_id = surface.owner;
             if render_component.borrow().is_some()
                 && (present || frame_requested || animating_now)
                 && let Some(state) = surface.obtain()
@@ -2533,7 +2537,7 @@ impl RenderCore {
                         std::eprintln!("[input] render focus published {focused:?}, notifying ui");
                     }
                     if let (Some(proxy), Some(window_id)) =
-                        (self.event_loop_proxy.as_ref(), surface.owner)
+                        (self.event_loop_proxy.as_ref(), window_id)
                     {
                         let _ = proxy.send_event(crate::SlintEvent(
                             crate::event_loop::CustomEvent::RenderFocusChanged {
@@ -2544,7 +2548,13 @@ impl RenderCore {
                     }
                 }
                 // The first frame for this attachment is up: the UI thread,
-                // which is waiting on it, may map the window now.
+                // which is waiting on it, may map the window now.  The map is
+                // what reveals this frame, so the frame is waited into the
+                // server before the map is told to happen: queued is not yet
+                // processed, and a map that outruns the present exposes
+                // nothing.
+                #[cfg(feature = "renderer-femtovg")]
+                state.sync_presents_to_server();
                 if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
                     std::eprintln!("[win] first present done");
                 }
@@ -3904,6 +3914,29 @@ pub(crate) fn set_hwnd(hwnd: isize) {
 struct GlObjects {
     context: glutin::context::PossiblyCurrentContext,
     surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
+    /// The X display the presents of this surface travel on, kept raw: a
+    /// frame that is only queued is not a frame the server has processed,
+    /// and the map that exposes it needs to know the difference.
+    x_display: Option<*mut core::ffi::c_void>,
+}
+
+/// Wait until the X server has processed everything this connection sent.
+///
+/// # Safety
+/// `display` must be a valid `Display*` the caller's connection keeps alive,
+/// which the GL display this was taken from guarantees.
+unsafe fn xlib_sync(display: *mut core::ffi::c_void) {
+    // libX11 is already loaded for this build's window system; the symbol is
+    // declared here rather than pulled in through another binding crate.
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XSync(display: *mut core::ffi::c_void, discard: i32) -> i32;
+    }
+    if !display.is_null() {
+        // SAFETY: the display is a live `Display*` of the connection the
+        // presents went out on, which the GL display this came from keeps.
+        unsafe { XSync(display, 0) };
+    }
 }
 
 /// A `'static` handle on [`GlObjects`] for `set_opengl_context`, which takes
@@ -4006,6 +4039,14 @@ enum DrawTarget {
 
 #[cfg(render_thread_can_draw)]
 impl DrawTarget {
+    /// Wait until the server has processed the presents of this target.
+    #[cfg(feature = "renderer-femtovg")]
+    fn sync_presents_to_server(&mut self) {
+        if let Self::Gl(state) = self {
+            state.sync_presents_to_server();
+        }
+    }
+
     /// Take a window's presentation over.
     fn new(window: Arc<winit::window::Window>, width: u32, height: u32) -> Result<Self, String> {
         // A build with both renderers prefers the GPU: the software path exists
@@ -4168,6 +4209,18 @@ struct GlRenderState {
 
 #[cfg(feature = "renderer-femtovg")]
 impl GlRenderState {
+    /// Wait until the server has processed the presents this connection sent.
+    ///
+    /// A swap that returned has only queued its frame.  The map that exposes
+    /// the first frame is issued from another thread, and the frame the map is
+    /// to reveal has to be in the server by the time the map arrives -- this
+    /// is what turns queued into processed.
+    fn sync_presents_to_server(&self) {
+        if let Some(display) = self.gl.x_display {
+            unsafe { xlib_sync(display) };
+        }
+    }
+
     fn new(window: Arc<winit::window::Window>, width: u32, height: u32) -> Result<Self, String> {
         use glutin::context::{ContextApi, ContextAttributesBuilder};
         use glutin::prelude::*;
@@ -4195,6 +4248,21 @@ impl GlRenderState {
             glutin::display::Display::new(raw_display.as_raw(), display_preference)
                 .map_err(|e| format!("glutin Display::new failed: {e}"))?
         };
+
+        // The X display the swap buffers will present through, for the one
+        // place a queued frame has to be turned into a processed one: the map
+        // that exposes the first frame must not outrun it.
+        // The same handle the GL display was built from: the connection the
+        // swap buffers present through.
+        #[cfg(feature = "x11")]
+        let x_display: Option<*mut core::ffi::c_void> = match raw_display.as_raw() {
+            raw_window_handle::RawDisplayHandle::Xlib(handle) => {
+                Some(handle.display.map(|d| d.as_ptr()).unwrap_or(std::ptr::null_mut()))
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "x11"))]
+        let x_display: Option<*mut core::ffi::c_void> = None;
 
         // The window was created for the config that the UI thread's renderer
         // picked, and glutin gave that window that config's visual.  A window
@@ -4282,7 +4350,7 @@ impl GlRenderState {
         surface.set_swap_interval(&context, glutin::surface::SwapInterval::DontWait).ok();
 
         Ok(Self {
-            gl: Rc::new(GlObjects { context, surface }),
+            gl: Rc::new(GlObjects { context, surface, x_display }),
             width,
             height,
             #[cfg(feature = "renderer-femtovg")]
