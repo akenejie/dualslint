@@ -71,7 +71,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use i_slint_core::api::PhysicalSize;
 use i_slint_core::api::Window as SlintApiWindow;
 use i_slint_core::graphics::Color;
-use i_slint_core::input::{BackendMouseEvent, FocusReason, InternalKeyEvent, PointerEventButton};
+use i_slint_core::input::{BackendMouseEvent, FocusReason, PointerEventButton};
 use i_slint_core::item_tree::{ItemRc, ItemTreeRc};
 use i_slint_core::lengths::LogicalPoint;
 #[cfg(render_thread_can_draw)]
@@ -454,23 +454,27 @@ pub enum RenderMessage {
         /// Reply channel: `true` when the control took the activation.
         response: std::sync::mpsc::SyncSender<bool>,
     },
-    /// A key was pressed, and the control that has the focus lives on this
-    /// thread.
+    /// The editing session for a text control opened on the UI thread, which
+    /// read back the state the drawing tree held.
+    GetTextState {
+        /// The control the session is for.
+        id: u64,
+        /// Reply channel: the text-editing state, or `None` when the control
+        /// has none to give -- it is not a text control at all.
+        response: std::sync::mpsc::Sender<Option<i_slint_core::items::TextEditingState>>,
+    },
+    /// The editing session changed the text-editing state, and the drawing
+    /// copy is told what to show.
     ///
-    /// The UI thread's job ends at turning the OS key into a Slint one; the
-    /// meaning of that key belongs to the item that has the focus, so the event
-    /// is handed to the tree rather than interpreted against a property. The
-    /// reply says whether the tree used it.
-    KeyToRenderControl {
-        /// The key, already in the runtime's own representation.
-        event: InternalKeyEvent,
-        /// The control the UI thread routed the key to, as published in the
-        /// shared coordinate table, or `None` to let the tree route it from its
-        /// focused item.  The UI thread owns which control receives keys, so it
-        /// names one here; the tree only finds the item behind the id.
-        target: Option<u64>,
-        /// Reply channel: `true` when an item consumed the key.
-        response: std::sync::mpsc::SyncSender<bool>,
+    /// No key, no callback: the UI thread applied the key to its own tree,
+    /// decided what the change means, and hands the resulting state over as
+    /// such.  The drawing tree installs it without running the editing logic,
+    /// and a frame follows if anything moved.
+    SetTextState {
+        /// The control the state belongs to.
+        id: u64,
+        /// The state the session now holds.
+        state: i_slint_core::items::TextEditingState,
     },
     /// The UI thread resolved a press: the hold has begun.
     ///
@@ -933,27 +937,25 @@ impl RenderHost {
     /// decides what it means. A field, a `Flickable`, a widget with a
     /// `key-pressed` handler and a `TextInput` are then all answered by the
     /// same code that answers them when the pointer does reach the tree.
-    pub fn send_key_to_control(&self, event: &InternalKeyEvent, target: Option<u64>) -> bool {
-        // In-thread callers hand the key to the tree here; there is no channel
-        // round-trip to wait on.
-        if self.is_own_render_thread()
-            && let Some(result) = with_tl_access(|tl| {
-                tl.adapter
-                    .borrow()
-                    .clone()
-                    .map(|adapter| send_key_to_tree(&adapter, event, target))
-                    .unwrap_or(false)
-            })
-        {
-            return result;
-        }
-        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
-        let _ = self.sender.send(RenderMessage::KeyToRenderControl {
-            event: event.clone(),
-            target,
-            response: tx,
-        });
-        rx.recv().unwrap_or(false)
+    /// Read back a control's text-editing state, and wait for it.
+    ///
+    /// An editing session opens with this: the string the drawing tree holds
+    /// is the one its bindings produced, and the session is about to edit it.
+    /// `None` answers for a control that has no text-editing state at all,
+    /// which is how the caller tells a text control from every other kind.
+    pub fn get_text_state(&self, id: u64) -> Option<i_slint_core::items::TextEditingState> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = self.sender.send(RenderMessage::GetTextState { id, response: tx });
+        rx.recv().unwrap_or(None)
+    }
+
+    /// Hand the drawing copy the text-editing state the session now holds.
+    ///
+    /// Fire-and-forget: the state is the message, and a frame is the drawing
+    /// tree's own answer to receiving it.  A state the copy already holds
+    /// draws no frame, so a key the control ignored costs nothing.
+    pub fn set_text_state(&self, id: u64, state: i_slint_core::items::TextEditingState) {
+        let _ = self.sender.send(RenderMessage::SetTextState { id, state });
     }
 
     /// Tell the tree that this control has the press.
@@ -1478,6 +1480,10 @@ pub(crate) struct RenderCore {
     /// The UI thread's font collection, received before the attach: the
     /// mirror's context shares it instead of scanning the system fonts again.
     font_collection: Option<SharedFontData>,
+    /// The UI event loop's proxy, so this thread can wake it when something
+    /// only the UI thread may act on happened -- a focus the tree moved on
+    /// its own, whose input method this thread cannot touch.
+    event_loop_proxy: Option<winit::event_loop::EventLoopProxy<crate::SlintEvent>>,
 }
 
 /// A parked call, together with the reply half the blocking caller waits on.
@@ -1693,6 +1699,7 @@ impl RenderCore {
         rx: mpsc::Receiver<RenderMessage>,
         coords: Arc<Mutex<PublishedControls>>,
         channel_id: usize,
+        event_loop_proxy: Option<winit::event_loop::EventLoopProxy<crate::SlintEvent>>,
     ) -> Self {
         Self {
             rx,
@@ -1701,6 +1708,7 @@ impl RenderCore {
             pending_on_screen_tree: Vec::new(),
             first_present_notify: None,
             font_collection: None,
+            event_loop_proxy,
         }
     }
 
@@ -1742,6 +1750,9 @@ impl RenderCore {
         let render_item_rcs: Rc<RefCell<HashMap<u64, ItemRc>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let mut interaction = ControlInteraction::default();
+        // The last focus this thread reported to the UI thread, so a change the
+        // tree made on its own is noticed at the next publish.
+        let last_reported_focus = std::cell::Cell::new(Option::<u64>::None);
         // Keeps the mirror component tree alive for the lifetime of the
         // render thread (the strong handle owns the ItemTree).  Moved in
         // only from `AttachComponent`; never leaves this thread.  Shared with
@@ -1861,6 +1872,9 @@ impl RenderCore {
                     #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))]
                     RenderMessage::Configure { window, width, height, scale_factor } => {
                         let window_id = window.id();
+                        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                            std::eprintln!("[win] configure id={window_id:?} w={width} h={height}");
+                        }
                         surface.configure(window, width, height, scale_factor as f32);
                         // A window this thread does not draw into is the UI
                         // thread's to draw, and the tree here is not told about
@@ -1926,6 +1940,9 @@ impl RenderCore {
                             );
                         }
                         surface.note_resize(window_id, width, height);
+                        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                            std::eprintln!("[win] resize id={window_id:?} w={width} h={height}");
+                        }
                         present = true;
                     }
                     #[allow(unused_assignments)]
@@ -1956,7 +1973,6 @@ impl RenderCore {
                     #[cfg_attr(not(render_thread_can_draw), allow(unused_variables))]
                     RenderMessage::AttachComponent { factory, property_access } => {
                         #[cfg(render_thread_can_draw)]
-                        let attach_started = std::time::Instant::now();
                         if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
                             std::eprintln!("[render-thread] attach message received");
                         }
@@ -2262,15 +2278,35 @@ impl RenderCore {
                         // handler may have changed anything at all.
                         present |= activated;
                     }
-                    RenderMessage::KeyToRenderControl { event, target, response } => {
-                        let used = render_window_adapter
-                            .as_ref()
-                            .is_some_and(|adapter| send_key_to_tree(adapter, &event, target));
-                        let _ = response.send(used);
-                        // A key that a `TextInput` took changed its text, and the
-                        // `accepted` handler that goes with it may have changed the
-                        // rest of the application.
-                        present |= used;
+                    RenderMessage::GetTextState { id, response } => {
+                        let state =
+                            render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                                let text_input =
+                                    item_rc.downcast::<i_slint_core::items::TextInput>()?;
+                                Some(text_input.as_pin_ref().text_editing_state())
+                            });
+                        let _ = response.send(state);
+                    }
+                    RenderMessage::SetTextState { id, state } => {
+                        let changed =
+                            render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                                let text_input =
+                                    item_rc.downcast::<i_slint_core::items::TextInput>()?;
+                                let item = text_input.as_pin_ref();
+                                if item.text_editing_state() == state {
+                                    // The state the copy holds is already this one: a
+                                    // key the control ignored.  Nothing moved, so no
+                                    // frame is owed.
+                                    return Some(false);
+                                }
+                                item.set_text_editing_state(state);
+                                Some(true)
+                            });
+                        // The text on screen is what changed, and the `edited`
+                        // and `accepted` callbacks fired where the editing
+                        // happened -- on the UI thread -- so a frame is all
+                        // that is left to do here.
+                        present |= changed.unwrap_or(false);
                     }
                     RenderMessage::RunOnScreenTree { task, done } => {
                         // The call runs here because the tree it belongs to is
@@ -2439,8 +2475,31 @@ impl RenderCore {
                     &mut interaction,
                 );
                 last_iteration_work = frame_started.elapsed();
+                // The tree can move the focus on its own -- a routed
+                // callback's `.focus()` call does -- and the input method
+                // follows the focus on the UI thread, which reads it from the
+                // table published here. A change is worth waking that thread
+                // for, so the keyboard arrives with the click instead of with
+                // the first key typed after it.
+                let focused = self.coords.lock().unwrap().focused();
+                if focused != last_reported_focus.get() {
+                    last_reported_focus.set(focused);
+                    if let (Some(proxy), Some(window_id)) =
+                        (self.event_loop_proxy.as_ref(), surface.owner)
+                    {
+                        let _ = proxy.send_event(crate::SlintEvent(
+                            crate::event_loop::CustomEvent::RenderFocusChanged {
+                                window_id,
+                                focus: focused,
+                            },
+                        ));
+                    }
+                }
                 // The first frame for this attachment is up: the UI thread,
                 // which is waiting on it, may map the window now.
+                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                    std::eprintln!("[win] first present done");
+                }
                 if let Some(tx) = self.first_present_notify.take() {
                     let _ = tx.send(());
                 }
@@ -2490,8 +2549,9 @@ fn publish_mirror_controls(
     *render_item_rcs.borrow_mut() = table.item_refs.into_iter().collect();
     interaction.retain(&table.controls);
     if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+        let size = adapter.size();
         std::eprintln!(
-            "[encode] timers+walk={encoded:?} maps={:?} slots={}",
+            "[encode] size={size:?} timers+walk={encoded:?} maps={:?} slots={}",
             maps_started.elapsed(),
             table.controls.len()
         );
@@ -3199,28 +3259,6 @@ fn send_pointer_move_to_tree(
 /// same code that answers it when the window has the pointer, so a `TextInput`
 /// keeps its cursor, its selection and its IME, and the application's
 /// `accepted(text) =>` runs with the value the user actually typed.
-fn send_key_to_tree(
-    adapter: &Rc<dyn WindowAdapter>,
-    event: &InternalKeyEvent,
-    target: Option<u64>,
-) -> bool {
-    let window = WindowInner::from_pub(adapter.window());
-    // The UI thread routed the key to a control, so the tree is told to deliver
-    // there instead of routing from its own focus.  The id names an item of this
-    // tree, so this is where it turns back into one; routing it in the tree's
-    // own `process_key_input` keeps capture, delivery and the menubar shortcuts
-    // on the same path as a key with no target.
-    window.set_key_target(target);
-    let result = matches!(
-        adapter.window().dispatch_event_with_result(WindowEvent::internal(
-            i_slint_core::platform::InternalEvent::Key(event.clone()),
-        )),
-        Ok(i_slint_core::platform::WindowEventDispatchResult::Accepted)
-    );
-    window.set_key_target(None);
-    result
-}
-
 /// Identifies the channel, so diagnostics can tell which render thread a post
 /// was meant for.
 static NEXT_CHANNEL_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -3234,12 +3272,12 @@ pub(crate) fn channel(
     let host = RenderHost {
         sender: tx,
         channel_id: NEXT_CHANNEL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        event_loop_proxy: Some(event_loop_proxy),
+        event_loop_proxy: Some(event_loop_proxy.clone()),
         attached: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         surface: Arc::new(Mutex::new(None)),
         coords: coords.clone(),
     };
-    let core = RenderCore::new(rx, coords, host.channel_id);
+    let core = RenderCore::new(rx, coords, host.channel_id, Some(event_loop_proxy));
     (host, core)
 }
 
@@ -3965,7 +4003,7 @@ impl DrawTarget {
                 let started = std::time::Instant::now();
                 state.ensure_upstream(window_adapter)?;
                 let ensured = started.elapsed();
-                let rendered = state.render_upstream()?;
+                state.render_upstream()?;
                 if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
                     let total = started.elapsed();
                     std::eprintln!(

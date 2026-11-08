@@ -41,6 +41,9 @@ mod ios;
 /// See `render_thread::RenderHost` for what it takes over and what it leaves
 /// behind.
 pub mod property_store;
+
+/// The render thread's loop: the mirror it hosts, the presents it drives, and
+/// the messages the UI thread sends it.
 pub mod render_thread;
 
 /// Re-export of the winit crate.

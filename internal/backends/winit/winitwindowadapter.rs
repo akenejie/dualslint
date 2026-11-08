@@ -482,6 +482,14 @@ pub struct WinitWindowAdapter {
     /// business, so the UI thread keeps this to know whether it owes the
     /// platform a change when the focus moves.
     render_ime_focused: Cell<Option<u64>>,
+    /// The text-editing state last pushed to the drawing tree, so a key that
+    /// changed nothing pushes nothing.
+    ///
+    /// The editing session on this thread is what moves the state; the
+    /// drawing copy is told the result. Comparing before sending keeps a key
+    /// the control ignored from waking the drawing thread for a frame that
+    /// would draw the same thing.
+    pushed_text_state: RefCell<Option<i_slint_core::items::TextEditingState>>,
     /// The button that is down, for as long as a press is held.
     ///
     /// Kept for the one release that arrives without a button of its own: the
@@ -556,6 +564,7 @@ impl WinitWindowAdapter {
             render_pressed: Default::default(),
             render_focused: Default::default(),
             render_ime_focused: Default::default(),
+            pushed_text_state: Default::default(),
             render_pressed_button: Default::default(),
             current_resize_direction: Default::default(),
             #[cfg(target_os = "ios")]
@@ -1577,7 +1586,13 @@ impl WinitWindowAdapter {
             },
             _ => return false,
         };
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[input] pointer event at {position:?}");
+        }
         let target = host.control_at(position.x, position.y);
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[input] control_at -> {target:?}");
+        }
         match action {
             // A press brings the hover with it, because the control that is held
             // is also the one the pointer is on.
@@ -1600,6 +1615,9 @@ impl WinitWindowAdapter {
                     // another finger's, and its release still has to arrive.
                     return true;
                 }
+                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                    std::eprintln!("[input] press target {:?}", press_target.id);
+                }
                 self.set_render_pressed(host, Some(press_target.id));
                 self.render_pressed_button.set(Some(button));
                 // The press is the grab and the focus, and nothing else: whether
@@ -1612,9 +1630,23 @@ impl WinitWindowAdapter {
                 // a `FocusScope` from accepting the press differently just
                 // because it now has the focus.
                 host.press_control(button, position, self.render_focused.get());
+                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                    std::eprintln!("[input] press sent");
+                }
                 if press_target.focus_on_click {
+                    // The focus opens the editing session: this tree's focus
+                    // follows, the drawing tree's state is read back once, and
+                    // the input method follows the control.
                     self.decide_focus(host, press_target.id);
-                    self.sync_render_ime(host);
+                    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                        std::eprintln!("[input] focus decided");
+                    }
+                } else if self.render_focused.get() == Some(press_target.id) {
+                    // A press on the control the session is already open for:
+                    // the drawing tree will move the caret to where the pointer
+                    // landed, and the session's state is read back so the next
+                    // key edits where the user pointed.
+                    self.pull_text_state(host, press_target.id);
                 }
             }
             PointerAction::Moved { finger_id } => {
@@ -1644,6 +1676,12 @@ impl WinitWindowAdapter {
                     );
                 }
                 self.set_render_hover(host, target);
+                // The press's routed callback ran on the drawing tree between
+                // this release and the press -- a cell that opens a text field
+                // by focusing a `LineEdit` in its `clicked` handler does exactly
+                // that -- so the focus the tree decided is read back here, where
+                // the input method follows it.
+                self.adopt_render_focus(host);
             }
         }
         true
@@ -1667,6 +1705,29 @@ impl WinitWindowAdapter {
             host.focused_control(),
             self.render_focused.get(),
         )
+    }
+
+    /// Bring this thread's record of the render-side focus in step with what
+    /// the tree published, and the input method with it.
+    ///
+    /// A routed callback can move the focus on the tree the render thread
+    /// draws -- a `.slint` file's `clicked => l.focus()` does exactly that --
+    /// and the press that triggered it never comes back with an answer, so
+    /// this thread only sees the change in the control table the render thread
+    /// publishes. The focus is still this thread's to decide for keys and the
+    /// input method, so what the tree decided is read back and adopted here;
+    /// without it the input method would be told there is nothing to type
+    /// into, and a soft keyboard would never appear.
+    fn adopt_render_focus(&self, host: &crate::render_thread::RenderHost) {
+        let drawn = host.focused_control();
+        if self.render_focused.get() != drawn {
+            // The tree moved the focus on its own; the editing session and the
+            // input method follow the same road any focus change takes.
+            match drawn {
+                Some(id) => self.handle_render_focus_changed(Some(id)),
+                None => self.handle_render_focus_changed(None),
+            }
+        }
     }
 
     /// Move the hover, which is a property on the control that had it and on the
@@ -1761,7 +1822,17 @@ impl WinitWindowAdapter {
     /// are text *into* the focused `TextInput`, and the render thread owns that
     /// item. Falling back here would feed a second, UI-side tree that has no
     /// focus to put it in.
-    fn dispatch_key_event_to_render_controls(&self, event: &InternalKeyEvent) {
+    /// Apply a key where the meaning of keys lives: this thread's tree.
+    ///
+    /// The OS hands its keys to the UI thread, and what a key means -- an
+    /// access key running some code, a character entering a text field -- is
+    /// decided against the tree the application wrote, which is here. The
+    /// editing state of a text control lives on this thread for the length of
+    /// its session, the callbacks are the application's own, and what the
+    /// change did to the screen is pushed to the drawing tree as state: the
+    /// string, the offsets and the composition it is to show. A key that
+    /// changed nothing pushes nothing.
+    fn dispatch_key_event(&self, event: &InternalKeyEvent) {
         if self.render_owns_controls()
             && let Some(host) = self.render_host()
         {
@@ -1771,21 +1842,124 @@ impl WinitWindowAdapter {
             // the tree would otherwise traverse is consumed here so the two do
             // not move the focus twice.
             if self.move_focus_by_tab(&host, event) {
-                // Tab moved the focus here, and the input method follows the
-                // focus: the control that just gained it is told to the platform.
-                self.sync_render_ime(&host);
-                return;
-            }
-            let target = self.render_focused.get();
-            if host.send_key_to_control(event, target) {
-                // A key went into the focused control, which may have moved the
-                // caret or changed the text; the platform is told where it is
-                // now so a soft keyboard sits near the cursor.
-                self.sync_render_ime(&host);
                 return;
             }
         }
+        {
+            let window_inner = WindowInner::from_pub(self.window());
+            let focused = window_inner.focus_item.borrow().upgrade().map(|i| i.stable_id());
+            if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                std::eprintln!("[input] key dispatch, ui-tree focus={focused:?}");
+            }
+        }
         self.dispatch_internal_event(event.clone());
+        if self.render_owns_controls() {
+            self.push_text_state();
+        }
+    }
+
+    /// Push the text-editing state this thread holds for the focused control
+    /// to the drawing tree, if it moved since the last push.
+    ///
+    /// The drawing copy is told the string, the offsets and the composition
+    /// it is to show; a frame is its own answer to receiving a state it does
+    /// not already hold.  A control with no editing state -- anything that is
+    /// not a text control -- has nothing to push.
+    fn push_text_state(&self) {
+        let Some(host) = self.render_host() else { return };
+        let Some(id) = self.render_focused.get() else { return };
+        let Some(item) = self.ui_tree_item(id) else { return };
+        let Some(text_input) = item.downcast::<i_slint_core::items::TextInput>() else { return };
+        let state = text_input.as_pin_ref().text_editing_state();
+        if self.pushed_text_state.borrow().as_ref() == Some(&state) {
+            // A key the control ignored: the session's state did not move, so
+            // the drawing tree is woken for nothing if this is sent.
+            return;
+        }
+        host.set_text_state(id, state.clone());
+        *self.pushed_text_state.borrow_mut() = Some(state);
+    }
+
+    /// Open the editing session the focus just moved to.
+    ///
+    /// Three things follow from the focus being this thread's to decide: this
+    /// tree's own focus follows the decision, so its key processing drives the
+    /// control; the text-editing state the drawing tree holds is read back
+    /// once, and from here on this thread is the writer; and the platform's
+    /// input method is brought in step with the control.
+    fn begin_text_session(&self, host: &crate::render_thread::RenderHost, id: u64) {
+        self.focus_ui_tree_item(id);
+        self.pull_text_state(host, id);
+        self.sync_render_ime(host);
+    }
+
+    /// Read back the text-editing state the drawing tree holds for the
+    /// control, and take it over.
+    ///
+    /// This is the one read of a session: from here on the editing happens on
+    /// this thread's tree, and what it changes is pushed back as state. A
+    /// control with no editing state -- anything that is not a text control --
+    /// reads back nothing.
+    fn pull_text_state(&self, host: &crate::render_thread::RenderHost, id: u64) {
+        let Some(state) = host.get_text_state(id) else {
+            *self.pushed_text_state.borrow_mut() = None;
+            return;
+        };
+        if let Some(item) = self.ui_tree_item(id) {
+            if let Some(text_input) = item.downcast::<i_slint_core::items::TextInput>() {
+                text_input.as_pin_ref().set_text_editing_state(state.clone());
+            }
+        }
+        *self.pushed_text_state.borrow_mut() = Some(state);
+    }
+
+    /// The item the id names, on the tree this thread owns.
+    ///
+    /// The rows a repeater describes are materialized when something reads
+    /// them. A window whose drawing was taken over leaves that work undone --
+    /// nothing on this thread drew the rows -- but an editing session is exactly
+    /// such a reader: the key processing and the callbacks run against the item
+    /// the id names, so the first session materializes the rows it needs and
+    /// the lookup is retried once.
+    fn ui_tree_item(&self, id: u64) -> Option<ItemRc> {
+        let component = WindowInner::from_pub(self.window()).component();
+        if let Some(item) = i_slint_core::item_tree::find_item_by_stable_id(&component, id) {
+            return Some(item);
+        }
+        // A repeater's rows materialize one round at a time: the outer rows
+        // becoming real is what makes the repeaters inside them dirty, and a
+        // grid nests them. The same bound the core's own instantiation loop
+        // uses keeps a pathological tree from spinning here.
+        for _ in 0..10u32 {
+            if !i_slint_core::item_tree::ensure_item_tree_instantiated(&component) {
+                break;
+            }
+            if let Some(item) = i_slint_core::item_tree::find_item_by_stable_id(&component, id) {
+                return Some(item);
+            }
+        }
+        i_slint_core::item_tree::find_item_by_stable_id(&component, id)
+    }
+
+    /// Focus the control the id names, on the tree this thread owns.
+    ///
+    /// The keys and the editing are processed here, so the tree the
+    /// application wrote must hold the focus the decision made -- otherwise a
+    /// key would fall through it and the editing would have no subject.
+    fn focus_ui_tree_item(&self, id: u64) {
+        let Some(item) = self.ui_tree_item(id) else {
+            return;
+        };
+        // The reason is programmatic on purpose: this focus is the session's
+        // door, decided from the control ids the drawing tree published. The
+        // tree's own visibility flags may be behind what the pointer did --
+        // a click that activated a cell ran where the pointer is heard -- and
+        // the editing must not be refused over a flag that describes drawing.
+        WindowInner::from_pub(self.window()).set_focus_item(
+            &item,
+            true,
+            corelib::input::FocusReason::Programmatic,
+        );
     }
 
     /// Move the focus for a Tab or Shift-Tab press, and report whether the key
@@ -1847,6 +2021,10 @@ impl WinitWindowAdapter {
     /// has to be told that the focus left, or it keeps painting the focused look.
     fn decide_focus(&self, host: &crate::render_thread::RenderHost, id: u64) {
         self.render_focused.set(Some(id));
+        // The focus is the session's door: the editing for a text control runs
+        // on this thread's tree from here on, so the tree's own focus follows
+        // and the state the drawing tree held is read back once.
+        self.begin_text_session(host, id);
         if host.control_coord(id).is_some_and(|c| c.focus_draws) {
             host.set_control_focus(id);
             return;
@@ -1861,6 +2039,25 @@ impl WinitWindowAdapter {
         }
     }
 
+    /// The tree the render thread draws moved the focus on its own, reported
+    /// from the control table the render thread publishes.
+    ///
+    /// A routed callback's `.focus()` call moves the focus where the tree
+    /// lives, and the press that triggered it never comes back with an
+    /// answer, so this notification is how the UI thread learns of it. The
+    /// focus is still this thread's to decide for keys and the input method,
+    /// so the tree's decision is adopted here and the editing session follows.
+    pub(crate) fn handle_render_focus_changed(&self, focus: Option<u64>) {
+        self.render_focused.set(focus);
+        if let Some(host) = self.render_host()
+            && let Some(id) = focus
+        {
+            self.begin_text_session(&host, id);
+        } else if self.render_ime_focused.replace(None).is_some() {
+            self.input_method_request(corelib::window::InputMethodRequest::Disable);
+        }
+    }
+
     /// Bring the platform's input method in step with the focused control.
     ///
     /// Talking to the input method is a UI thread's business, so the UI thread
@@ -1872,6 +2069,10 @@ impl WinitWindowAdapter {
     fn sync_render_ime(&self, host: &crate::render_thread::RenderHost) {
         let target = self.render_focused.get();
         let previous = self.render_ime_focused.get();
+        let ime_started = std::time::Instant::now();
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[input] ime sync target={target:?} previous={previous:?}");
+        }
 
         let editable = target.is_some_and(|id| {
             !matches!(
@@ -1882,24 +2083,44 @@ impl WinitWindowAdapter {
         let props =
             if editable { target.and_then(|id| host.input_method_properties(id)) } else { None };
 
-        // The hints are the one input-method value the compiler puts on this
-        // thread's side, so it is read here from the tree the UI thread owns
-        // rather than from the value the drawing side assembled.  An edited
-        // text can make the hints stale before it reaches here; that is a
-        // narrow window and the fallback value is still a valid answer.
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[input] ime sync props read in {:?}", ime_started.elapsed());
+        }
+        self.update_render_ime(host, props);
+    }
+
+    /// Bring the platform's input method in step with values already in hand.
+    ///
+    /// The keystroke path calls this with the values that came back with the
+    /// key's answer -- the tree computed them while the key was in hand -- so
+    /// a typed character costs one round trip instead of three.  The focus
+    /// paths call [`Self::sync_render_ime`], which reads the values from the
+    /// tree first.
+    ///
+    /// What the tree supplied is the state it draws: the text, the preedit and
+    /// the caret rectangle, which only the side that shaped the font knows.
+    /// The input-method hints are not among them -- the compiler assigned those
+    /// to this thread, where the OS communication they shape lives -- so they
+    /// are read from the tree this thread owns and written over whatever the
+    /// drawn-side copy carried.
+    fn update_render_ime(
+        &self,
+        host: &crate::render_thread::RenderHost,
+        props: Option<corelib::window::InputMethodProperties>,
+    ) {
+        let target = self.render_focused.get();
+        let previous = self.render_ime_focused.get();
         let props = props.map(|mut props| {
             if let Some(id) = target {
-                if host.ime_ui_owned(id) {
-                    if let Some(hints) =
+                if host.ime_ui_owned(id)
+                    && let Some(hints) =
                         WindowInner::from_pub(self.window()).input_method_hints_for(id)
-                    {
-                        props.input_method_hints = hints;
-                    }
+                {
+                    props.input_method_hints = hints;
                 }
             }
             props
         });
-
         match props {
             Some(props) => {
                 if previous == target {
@@ -2099,7 +2320,7 @@ impl WinitWindowAdapter {
                     ..Default::default()
                 };
 
-                self.dispatch_key_event_to_render_controls(&event);
+                self.dispatch_key_event(&event);
             }
             WinitWindowEvent::Ime(winit::event::Ime::Preedit(string, preedit_selection)) => {
                 let event = InternalKeyEvent {
@@ -2108,7 +2329,7 @@ impl WinitWindowAdapter {
                     preedit_selection: preedit_selection.map(|e| e.0 as i32..e.1 as i32),
                     ..Default::default()
                 };
-                self.dispatch_key_event_to_render_controls(&event);
+                self.dispatch_key_event(&event);
             }
             WinitWindowEvent::Ime(winit::event::Ime::Commit(string)) => {
                 let mut key_event = KeyEvent::default();
@@ -2118,7 +2339,7 @@ impl WinitWindowAdapter {
                     key_event,
                     ..Default::default()
                 };
-                self.dispatch_key_event_to_render_controls(&event);
+                self.dispatch_key_event(&event);
             }
             WinitWindowEvent::CursorMoved { position, .. } => {
                 self.current_resize_direction.set(handle_cursor_move_for_resize(
@@ -2378,17 +2599,38 @@ impl WinitWindowAdapter {
                 let _ = first_frame_rx.recv_timeout(std::time::Duration::from_secs(3));
             }
 
+            if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                std::eprintln!("[win] UI maps id={:?}", winit_window.id());
+            }
             winit_window.set_visible(true);
 
             // The frame presented before the map went into an unmapped window,
             // and a swap into an unmapped window does not reach the screen --
-            // the compositor's nothing is what the map exposes. Ask for one
-            // more frame now that the window can show it.
+            // the compositor's nothing is what the map exposes. This frame is
+            // asked for immediately: the map request is already in the X
+            // server's queue, and a swap behind it lands in a mapped window's
+            // buffer, which is what cuts the transparent period between the
+            // map and the next frame down to the present itself.
             if matches!(visibility, WindowVisibility::ShownFirstTime)
                 && !self.shared_backend_data.is_wayland
                 && let Some(host) = self.render_host()
                 && host.has_attached_component()
             {
+                host.redraw_once();
+            }
+
+            // A reparenting window manager frames the window some time after
+            // the map request, and a swap that lands inside that gap is
+            // presented into a window the screen does not composite yet.
+            // booker's first frames were lost that way, and the user saw a
+            // transparent window until the first hover forced another frame.
+            // The bounded wait pushes the follow-up frame past the framing.
+            if matches!(visibility, WindowVisibility::ShownFirstTime)
+                && !self.shared_backend_data.is_wayland
+                && let Some(host) = self.render_host()
+                && host.has_attached_component()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 host.redraw_once();
             }
 

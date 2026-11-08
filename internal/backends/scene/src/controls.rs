@@ -87,66 +87,6 @@ fn focus_on_tab(item: &ItemRc) -> bool {
 
 /// What an item does with a pointer press, if anything.
 ///
-/// The tree hands a press to the item under the pointer, and to the items
-/// below it when that item lets the press through.  An item that takes the
-/// press ends it there; a focus scope takes it only by taking the focus, and
-/// lets it through otherwise.  The item that ends up with the press is the
-/// one the UI thread has to look for, because that is the one whose answer
-/// decides whether the press is worth sending on.
-fn press_behavior(item: &ItemRc) -> Option<PressBehavior> {
-    if let Some(item) = item.downcast::<i_slint_core::items::TouchArea>() {
-        let enabled = i_slint_core::items::TouchArea::FIELD_OFFSETS
-            .enabled()
-            .apply_pin(item.as_pin_ref())
-            .get();
-        return enabled.then_some(PressBehavior::Takes);
-    }
-    if let Some(item) = item.downcast::<i_slint_core::items::TextInput>() {
-        let enabled = i_slint_core::items::TextInput::FIELD_OFFSETS
-            .enabled()
-            .apply_pin(item.as_pin_ref())
-            .get();
-        return enabled.then_some(PressBehavior::Takes);
-    }
-    if let Some(item) = item.downcast::<i_slint_core::items::FocusScope>() {
-        let item = item.as_pin_ref();
-        let enabled =
-            i_slint_core::items::FocusScope::FIELD_OFFSETS.enabled().apply_pin(item).get();
-        let focus_on_click =
-            i_slint_core::items::FocusScope::FIELD_OFFSETS.focus_on_click().apply_pin(item).get();
-        return (enabled && focus_on_click).then_some(PressBehavior::Focus);
-    }
-    if let Some(item) = item.downcast::<i_slint_core::items::Flickable>() {
-        let item = item.as_pin_ref();
-        // A flickable that cannot be panned lets the press through to the
-        // items below it.
-        return (item.interactive() && item.mouse_drag_pan_enabled())
-            .then_some(PressBehavior::Takes);
-    }
-    if let Some(item) = item.downcast::<i_slint_core::items::DragArea>() {
-        let enabled = i_slint_core::items::DragArea::FIELD_OFFSETS
-            .enabled()
-            .apply_pin(item.as_pin_ref())
-            .get();
-        return enabled.then_some(PressBehavior::Takes);
-    }
-    if let Some(item) = item.downcast::<i_slint_core::items::ContextMenu>() {
-        let enabled = i_slint_core::items::ContextMenu::FIELD_OFFSETS
-            .enabled()
-            .apply_pin(item.as_pin_ref())
-            .get();
-        return enabled.then_some(PressBehavior::Takes);
-    }
-    if let Some(item) = item.downcast::<i_slint_core::items::WindowMoveArea>() {
-        let enabled = i_slint_core::items::WindowMoveArea::FIELD_OFFSETS
-            .enabled()
-            .apply_pin(item.as_pin_ref())
-            .get();
-        return enabled.then_some(PressBehavior::Takes);
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // ControlEncoder
 // ---------------------------------------------------------------------------

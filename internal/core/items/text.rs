@@ -756,6 +756,26 @@ struct UndoItem {
     kind: UndoItemKind,
 }
 
+/// The text-editing state of one `TextInput`: the string, where the cursor
+/// and the selection anchor sit in it, and the composition in flight.
+///
+/// The thread that owns the editing session holds this state and edits it;
+/// the copy that only draws is told the same shape, so the two sides need
+/// agree on nothing else.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct TextEditingState {
+    /// The string, without the composition.
+    pub text: SharedString,
+    /// Where the cursor sits, as a byte offset into `text`.
+    pub cursor_position_byte_offset: i32,
+    /// Where the selection anchor sits, as a byte offset into `text`.
+    pub anchor_position_byte_offset: i32,
+    /// The composition the platform's input method has in flight.
+    pub preedit_text: SharedString,
+    /// The cursor and the anchor within the composition, when one is active.
+    pub preedit_selection: Option<core::ops::Range<i32>>,
+}
+
 /// The implementation of the `TextInput` element
 #[repr(C)]
 #[derive(FieldOffsets, Default, SlintElement)]
@@ -1531,6 +1551,66 @@ fn cursor_uses_selection_color() -> bool {
 }
 
 impl TextInput {
+    /// The text-editing state of this control.
+    ///
+    /// The thread that owns the editing session reads this to learn what it is
+    /// taking over; the thread that only draws reads it to learn what it has
+    /// been told to show.
+    pub fn text_editing_state(self: Pin<&Self>) -> TextEditingState {
+        TextEditingState {
+            text: Self::FIELD_OFFSETS.text().apply_pin(self).get(),
+            cursor_position_byte_offset: Self::FIELD_OFFSETS
+                .cursor_position_byte_offset()
+                .apply_pin(self)
+                .get(),
+            anchor_position_byte_offset: Self::FIELD_OFFSETS
+                .anchor_position_byte_offset()
+                .apply_pin(self)
+                .get(),
+            preedit_text: Self::FIELD_OFFSETS.preedit_text().apply_pin(self).get(),
+            preedit_selection: self.preedit_selection_state(),
+        }
+    }
+
+    /// Install the text-editing state.
+    ///
+    /// The session's owner calls this to open a session with what the drawing
+    /// tree held; the drawing copy is told the same way what the session
+    /// changed. Neither runs the editing logic or fires the callbacks: the
+    /// string, the offsets and the composition are installed as given, the
+    /// offsets after the text so they are not realigned away by the change
+    /// an external assignment triggers.
+    pub fn set_text_editing_state(self: Pin<&Self>, state: TextEditingState) {
+        self.text.set(state.text);
+        self.cursor_position_byte_offset.set(state.cursor_position_byte_offset);
+        self.anchor_position_byte_offset.set(state.anchor_position_byte_offset);
+        self.set_preedit_state(state.preedit_text, state.preedit_selection);
+    }
+
+    /// The composition in flight, as the text and the selection within it.
+    pub fn preedit_state(self: Pin<&Self>) -> (SharedString, Option<core::ops::Range<i32>>) {
+        (Self::FIELD_OFFSETS.preedit_text().apply_pin(self).get(), self.preedit_selection_state())
+    }
+
+    /// Install the composition in flight.
+    pub fn set_preedit_state(
+        self: Pin<&Self>,
+        preedit: SharedString,
+        selection: Option<core::ops::Range<i32>>,
+    ) {
+        self.preedit_text.set(preedit);
+        self.preedit_selection.set(selection.into());
+    }
+
+    /// The selection within the composition, if one is active.
+    fn preedit_selection_state(self: Pin<&Self>) -> Option<core::ops::Range<i32>> {
+        // SAFETY: the item is pinned as part of its component, so the property
+        // keeps its address for as long as the reference lives; `get` needs the
+        // pin to promise what the component already guarantees.
+        let property = unsafe { core::pin::Pin::new_unchecked(&self.get_ref().preedit_selection) };
+        property.get().as_option()
+    }
+
     fn show_cursor(&self, window_adapter: &Rc<dyn WindowAdapter>) {
         WindowInner::from_pub(window_adapter.window())
             .set_cursor_blink_binding(&self.cursor_visible);

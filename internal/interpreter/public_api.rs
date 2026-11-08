@@ -20,7 +20,6 @@ use i_slint_compiler::llr::{
 use i_slint_compiler::object_tree::PropertyVisibility;
 use i_slint_core::item_tree::{ItemRc, ItemTreeRc, ItemTreeVTable};
 use i_slint_core::model::Model;
-use i_slint_core::window::WindowInner;
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -397,26 +396,10 @@ fn member_reference_of(
     }
 }
 
-/// Read a public property of the component that owns the item at
-/// `flat_item_index`.
-///
-/// This is the composite-component counterpart of [`get`]: a caller that can
-/// name an item can also reach the properties of the components that item lives
-/// in, which is how `CheckBox.checked` is answered even though no item in the
-/// tree is named `checked`.
-pub fn get_for_item(
-    instance: &VRc<ItemTreeVTable, Instance>,
-    flat_item_index: u32,
-    name: &str,
-) -> Option<Value> {
-    let (cu, owner) = resolve_item(instance, flat_item_index)?;
-    read_property_of_component(&cu, &owner, name)
-}
-
 /// Read a public property of the component that owns `item`.
 ///
-/// The counterpart of [`get_for_item`] for a caller that was handed the item
-/// itself, which is what the render thread has.
+/// The counterpart of [`get`] for a caller that was handed the item itself,
+/// which is what the render thread has.
 pub fn get_for_item_rc(
     instance: &VRc<ItemTreeVTable, Instance>,
     item: &ItemRc,
@@ -424,19 +407,6 @@ pub fn get_for_item_rc(
 ) -> Option<Value> {
     let (cu, owner) = resolve_item_rc(instance, item)?;
     read_property_of_component(&cu, &owner, name)
-}
-
-/// Write a public property of the component that owns the item at
-/// `flat_item_index`: the counterpart of [`get_for_item`].
-pub fn set_for_item(
-    instance: &VRc<ItemTreeVTable, Instance>,
-    flat_item_index: u32,
-    name: &str,
-    value: Value,
-) -> Result<(), SetPropertyError> {
-    let (cu, owner) =
-        resolve_item(instance, flat_item_index).ok_or(SetPropertyError::NoSuchProperty)?;
-    write_property_of_component(&cu, &owner, name, value)
 }
 
 /// Write a public property of the component that owns `item`: the counterpart

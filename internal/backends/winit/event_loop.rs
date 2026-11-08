@@ -29,8 +29,17 @@ pub enum CustomEvent {
     WakeEventLoopWorkaround,
     /// Slint internal: Invoke the
     UserEvent(Box<dyn FnOnce() + Send>),
-    /// Invoke the callback with the [`ActiveEventLoop`], for [`crate::invoke_from_active_event_loop`]
+    /// Invoke the callback with the [`ActiveEventLoop`], for [`crate::invoke_from_event_loop`]
     UserEventWithEventLoop(Box<dyn FnOnce(&ActiveEventLoop) + Send>),
+    /// The tree the render thread draws moved the focus on its own -- a routed
+    /// callback's `.focus()` call does -- and the input method follows the
+    /// focus, which is the UI thread's to communicate to the platform.
+    RenderFocusChanged {
+        /// The window whose tree moved the focus.
+        window_id: winit::window::WindowId,
+        /// The control the tree focused, as published in the control table.
+        focus: Option<u64>,
+    },
     /// Emitted from quit_event_loop with the current event loop generation
     Exit(usize),
     #[cfg(enable_accesskit)]
@@ -46,6 +55,9 @@ impl std::fmt::Debug for CustomEvent {
             Self::WakeEventLoopWorkaround => write!(f, "WakeEventLoopWorkaround"),
             Self::UserEvent(_) => write!(f, "UserEvent"),
             Self::UserEventWithEventLoop(_) => write!(f, "UserEventWithEventLoop"),
+            Self::RenderFocusChanged { window_id, focus } => {
+                write!(f, "RenderFocusChanged({window_id:?}, {focus:?})")
+            }
             Self::Exit(_) => write!(f, "Exit"),
             #[cfg(enable_accesskit)]
             Self::Accesskit(a) => write!(f, "AccessKit({a:?})"),
@@ -154,6 +166,11 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
         match event.0 {
             CustomEvent::UserEvent(user_callback) => user_callback(),
             CustomEvent::UserEventWithEventLoop(user_callback) => user_callback(event_loop),
+            CustomEvent::RenderFocusChanged { window_id, focus } => {
+                if let Some(window) = self.shared_backend_data.window_by_id(window_id) {
+                    window.handle_render_focus_changed(focus);
+                }
+            }
             CustomEvent::Exit(generation) => {
                 if self
                     .shared_backend_data

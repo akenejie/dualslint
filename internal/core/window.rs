@@ -1677,7 +1677,16 @@ impl WindowInner {
             item = crate::item_tree::find_item_by_stable_id(&self.component(), target);
         }
 
-        if item.as_ref().is_some_and(|i| !i.is_visible()) {
+        // A key is not delivered to an item the tree says is invisible: the
+        // focus outlived what it was on. This holds when the tree the keys run
+        // on is the one on screen. A tree whose drawing was handed over holds
+        // the editing state and the callbacks, and its visibility flags may lag
+        // what the pointer did on the drawing tree -- a click that activated a
+        // cell ran there -- so the drawn tree's truth is what the session
+        // already reflects, and this check would only refuse the editing.
+        if self.window_adapter().hosts_drawn_tree()
+            && item.as_ref().is_some_and(|i| !i.is_visible())
+        {
             // Reset the focus... not great, but better than keeping it.
             self.take_focus_item(&FocusEvent::FocusOut(FocusReason::TabNavigation));
             item = None;

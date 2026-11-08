@@ -23,12 +23,12 @@ constexpr inline ItemTreeNode make_item_node(uint32_t child_count, uint32_t chil
                                              uint32_t parent_index, uint32_t item_array_index,
                                              bool is_accessible, bool focus_draws,
                                              bool ime_ui_owned, bool pointer_reacts,
-                                             bool pointer_draws,
+                                             bool hover_draws, bool press_draws,
                                              uint32_t element_id)
 {
     return ItemTreeNode { ItemTreeNode::Item_Body { ItemTreeNode::Tag::Item, is_accessible,
                                                     focus_draws, ime_ui_owned, pointer_reacts,
-                                                    pointer_draws,
+                                                    hover_draws, press_draws,
                                                     child_count, child_index, parent_index,
                                                     item_array_index, element_id } };
 }

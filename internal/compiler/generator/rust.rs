@@ -1507,7 +1507,6 @@ fn render_handover_state(
         if !global.exported {
             return None;
         }
-        let global_id = format_ident!("global_{}", ident(&global.name));
         // The root's own callbacks count their handler notes from zero, so a
         // global's notes start past every number the root could ever use.
         let note_base = (global_index + 1) * 1_000_000;
@@ -1844,20 +1843,6 @@ impl CallTarget {
                         .note_host_callback(#note_base + #index);
                 }
             ),
-        }
-    }
-
-    /// The expression that reaches the window these calls belong to, when there is one.
-    ///
-    /// A component rooted in a window can ask that window which tree it shows;
-    /// a tray or a component with no window has nothing to ask, and the code
-    /// that tells the window something about the application's handlers needs
-    /// it for the same reason. A global reaches its window through the
-    /// `SharedGlobals` it sits in, which [`Self::note_host`] spells out.
-    fn window_expr(&self) -> Option<&TokenStream> {
-        match self {
-            CallTarget::ScreenTree { window, .. } => Some(window),
-            CallTarget::OwnTree | CallTarget::GlobalTree { .. } => None,
         }
     }
 }
