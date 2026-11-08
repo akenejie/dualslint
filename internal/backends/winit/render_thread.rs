@@ -1780,6 +1780,13 @@ impl RenderCore {
         // The last focus this thread reported to the UI thread, so a change the
         // tree made on its own is noticed at the next publish.
         let last_reported_focus = std::cell::Cell::new(Option::<u64>::None);
+        // When the window was mapped, and whether the follow-up frame after
+        // the window manager's own map processing has gone out yet.  The
+        // presents a compositor is still introducing the window with can be
+        // lost to its redirect, and the first user input would then be what
+        // paints the window -- so one more frame goes out once the map
+        // processing has had time to settle.
+        let mut map_settle: Option<(std::time::Instant, bool)> = None;
         // Keeps the mirror component tree alive for the lifetime of the
         // render thread (the strong handle owns the ItemTree).  Moved in
         // only from `AttachComponent`; never leaves this thread.  Shared with
@@ -1833,7 +1840,17 @@ impl RenderCore {
                 None
             } else {
                 let frame = std::time::Duration::from_millis(RENDER_FRAME_INTERVAL_MS);
-                let next_timer = i_slint_core::platform::duration_until_next_timer_update();
+                let mut next_timer = i_slint_core::platform::duration_until_next_timer_update();
+                // A window freshly mapped is still being introduced by the
+                // compositor; the frame for it goes out again at the settle
+                // mark, and the wait may not run past that mark.
+                let settle_wait = map_settle
+                    .as_ref()
+                    .filter(|(_, done)| !*done)
+                    .map(|(at, _)| MAP_SETTLE_DELAY.saturating_sub(at.elapsed()));
+                if let Some(w) = settle_wait {
+                    next_timer = Some(next_timer.map_or(w, |timer| timer.min(w)));
+                }
                 if animating(&render_window_adapter) {
                     // The previous iteration's work ate into this interval:
                     // pace to the interval from the frame's start, not from
@@ -1998,6 +2015,7 @@ impl RenderCore {
                         // mapper learns the frame is in the buffer, not that
                         // the message was read.
                         self.window_mapped_notify = Some(response);
+                        map_settle = Some((std::time::Instant::now(), false));
                         present = true;
                     }
                     RenderMessage::RedrawOnce => {
@@ -2566,6 +2584,18 @@ impl RenderCore {
                 if let Some(tx) = self.window_mapped_notify.take() {
                     let _ = tx.send(());
                 }
+                // One more frame once the window manager's map processing has
+                // had time to settle: the presents a compositor is still
+                // introducing the window with can be lost to its redirect, and
+                // without this the first user input would be what paints the
+                // window.
+                if let Some((at, done)) = map_settle.as_mut()
+                    && !*done
+                    && at.elapsed() >= MAP_SETTLE_DELAY
+                {
+                    *done = true;
+                    present = true;
+                }
             } else {
                 // An iteration that only ran messages spent almost nothing on
                 // the frame budget.
@@ -2638,6 +2668,12 @@ fn publish_mirror_controls(
 /// refresh interval; the android-activity loop uses the same fallback.
 #[cfg(render_thread_can_draw)]
 const RENDER_FRAME_INTERVAL_MS: u64 = 10;
+
+/// How long after the map the settle frame goes out.  Long enough that the
+/// compositor's own introduction of the window has finished; short enough
+/// that the user does not watch a transparent window instead of the
+/// application.
+const MAP_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Whether the render-owned tree is animating, which is what tells the render
 /// thread that the screen is owed a frame without a message to say so.
