@@ -2625,34 +2625,19 @@ impl WinitWindowAdapter {
             }
             winit_window.set_visible(true);
 
-            // The frame presented before the map went into an unmapped window,
-            // and a swap into an unmapped window does not reach the screen --
-            // the compositor's nothing is what the map exposes. This frame is
-            // asked for immediately: the map request is already in the X
-            // server's queue, and a swap behind it lands in a mapped window's
-            // buffer, which is what cuts the transparent period between the
-            // map and the next frame down to the present itself.
+            // The frame the screen is to show at the show moment is the one
+            // that lands behind the map.  The presents and the map travel one
+            // X connection, so a present queued behind the map is processed
+            // behind it on the server as well; waiting for the present to have
+            // run is what makes the show moment deterministic.  A render
+            // thread that cannot present maps the window blank rather than
+            // hanging the startup, which the bounded wait is for.
             if matches!(visibility, WindowVisibility::ShownFirstTime)
                 && !self.shared_backend_data.is_wayland
                 && let Some(host) = self.render_host()
                 && host.has_attached_component()
             {
-                host.redraw_once();
-            }
-
-            // A reparenting window manager frames the window some time after
-            // the map request, and a swap that lands inside that gap is
-            // presented into a window the screen does not composite yet.
-            // booker's first frames were lost that way, and the user saw a
-            // transparent window until the first hover forced another frame.
-            // The bounded wait pushes the follow-up frame past the framing.
-            if matches!(visibility, WindowVisibility::ShownFirstTime)
-                && !self.shared_backend_data.is_wayland
-                && let Some(host) = self.render_host()
-                && host.has_attached_component()
-            {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                host.redraw_once();
+                host.present_for_mapped_window();
             }
 
             // Refresh the SlintContext color-scheme now that the window is mapped: on some platforms

@@ -347,6 +347,14 @@ pub enum RenderMessage {
     /// window that was not mapped yet, and a swap into an unmapped window
     /// does not reach the screen, so the mapped window starts from the
     /// compositor's nothing and needs a frame of its own.
+    /// The window was just mapped, and the frame the screen is to show at
+    /// that moment is this thread's to present.  The reply says the present
+    /// is done, so the mapping thread does not return before the frame is in
+    /// the window's buffer.
+    WindowMapped {
+        /// Reply channel: the present completed.
+        response: std::sync::mpsc::SyncSender<()>,
+    },
     RedrawOnce,
     /// Instantiate the app's component on the render thread.  `factory` runs on
     /// the render thread (it must call the component's `new()` *there*, since
@@ -1374,6 +1382,21 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::RedrawOnce);
     }
 
+    /// Present the frame for the window that was just mapped, and wait for it.
+    ///
+    /// The map and this present are the show moment: the frame the compositor
+    /// is to see when it first looks at the window.  Waiting for the reply
+    /// keeps the mapping thread from returning before that frame is in the
+    /// window's buffer.  The presents and the map travel one X connection, so
+    /// a present queued behind the map lands behind it on the server as well,
+    /// which is what makes the show moment deterministic.
+    pub fn present_for_mapped_window(&self) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        if self.sender.send(RenderMessage::WindowMapped { response: tx }).is_ok() {
+            let _ = rx.recv_timeout(std::time::Duration::from_millis(500));
+        }
+    }
+
     /// Hand the render thread the font collection the UI thread's context
     /// already scanned, so the mirror's context shares it.
     pub fn send_font_collection(&self, data: SharedFontData) {
@@ -1477,6 +1500,9 @@ pub(crate) struct RenderCore {
     /// The UI thread waits for this thread's first frame before it maps the
     /// window; signaled once, after the first successful present.
     first_present_notify: Option<std::sync::mpsc::Sender<()>>,
+    /// The UI thread waits for the frame that follows the map before it goes
+    /// on; signaled once, after the present that answers `WindowMapped`.
+    window_mapped_notify: Option<std::sync::mpsc::SyncSender<()>>,
     /// The UI thread's font collection, received before the attach: the
     /// mirror's context shares it instead of scanning the system fonts again.
     font_collection: Option<SharedFontData>,
@@ -1707,6 +1733,7 @@ impl RenderCore {
             channel_id,
             pending_on_screen_tree: Vec::new(),
             first_present_notify: None,
+            window_mapped_notify: None,
             font_collection: None,
             event_loop_proxy,
         }
@@ -1963,6 +1990,15 @@ impl RenderCore {
                     }
                     RenderMessage::SetFontCollection(collection) => {
                         self.font_collection = Some(collection);
+                    }
+                    RenderMessage::WindowMapped { response } => {
+                        // The frame the screen sees at the show moment is the
+                        // one this message asks for.  The reply is parked and
+                        // taken once the frame block has presented, so the
+                        // mapper learns the frame is in the buffer, not that
+                        // the message was read.
+                        self.window_mapped_notify = Some(response);
+                        present = true;
                     }
                     RenderMessage::RedrawOnce => {
                         frame_request.set(true);
@@ -2513,6 +2549,11 @@ impl RenderCore {
                     std::eprintln!("[win] first present done");
                 }
                 if let Some(tx) = self.first_present_notify.take() {
+                    let _ = tx.send(());
+                }
+                // The frame the map asked for is in the buffer now; the mapper
+                // can go on.
+                if let Some(tx) = self.window_mapped_notify.take() {
                     let _ = tx.send(());
                 }
             } else {
