@@ -1604,7 +1604,10 @@ impl WinitWindowAdapter {
                 // press there can change anything on screen.
                 let Some(press_target) = self.render_press_target(host, position) else {
                     // Nothing under the pointer takes a press, so the tree
-                    // would only walk its items to find that out.
+                    // would only walk its items to find that out.  The editing
+                    // session follows the focus, and the focus stays where it
+                    // is: a press on nothing moves it no more than a press on
+                    // a control that takes none does.
                     return true;
                 };
                 if !press_target.pointer_reacts {
@@ -1676,12 +1679,6 @@ impl WinitWindowAdapter {
                     );
                 }
                 self.set_render_hover(host, target);
-                // The press's routed callback ran on the drawing tree between
-                // this release and the press -- a cell that opens a text field
-                // by focusing a `LineEdit` in its `clicked` handler does exactly
-                // that -- so the focus the tree decided is read back here, where
-                // the input method follows it.
-                self.adopt_render_focus(host);
             }
         }
         true
@@ -1718,18 +1715,6 @@ impl WinitWindowAdapter {
     /// input method, so what the tree decided is read back and adopted here;
     /// without it the input method would be told there is nothing to type
     /// into, and a soft keyboard would never appear.
-    fn adopt_render_focus(&self, host: &crate::render_thread::RenderHost) {
-        let drawn = host.focused_control();
-        if self.render_focused.get() != drawn {
-            // The tree moved the focus on its own; the editing session and the
-            // input method follow the same road any focus change takes.
-            match drawn {
-                Some(id) => self.handle_render_focus_changed(Some(id)),
-                None => self.handle_render_focus_changed(None),
-            }
-        }
-    }
-
     /// Move the hover, which is a property on the control that had it and on the
     /// one that has it now.
     fn set_render_hover(&self, host: &crate::render_thread::RenderHost, target: Option<u64>) {
@@ -2048,6 +2033,9 @@ impl WinitWindowAdapter {
     /// focus is still this thread's to decide for keys and the input method,
     /// so the tree's decision is adopted here and the editing session follows.
     pub(crate) fn handle_render_focus_changed(&self, focus: Option<u64>) {
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            std::eprintln!("[input] render focus changed -> {focus:?}");
+        }
         self.render_focused.set(focus);
         if let Some(host) = self.render_host()
             && let Some(id) = focus

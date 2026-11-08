@@ -2229,13 +2229,22 @@ impl RenderCore {
                         // Only clear the control the UI thread named: a `.slint`
                         // file can move the focus on its own, and a stale UI
                         // decision must not take that focus away.
-                        if let Some(adapter) = render_window_adapter.as_ref()
-                            && let Some(item_rc) = render_item_rcs.borrow().get(&id).cloned()
-                            && let Some(focused) = WindowInner::from_pub(adapter.window())
-                                .focus_item
-                                .borrow()
-                                .upgrade()
-                            && focused == item_rc
+                        //
+                        // The check borrows the window's focus cell, and the
+                        // clear takes it; the two must not overlap, so the
+                        // answer is decided in an inner scope and applied
+                        // after both borrows are gone.
+                        let clearing = render_window_adapter.as_ref().and_then(|adapter| {
+                            render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                                let focused = WindowInner::from_pub(adapter.window())
+                                    .focus_item
+                                    .borrow()
+                                    .upgrade()?;
+                                (focused == item_rc).then_some(item_rc)
+                            })
+                        });
+                        if let Some(item_rc) = clearing
+                            && let Some(adapter) = render_window_adapter.as_ref()
                         {
                             WindowInner::from_pub(adapter.window()).set_focus_item(
                                 &item_rc,
@@ -2484,6 +2493,9 @@ impl RenderCore {
                 let focused = self.coords.lock().unwrap().focused();
                 if focused != last_reported_focus.get() {
                     last_reported_focus.set(focused);
+                    if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                        std::eprintln!("[input] render focus published {focused:?}, notifying ui");
+                    }
                     if let (Some(proxy), Some(window_id)) =
                         (self.event_loop_proxy.as_ref(), surface.owner)
                     {
