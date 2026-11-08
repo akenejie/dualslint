@@ -40,6 +40,16 @@ use std::str::FromStr;
 struct RustGeneratorContext {
     /// Path to the SharedGlobals structure that contains the global and the WindowAdapter
     global_access: TokenStream,
+    /// How a call from this context reaches the tree that is drawn.  A write
+    /// to a property the drawing thread owns, made from code that runs on the
+    /// application's tree, carries through this target: the value the handler
+    /// assigned has to reach the copy whose bindings decide the screen.
+    ///
+    /// Read by the property-write carry, which is the next piece of the
+    /// pointer inversion: the handlers move to the application's tree and
+    /// their writes to drawing-owned properties follow this target.
+    #[expect(dead_code)]
+    call_target: CallTarget,
 }
 
 type EvaluationContext<'a> = llr_EvaluationContext<'a, RustGeneratorContext>;
@@ -378,13 +388,6 @@ fn generate_public_component(
 
     let component = generate_item_tree(&llr.item_tree, unit, None, None, false);
 
-    let ctx = EvaluationContext {
-        compilation_unit: unit,
-        current_scope: EvaluationScope::SubComponent(llr.item_tree.root, None),
-        generator_state: RustGeneratorContext { global_access: quote!(_self.globals()) },
-        argument_types: &[],
-    };
-
     // A component rooted in a window can ask that window which tree it shows, so
     // its calls follow the tree that is drawn. A tray icon is not a window, and
     // a component without a window has nothing to ask.
@@ -394,6 +397,16 @@ fn generate_public_component(
             inner_component: quote!(#inner_component_id),
         },
         llr::TopLevelComponentType::SystemTrayIcon => CallTarget::OwnTree,
+    };
+
+    let ctx = EvaluationContext {
+        compilation_unit: unit,
+        current_scope: EvaluationScope::SubComponent(llr.item_tree.root, None),
+        generator_state: RustGeneratorContext {
+            global_access: quote!(_self.globals()),
+            call_target: call_target.clone(),
+        },
+        argument_types: &[],
     };
 
     // A tray has no window to hand over, and a window that neither carries a
@@ -914,6 +927,7 @@ fn generate_struct(the_struct: &Struct, unit: &llr::CompilationUnit) -> TokenStr
             unit,
             RustGeneratorContext {
                 global_access: quote!(compile_error!("no global access in a constant expression")),
+                call_target: CallTarget::OwnTree,
             },
         );
         let (field_names, field_values): (Vec<_>, Vec<_>) = the_struct
@@ -1619,6 +1633,7 @@ fn callback_travels_back(callback: &crate::langtype::Function) -> bool {
 }
 
 /// Which tree an exported component's calls run against.
+#[derive(Clone)]
 enum CallTarget {
     /// The call runs against the tree the caller holds, which is the tree that
     /// is drawn.
@@ -2241,7 +2256,10 @@ fn generate_sub_component(
     let ctx = EvaluationContext::new_sub_component(
         root,
         component_idx,
-        RustGeneratorContext { global_access: quote!(_self.globals()) },
+        RustGeneratorContext {
+            global_access: quote!(_self.globals()),
+            call_target: CallTarget::OwnTree,
+        },
         parent_ctx,
     );
     let mut extra_components = component
@@ -3082,7 +3100,10 @@ fn generate_global(
     let ctx = EvaluationContext::new_global(
         root,
         global_idx,
-        RustGeneratorContext { global_access: quote!(_self.globals()) },
+        RustGeneratorContext {
+            global_access: quote!(_self.globals()),
+            call_target: CallTarget::OwnTree,
+        },
     );
 
     let declared_functions = generate_functions(global.functions.as_ref(), &ctx);
@@ -3636,7 +3657,10 @@ fn generate_item_tree(
         let ctx = EvaluationContext::new_sub_component(
             root,
             sub_tree.root,
-            RustGeneratorContext { global_access: quote!(_self.globals.get().unwrap()) },
+            RustGeneratorContext {
+                global_access: quote!(_self.globals.get().unwrap()),
+                call_target: CallTarget::OwnTree,
+            },
             parent_ctx,
         );
         let z_match_arms = z_sorted_nodes.iter().map(|(node_idx, node)| {
@@ -3855,7 +3879,10 @@ fn generate_repeated_component(
     let ctx = EvaluationContext {
         compilation_unit: unit,
         current_scope: EvaluationScope::SubComponent(repeated.sub_tree.root, Some(parent_ctx)),
-        generator_state: RustGeneratorContext { global_access: quote!(_self.globals()) },
+        generator_state: RustGeneratorContext {
+            global_access: quote!(_self.globals()),
+            call_target: CallTarget::OwnTree,
+        },
         argument_types: &[],
     };
 
@@ -4233,7 +4260,10 @@ fn generate_repeated_component(
         let ctx = EvaluationContext::new_sub_component(
             unit,
             repeated.sub_tree.root,
-            RustGeneratorContext { global_access: quote!(_self.globals.get().unwrap()) },
+            RustGeneratorContext {
+                global_access: quote!(_self.globals.get().unwrap()),
+                call_target: CallTarget::OwnTree,
+            },
             Some(parent_ctx),
         );
         let z_prop = access_member(z_ref, &ctx).get_property();
@@ -5717,7 +5747,10 @@ fn compile_builtin_function_call(
                 let popup_ctx = EvaluationContext::new_sub_component(
                     ctx.compilation_unit,
                     popup.item_tree.root,
-                    RustGeneratorContext { global_access: quote!(_self.globals()) },
+                    RustGeneratorContext {
+            global_access: quote!(_self.globals()),
+            call_target: CallTarget::OwnTree,
+        },
                     Some(&parent_ctx),
                 );
                 let position = compile_expression(&popup.position.read(), &popup_ctx);
@@ -5874,7 +5907,10 @@ fn compile_builtin_function_call(
             let popup_ctx = EvaluationContext::new_sub_component(
                 ctx.compilation_unit,
                 popup.item_tree.root,
-                RustGeneratorContext { global_access: quote!(_self.globals()) },
+                RustGeneratorContext {
+                    global_access: quote!(_self.globals()),
+                    call_target: CallTarget::OwnTree,
+                },
                 None,
             );
             let access_entries = access_member(&popup.entries, &popup_ctx).unwrap();
@@ -7431,6 +7467,7 @@ fn generate_translations(
         current_scope: EvaluationScope::Global(0.into()),
         generator_state: RustGeneratorContext {
             global_access: quote!(compile_error!("language rule can't access state")),
+            call_target: CallTarget::OwnTree,
         },
         argument_types: &[Type::Int32],
     };

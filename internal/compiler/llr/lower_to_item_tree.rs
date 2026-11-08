@@ -472,6 +472,7 @@ fn lower_sub_component(
                 let index = sub_component.properties.push_and_get_key(Property {
                     name: format_smolstr!("{}_{}", elem.id, p),
                     ty: x.property_type.clone(),
+                    ownership: elem.property_ownership.borrow().get(p).copied().unwrap_or_default(),
                     ..Property::default()
                 });
                 index.into()

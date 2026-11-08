@@ -1400,9 +1400,10 @@ pub struct Element {
 /// The tree on screen belongs to the drawing thread, so a property belongs to
 /// it by default.  A property the input side reads and nothing paints belongs
 /// to the UI thread instead, and a property both sides read belongs to both.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PropertyOwnership {
     /// The drawing thread holds the value.
+    #[default]
     Render,
     /// The UI thread holds the value.
     Ui,

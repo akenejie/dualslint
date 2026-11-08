@@ -393,6 +393,11 @@ pub struct Property {
     /// The amount of time this property is used of another property
     /// This property is only valid after the [`count_property_use`](super::optim_passes::count_property_use) pass
     pub use_count: AtomicUsize,
+    /// Which thread owns this property: the drawing side, the side that talks
+    /// to the OS, or both.  Decided by the compiler's ownership pass; the
+    /// generated code consults it so a write made on the application's tree
+    /// reaches the copy whose bindings decide the screen.
+    pub ownership: crate::object_tree::PropertyOwnership,
 }
 
 #[derive(Debug, Default)]
