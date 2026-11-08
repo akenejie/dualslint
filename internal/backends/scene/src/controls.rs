@@ -131,10 +131,12 @@ impl<'a> ControlEncoder<'a> {
     /// the one the user can point at rather than the one that happened to be
     /// drawn.
     fn push_control(&mut self, item: &ItemRc, origin: LogicalPoint) {
+        // A control with no area is still published: a focus-only `FocusScope`
+        // is laid out at zero width on purpose -- it takes no clicks but Tab
+        // reaches it, and the traversal is what the control table exists to
+        // inform. The hit-test ignores it on its own: no point falls inside an
+        // empty rectangle.
         let geometry = item.geometry();
-        if geometry.size.is_empty() {
-            return;
-        }
         // A popup is a tree of its own that the window draws at an offset, so
         // the item's own position is relative to the popup and the published
         // rectangle carries the offset. Everything downstream hit-tests in the

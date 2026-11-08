@@ -1715,6 +1715,27 @@ impl WinitWindowAdapter {
     /// input method, so what the tree decided is read back and adopted here;
     /// without it the input method would be told there is nothing to type
     /// into, and a soft keyboard would never appear.
+    /// The mouse cursor over the control the pointer is on, read from the tree
+    /// this thread owns.
+    ///
+    /// The cursor is OS communication and not drawing, so the drawing tree is
+    /// asked for nothing.  What the compiler put on this thread answers it: a
+    /// `TouchArea` carries the cursor its `.slint` gave it, and editable text
+    /// asks for the I-beam by its own nature -- the element carries no cursor
+    /// property upstream, and the file keeps upstream's shape.
+    fn mouse_cursor_for(&self, target: Option<u64>) -> MouseCursorInner {
+        let Some(id) = target else { return MouseCursorInner::default() };
+        let Some(item) = self.ui_tree_item(id) else { return MouseCursorInner::default() };
+        if let Some(text_input) = item.downcast::<i_slint_core::items::TextInput>() {
+            let _ = text_input;
+            return MouseCursorInner::BuiltIn(BuiltInMouseCursor::Text);
+        }
+        if let Some(touch_area) = item.downcast::<i_slint_core::items::TouchArea>() {
+            return touch_area.as_pin_ref().mouse_cursor();
+        }
+        MouseCursorInner::default()
+    }
+
     /// Move the hover, which is a property on the control that had it and on the
     /// one that has it now.
     fn set_render_hover(&self, host: &crate::render_thread::RenderHost, target: Option<u64>) {
@@ -1735,6 +1756,10 @@ impl WinitWindowAdapter {
                 host.apply_control_state(target, true, self.render_pressed.get() == Some(target));
             }
         }
+        // The cursor follows the hover, and only the changes reach here: the
+        // calls that keep the same control return above.
+        let cursor = self.mouse_cursor_for(target);
+        WindowAdapterInternal::set_mouse_cursor(self, cursor);
     }
 
     /// Move the press, which is a property too.  The pressed-state update is
@@ -1828,13 +1853,6 @@ impl WinitWindowAdapter {
             // not move the focus twice.
             if self.move_focus_by_tab(&host, event) {
                 return;
-            }
-        }
-        {
-            let window_inner = WindowInner::from_pub(self.window());
-            let focused = window_inner.focus_item.borrow().upgrade().map(|i| i.stable_id());
-            if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                std::eprintln!("[input] key dispatch, ui-tree focus={focused:?}");
             }
         }
         self.dispatch_internal_event(event.clone());
