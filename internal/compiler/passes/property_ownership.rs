@@ -14,6 +14,15 @@ use crate::object_tree::{PropertyOwnership, recurse_elem_including_sub_component
 use smol_str::SmolStr;
 use std::collections::BTreeMap;
 
+/// The classification, for the code generators: a write the generated code
+/// makes has to know which thread the value belongs to.
+pub fn classify_public(
+    builtin_name: Option<&str>,
+    prop: &str,
+) -> crate::object_tree::PropertyOwnership {
+    classify(builtin_name, prop)
+}
+
 fn classify(builtin_name: Option<&str>, prop: &str) -> PropertyOwnership {
     match prop {
         // OS communication / input routing / IME - UI owns

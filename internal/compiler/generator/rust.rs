@@ -44,12 +44,13 @@ struct RustGeneratorContext {
     /// to a property the drawing thread owns, made from code that runs on the
     /// application's tree, carries through this target: the value the handler
     /// assigned has to reach the copy whose bindings decide the screen.
-    ///
-    /// Read by the property-write carry, which is the next piece of the
-    /// pointer inversion: the handlers move to the application's tree and
-    /// their writes to drawing-owned properties follow this target.
-    #[expect(dead_code)]
     call_target: CallTarget,
+    /// Whether the code being compiled is a handler body: code the
+    /// application's tree runs in response to input.  Writes in a handler
+    /// carry to the drawn tree when the property belongs to the drawing
+    /// side; binding code does not, because each tree evaluates its own
+    /// bindings and the drawing side's are the ones that decide the screen.
+    in_callback_body: bool,
 }
 
 type EvaluationContext<'a> = llr_EvaluationContext<'a, RustGeneratorContext>;
@@ -405,6 +406,7 @@ fn generate_public_component(
         generator_state: RustGeneratorContext {
             global_access: quote!(_self.globals()),
             call_target: call_target.clone(),
+            in_callback_body: false,
         },
         argument_types: &[],
     };
@@ -928,6 +930,7 @@ fn generate_struct(the_struct: &Struct, unit: &llr::CompilationUnit) -> TokenStr
             RustGeneratorContext {
                 global_access: quote!(compile_error!("no global access in a constant expression")),
                 call_target: CallTarget::OwnTree,
+                in_callback_body: false,
             },
         );
         let (field_names, field_values): (Vec<_>, Vec<_>) = the_struct
@@ -1096,6 +1099,7 @@ fn handle_property_init(
 
     if let Type::Callback(callback) = &prop_type {
         let mut ctx2 = ctx.clone();
+        ctx2.generator_state.in_callback_body = true;
         ctx2.argument_types = &callback.args;
         let tokens_for_expression =
             compile_expression(&binding_expression.expression.read(), &ctx2);
@@ -2259,6 +2263,7 @@ fn generate_sub_component(
         RustGeneratorContext {
             global_access: quote!(_self.globals()),
             call_target: CallTarget::OwnTree,
+            in_callback_body: false,
         },
         parent_ctx,
     );
@@ -3103,6 +3108,7 @@ fn generate_global(
         RustGeneratorContext {
             global_access: quote!(_self.globals()),
             call_target: CallTarget::OwnTree,
+            in_callback_body: false,
         },
     );
 
@@ -3660,6 +3666,7 @@ fn generate_item_tree(
             RustGeneratorContext {
                 global_access: quote!(_self.globals.get().unwrap()),
                 call_target: CallTarget::OwnTree,
+                in_callback_body: false,
             },
             parent_ctx,
         );
@@ -3882,6 +3889,7 @@ fn generate_repeated_component(
         generator_state: RustGeneratorContext {
             global_access: quote!(_self.globals()),
             call_target: CallTarget::OwnTree,
+            in_callback_body: false,
         },
         argument_types: &[],
     };
@@ -4263,6 +4271,7 @@ fn generate_repeated_component(
             RustGeneratorContext {
                 global_access: quote!(_self.globals.get().unwrap()),
                 call_target: CallTarget::OwnTree,
+                in_callback_body: false,
             },
             Some(parent_ctx),
         );
@@ -4334,7 +4343,122 @@ fn property_set_value_tokens(
         return prop
             .then(|prop| quote!(#prop.set_animated_value(#value_tokens as _, #animation_tokens)));
     }
-    prop.then(|prop| quote!(#prop.set(#value_tokens as _)))
+    let set = prop.then(|prop| quote!(#prop.set(#value_tokens as _)));
+    // A handler write to a property the drawing side owns carries the value to
+    // the copy whose bindings decide the screen.  The handler runs on the
+    // application's tree -- the input's meaning is that tree's to execute --
+    // and the drawn tree is where the value becomes pixels.  A write from the
+    // drawn tree itself carries nothing: the guard in the carry sees the
+    // caller's tree as the one on screen and stops there.
+    if ctx.generator_state.in_callback_body
+        && !matches!(
+            property_ownership_of(property, ctx),
+            crate::object_tree::PropertyOwnership::Ui
+        )
+        && let Some(carry) = handler_write_carry_tokens(property, &set, ctx)
+    {
+        return carry;
+    }
+    set
+}
+
+/// Which thread owns the property a member reference names.
+fn property_ownership_of(
+    property: &llr::MemberReference,
+    ctx: &EvaluationContext,
+) -> crate::object_tree::PropertyOwnership {
+    match property {
+        llr::MemberReference::Relative { parent_level, local_reference } => {
+            let Some(root) = ctx.parent_sub_component_idx(*parent_level) else {
+                return Default::default();
+            };
+            let (_, sub_component) = follow_sub_component_path(
+                ctx.compilation_unit,
+                root,
+                &local_reference.sub_component_path,
+            );
+            match &local_reference.reference {
+                llr::LocalMemberIndex::Property(property_index) => {
+                    sub_component.properties[*property_index].ownership
+                }
+                llr::LocalMemberIndex::Native { item_index, prop_name, .. } => {
+                    // The built-in properties are not llr `Property` entries;
+                    // the compiler's classification table answers by name.
+                    let class_name = sub_component
+                        .items
+                        .get(*item_index)
+                        .map(|item| item.ty.class_name.as_str());
+                    crate::passes::property_ownership::classify_public(
+                        class_name,
+                        prop_name.as_str(),
+                    )
+                }
+                _ => Default::default(),
+            }
+        }
+        llr::MemberReference::Global { .. } => Default::default(),
+    }
+}
+
+/// The write, plus the copy of it that runs against the drawn tree.
+///
+/// The item the value belongs to is found on the drawn tree by the stable id
+/// the handler's own item carries: the two trees are the same structure, so
+/// the same id names the same item on both sides.  The access tokens then run
+/// with `_self` re-bound to that item's enclosing component, which is what
+/// the tokens were written against.
+fn handler_write_carry_tokens(
+    property: &llr::MemberReference,
+    set: &TokenStream,
+    ctx: &EvaluationContext,
+) -> Option<TokenStream> {
+    // A component with no drawn tree of its own has nothing to carry to.
+    if matches!(ctx.generator_state.call_target, CallTarget::OwnTree) {
+        return None;
+    }
+    let llr::MemberReference::Relative { parent_level: 0, local_reference } = property else {
+        // A write that names a parent component or a global: the parents are
+        // reachable from the resolved item's own parent chain, and the
+        // globals have their own carries; both are later work.
+        return None;
+    };
+    if matches!(
+        local_reference.reference,
+        llr::LocalMemberIndex::Callback(_) | llr::LocalMemberIndex::Function(_)
+    ) {
+        return None;
+    }
+    let inner_component = ctx.parent_sub_component_idx(0)?;
+    let inner_component_id = inner_component_id(&ctx.compilation_unit.sub_components[inner_component]);
+    let global_access = &ctx.generator_state.global_access;
+    Some(quote!({
+        let forwarded_item = self_rc.stable_id();
+        let forwarded = #set;
+        match #global_access.window_adapter_ref() {
+            Ok(window_adapter) => {
+                let Some(local_tree) = #global_access.root_item_tree_weak.upgrade() else {
+                    unreachable!("the tree the handler runs on is its own root");
+                };
+                let local_identity = sp::item_tree_identity(&local_tree);
+                window_adapter.window().post_on_screen_tree(local_tree, move |tree| {
+                    let tree_identity = sp::item_tree_identity(tree);
+                    if tree_identity == local_identity {
+                        return;
+                    }
+                    let Some(item) = sp::find_item_by_stable_id(&tree, forwarded_item) else {
+                        return;
+                    };
+                    let component = sp::VRc::map_dyn(item.item_tree().clone(), |tree| {
+                        sp::VRef::downcast_pin::<#inner_component_id>(tree)
+                            .expect("the item's tree is not the component the write belongs to")
+                    });
+                    let _self = component.as_pin_ref();
+                    #set;
+                })
+            }
+            Err(_) => {}
+        }
+    }))
 }
 
 /// Returns the code that can access the given property or callback
@@ -5750,6 +5874,7 @@ fn compile_builtin_function_call(
                     RustGeneratorContext {
             global_access: quote!(_self.globals()),
             call_target: CallTarget::OwnTree,
+            in_callback_body: false,
         },
                     Some(&parent_ctx),
                 );
@@ -5910,6 +6035,7 @@ fn compile_builtin_function_call(
                 RustGeneratorContext {
                     global_access: quote!(_self.globals()),
                     call_target: CallTarget::OwnTree,
+                    in_callback_body: false,
                 },
                 None,
             );
@@ -7468,6 +7594,7 @@ fn generate_translations(
         generator_state: RustGeneratorContext {
             global_access: quote!(compile_error!("language rule can't access state")),
             call_target: CallTarget::OwnTree,
+            in_callback_body: false,
         },
         argument_types: &[Type::Int32],
     };

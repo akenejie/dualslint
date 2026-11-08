@@ -355,6 +355,8 @@ pub enum RenderMessage {
         /// Reply channel: the present completed.
         response: std::sync::mpsc::SyncSender<()>,
     },
+    /// One more frame the next time the loop draws: the drawing tree owes the
+    /// screen a frame that no particular message carries.
     RedrawOnce,
     /// Instantiate the app's component on the render thread.  `factory` runs on
     /// the render thread (it must call the component's `new()` *there*, since
@@ -4078,9 +4080,9 @@ impl DrawTarget {
     /// Wait until the server has processed the presents of this target.
     #[cfg(feature = "renderer-femtovg")]
     fn sync_presents_to_server(&mut self) {
-        if let Self::Gl(state) = self {
-            state.sync_presents_to_server();
-        }
+        #[allow(irrefutable_let_patterns)]
+        let Self::Gl(state) = self else { return };
+        state.sync_presents_to_server();
     }
 
     /// Take a window's presentation over.
