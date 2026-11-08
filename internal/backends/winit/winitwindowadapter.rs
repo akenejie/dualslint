@@ -2053,7 +2053,22 @@ impl WinitWindowAdapter {
             && let Some(id) = focus
         {
             self.begin_text_session(&host, id);
-        } else if self.render_ime_focused.replace(None).is_some() {
+        } else {
+            // The session is over. What this thread pulled for it is spent: the
+            // drawing tree holds the string now, and the next session reads
+            // back from there rather than from anything remembered here.
+            self.end_text_session();
+        }
+    }
+
+    /// Recognize the end of an editing session and drop what it held.
+    ///
+    /// The text state this thread kept is only good for the session it was
+    /// pulled for; the drawing tree is where the string lives from here on.
+    /// Releasing it keeps this thread from ever answering out of a stale copy.
+    fn end_text_session(&self) {
+        *self.pushed_text_state.borrow_mut() = None;
+        if self.render_ime_focused.replace(None).is_some() {
             self.input_method_request(corelib::window::InputMethodRequest::Disable);
         }
     }
