@@ -1510,6 +1510,17 @@ impl WinitWindowAdapter {
         &self,
         event: impl Into<corelib::platform::InternalEvent>,
     ) -> bool {
+        self.dispatch_pointer_event_impl(event.into())
+    }
+
+    /// Dispatch a pointer event the way the window's own pointer handling
+    /// does: the drawing states to the drawn tree, the meaning to the
+    /// application tree.  Public so the diagnostic drivers and the testing
+    /// surfaces click the way the user does, through the same path.
+    pub fn dispatch_pointer_event_impl(
+        &self,
+        event: corelib::platform::InternalEvent,
+    ) -> bool {
         let event = event.into();
         if !self.render_owns_controls() {
             self.dispatch_internal_event(event);

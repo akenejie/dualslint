@@ -71,13 +71,13 @@ use std::sync::{Arc, Mutex, mpsc};
 use i_slint_core::api::PhysicalSize;
 use i_slint_core::api::Window as SlintApiWindow;
 use i_slint_core::graphics::Color;
-use i_slint_core::input::{BackendMouseEvent, FocusReason, PointerEventButton};
+use i_slint_core::input::{BackendMouseEvent, FocusReason};
 use i_slint_core::item_tree::{ItemRc, ItemTreeRc};
 use i_slint_core::lengths::LogicalPoint;
 #[cfg(render_thread_can_draw)]
 use i_slint_core::platform::{Clipboard, Platform, PlatformError};
 use i_slint_core::platform::{WindowEvent, WindowEventDispatchResult};
-use i_slint_core::window::{WindowAdapter, WindowInner};
+use i_slint_core::window::{WindowAdapter, WindowAdapterInternal, WindowInner};
 
 // Brings the extension traits that give `PossiblyCurrentContext` and
 // `Surface<WindowSurface>` their `make_current` / `swap_buffers` / `resize`
@@ -459,23 +459,6 @@ pub enum RenderMessage {
         /// text control.
         response: std::sync::mpsc::SyncSender<Option<i_slint_core::window::InputMethodProperties>>,
     },
-    /// A click landed on a render-owned control.
-    ///
-    /// The UI thread resolved the pointer against the composited geometry and
-    /// decided that the press and the release both landed on this control; what
-    /// a click *means* is not something it can decide, because the thing that
-    /// answers it -- the `TouchArea` behind a `Button`, the `toggled` handler
-    /// behind a `CheckBox`, the `focus-on-click` of a `FocusScope` -- is an
-    /// item in the tree on this thread. So the message names the control and
-    /// nothing else: no position, no button, no timing. The render thread
-    /// turns it into the press and release pair that the pointer would have
-    /// produced, which is what runs the application's own callbacks.
-    ActivateControl {
-        /// The control id (as published in the shared coordinate table).
-        id: u64,
-        /// Reply channel: `true` when the control took the activation.
-        response: std::sync::mpsc::SyncSender<bool>,
-    },
     /// The editing session for a text control opened on the UI thread, which
     /// read back the state the drawing tree held.
     GetTextState {
@@ -497,58 +480,6 @@ pub enum RenderMessage {
         id: u64,
         /// The state the session now holds.
         state: i_slint_core::items::TextEditingState,
-    },
-    /// The UI thread resolved a press: the hold has begun.
-    ///
-    /// No item is named.  The UI thread decided *whether* the press is worth
-    /// sending, from what the render thread published about the items under the
-    /// pointer; the tree then hit-tests the position with its own items and
-    /// hands the press to the one there, which is the tree's answer to give.
-    PressControl {
-        /// Which button went down, so that a right press stays a right press.
-        button: PointerEventButton,
-        /// Where the pointer went down, in the window's logical coordinates.
-        ///
-        /// A drag is a distance between two points, so the tree has to be given
-        /// the point the user pressed on: an event placed in the middle of the
-        /// control would make every drag start from a place the pointer was
-        /// never at.
-        position: LogicalPoint,
-        /// The control the UI thread considered focused when the pointer went
-        /// down, if any.
-        ///
-        /// A control whose focus state draws nothing is never told about the
-        /// focus, so the tree's own `has-focus` does not know that the UI thread
-        /// already focused it.  Its press handling does have to know, because
-        /// upstream a focused `FocusScope` ignores the press instead of taking
-        /// it, so the answer travels with the press it belongs to.
-        ui_focused: Option<u64>,
-    },
-    /// The pointer moved while a press was held: a drag.
-    ///
-    /// Named by position and not by control, because the point of a drag is
-    /// often to leave the control -- a `Flickable` follows the pointer past its
-    /// own edge -- and the tree's own grab is what decides which item keeps
-    /// receiving the moves.
-    MoveControl {
-        /// Where the pointer is now, in the window's logical coordinates.
-        position: LogicalPoint,
-        /// Which finger, for a touch: a drag is one finger's story, and the tree
-        /// tells two fingers apart by this.
-        finger_id: i32,
-    },
-    /// The UI thread resolved a release: the hold is over.
-    ///
-    /// The tree's own grab decides which item the release belongs to, as it
-    /// does for the moves of a drag that leaves the item it started on.
-    ReleaseControl {
-        /// Which button came up, to end the press it began.
-        button: PointerEventButton,
-        /// Where the pointer came up, in the window's logical coordinates.
-        ///
-        /// A click is a press and a release at one point, so where the release
-        /// landed is what decides between the two.
-        position: LogicalPoint,
     },
     /// The UI thread decided which control has the focus, and the tree here
     /// applies it.
@@ -893,72 +824,15 @@ impl RenderHost {
         *surface == Some(identity)
     }
 
-    /// Request the render thread to apply a pointer state to the given control
-    /// in its own component and redraw.  Ui thread and workers are equal
-    /// peers here: both call this to indicate that a control should be
-    /// hovered / pressed.
+    /// Tell the drawn tree the pointer state of a control: hovered, pressed.
+    ///
+    /// The pointer's meaning is the application tree's, but the drawn look of
+    /// hovering and pressing is what the drawn tree paints, so the state it
+    /// draws arrives here as state, not as an event.
     pub fn apply_control_state(&self, id: u64, hovered: bool, pressed: bool) {
         let _ = self.sender.send(RenderMessage::ApplyControlState { id, hovered, pressed });
     }
 
-    /// Tell the render thread that a click landed on a render-owned control,
-    /// blocking until the tree there has applied it.  Returns `true` when the
-    /// control took the activation.
-    ///
-    /// The UI thread knows which control the pointer landed on; it does not
-    /// know what a click means, and it must not decide -- the `clicked`,
-    /// `toggled` and `accepted` handlers that answer it belong to the items in
-    /// the tree on the render thread, and they run there with the application's
-    /// own code. So this is a statement about the control, not a command to
-    /// imitate one: no widget is named, no property is set, and nothing here
-    /// has to be updated when a new widget is added.
-    ///
-    /// Ui thread and library-external workers are equal peers here.
-    pub fn activate_control(&self, id: u64) -> bool {
-        // A call from the render thread itself cannot wait on the channel it
-        // would answer on: it acts on the tree in place instead, using the same
-        // state the loop holds.
-        if self.is_own_render_thread()
-            && let Some(result) = with_tl_access(|tl| {
-                let region = {
-                    let coords = tl.coords.lock().unwrap();
-                    coords.by_id.get(&id).map(|c| ControlRegion {
-                        id,
-                        geometry: i_slint_core::lengths::LogicalRect::new(
-                            LogicalPoint::new(c.x, c.y),
-                            i_slint_core::lengths::LogicalSize::new(c.width, c.height),
-                        ),
-                        focus_on_click: c.focus_on_click,
-                        focus_on_tab: c.focus_on_tab,
-                        focus_draws: c.focus_draws,
-                        ime_ui_owned: c.ime_ui_owned,
-                        hover_draws: c.hover_draws,
-                        press_draws: c.press_draws,
-                    })
-                };
-                let adapter = tl.adapter.borrow().clone();
-                match (region, adapter) {
-                    (Some(region), Some(adapter)) => activate_control(&adapter, &region),
-                    _ => false,
-                }
-            })
-        {
-            return result;
-        }
-        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(1);
-        let _ = self.sender.send(RenderMessage::ActivateControl { id, response: tx });
-        rx.recv().unwrap_or(false)
-    }
-
-    /// Hand a key to the tree on the render thread, blocking until it answers.
-    /// Returns `true` when an item there consumed the key.
-    ///
-    /// The key arrives in the runtime's own representation because that is
-    /// where the OS key stops being an OS key: the UI thread's work is done
-    /// once the key is named, and from there on the item that has the focus
-    /// decides what it means. A field, a `Flickable`, a widget with a
-    /// `key-pressed` handler and a `TextInput` are then all answered by the
-    /// same code that answers them when the pointer does reach the tree.
     /// Read back a control's text-editing state, and wait for it.
     ///
     /// An editing session opens with this: the string the drawing tree holds
@@ -980,34 +854,6 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::SetTextState { id, state });
     }
 
-    /// Tell the tree that this control has the press.
-    ///
-    /// This is the grab and the focus, and nothing else: whether the release
-    /// that comes next is a click is decided by the tree, because the tree is
-    /// what knows whether the pointer moved away in the meantime.
-    pub fn press_control(
-        &self,
-        button: PointerEventButton,
-        position: LogicalPoint,
-        ui_focused: Option<u64>,
-    ) -> bool {
-        self.sender.send(RenderMessage::PressControl { button, position, ui_focused }).is_ok()
-    }
-
-    /// Tell the tree that the pointer moved while the press was held.
-    ///
-    /// Sent for as long as the pointer is down, which is the whole of a drag: the
-    /// UI thread reports where the pointer is, and the tree decides what a
-    /// distance between two points means -- a slider's value, a `Flickable`'s
-    /// scroll position, a `TouchArea`'s `moved`.
-    pub fn move_control(&self, position: LogicalPoint, finger_id: i32) -> bool {
-        self.sender.send(RenderMessage::MoveControl { position, finger_id }).is_ok()
-    }
-
-    /// Tell the tree that the press on this control is over.
-    pub fn release_control(&self, button: PointerEventButton, position: LogicalPoint) -> bool {
-        self.sender.send(RenderMessage::ReleaseControl { button, position }).is_ok()
-    }
 
     /// Tell the tree that the wheel belongs to this control.
     ///
@@ -2278,41 +2124,6 @@ impl RenderCore {
                         });
                         let _ = response.send(value);
                     }
-                    RenderMessage::PressControl { button, position, ui_focused } => {
-                        // The press handler in the tree asks whether the control
-                        // already has the focus, and for one whose focus state is
-                        // not drawn here the answer only exists on the UI thread.
-                        // It travels with the press and is taken back out after,
-                        // so it cannot leak into an unrelated event.
-                        let window = render_window_adapter.as_ref().map(|adapter| adapter.window());
-                        if let Some(window) = window {
-                            WindowInner::from_pub(window).set_ui_focused_id(ui_focused);
-                        }
-                        present |= send_pointer_event_to_tree(
-                            render_window_adapter.as_ref(),
-                            MouseEventKind::Pressed,
-                            button,
-                            position,
-                        );
-                        if let Some(window) = window {
-                            WindowInner::from_pub(window).set_ui_focused_id(None);
-                        }
-                    }
-                    RenderMessage::MoveControl { position, finger_id } => {
-                        present |= send_pointer_move_to_tree(
-                            render_window_adapter.as_ref(),
-                            position,
-                            finger_id,
-                        );
-                    }
-                    RenderMessage::ReleaseControl { button, position } => {
-                        present |= send_pointer_event_to_tree(
-                            render_window_adapter.as_ref(),
-                            MouseEventKind::Released,
-                            button,
-                            position,
-                        );
-                    }
                     RenderMessage::SetControlFocus { id } => {
                         // The UI thread decided the focus; the item it names is
                         // the one the id was published for, so the tree installs
@@ -2383,18 +2194,6 @@ impl RenderCore {
                             Gesture::Rotation { delta },
                             position,
                         );
-                    }
-                    RenderMessage::ActivateControl { id, response } => {
-                        // A press and a release at the same point, which is all a
-                        // click is before the tree has had its say about it.
-                        let activated = render_window_adapter
-                            .as_ref()
-                            .zip(render_controls.get(&id))
-                            .is_some_and(|(adapter, region)| activate_control(adapter, region));
-                        let _ = response.send(activated);
-                        // The tree changed: a `pressed` binding fired, a `clicked`
-                        // handler may have changed anything at all.
-                        present |= activated;
                     }
                     RenderMessage::GetTextState { id, response } => {
                         let state =
@@ -3232,52 +3031,6 @@ fn read_control_property(
 
 /// Deliver a click to the tree, the way a pointer would have.
 ///
-/// The UI thread has already said which control the press and the release both
-/// landed on. Turning that into the pair of events the tree expects is the
-/// render thread's business, and doing it here rather than on the UI thread is
-/// what keeps the application's own code in charge: the `TouchArea` fires
-/// `clicked`, the `CheckBox` behind it flips `checked` and fires `toggled`, a
-/// `FocusScope` with `focus-on-click` takes the focus, and a `Button` looks
-/// pressed in between -- all of it decided by the bindings and callbacks the
-/// `.slint` file already declares, none of it by a list of widget names in a
-/// backend.
-///
-/// The position is the control's own centre, taken from its geometry, because
-/// the pointer is not part of this path: what arrives here is a key, so there is
-/// no place on screen the user pointed at and the control's middle is as good a
-/// point as any. Both events go through the window, which is also how the item
-/// stack is built: the tree finds for itself which items the point is inside,
-/// exactly as it would for a real press.
-fn activate_control(adapter: &Rc<dyn WindowAdapter>, region: &ControlRegion) -> bool {
-    let position = control_centre(region);
-
-    for kind in [MouseEventKind::Pressed, MouseEventKind::Released] {
-        let event = i_slint_core::platform::InternalEvent::Mouse(match kind {
-            MouseEventKind::Pressed => BackendMouseEvent::Pressed {
-                position,
-                button: PointerEventButton::Left,
-                click_count: 1,
-                touch_finger_id: 0,
-            },
-            MouseEventKind::Released => BackendMouseEvent::Released {
-                position,
-                button: PointerEventButton::Left,
-                click_count: 1,
-                touch_finger_id: 0,
-            },
-        });
-        adapter.window().dispatch_event(WindowEvent::internal(event));
-    }
-    // The tree is asked whether it accepted the release; the press is only ever
-    // a grab, so the release is where "the control took the click" is decided.
-    adapter
-        .window()
-        .dispatch_event_with_result(WindowEvent::internal(
-            i_slint_core::platform::InternalEvent::Mouse(BackendMouseEvent::Exit),
-        ))
-        .is_ok()
-}
-
 /// A gesture that the UI thread has already attributed to a control.
 ///
 /// Which control it belongs to is a question about geometry, and the UI thread
@@ -3327,20 +3080,7 @@ fn send_gesture_to_tree(
     )
 }
 
-/// Which part of a click is being built: the press, or the release that ends it.
-enum MouseEventKind {
-    Pressed,
-    Released,
-}
 
-/// The middle of a control, in the coordinates of the window that published it.
-///
-/// Used for the events that have no pointer of their own -- the click a key
-/// stands for -- so that the point handed to the tree is inside the control the
-/// UI thread named.
-fn control_centre(region: &ControlRegion) -> LogicalPoint {
-    region.geometry.origin + region.geometry.size.to_vector() * 0.5
-}
 
 /// Hand one half of a click to the control the UI thread named.
 ///
@@ -3352,67 +3092,6 @@ fn control_centre(region: &ControlRegion) -> LogicalPoint {
 /// The control is only asked for as a check that it is still there: the frame
 /// that published it and the frame that dispatches to it are frames apart, and a
 /// control that has since gone should not be given an event.
-/// Hand a press or a release to the tree.
-///
-/// No control is named: the tree hit-tests the position with its own item tree
-/// and hands the press to the item there, and to the items below it when that
-/// item lets it through.  The UI thread only decides *whether* to send the
-/// event, not which item answers it.
-fn send_pointer_event_to_tree(
-    adapter: Option<&Rc<dyn WindowAdapter>>,
-    kind: MouseEventKind,
-    button: PointerEventButton,
-    position: LogicalPoint,
-) -> bool {
-    let Some(adapter) = adapter else {
-        return false;
-    };
-
-    let event = i_slint_core::platform::InternalEvent::Mouse(match kind {
-        MouseEventKind::Pressed => {
-            BackendMouseEvent::Pressed { position, button, click_count: 1, touch_finger_id: 0 }
-        }
-        MouseEventKind::Released => {
-            BackendMouseEvent::Released { position, button, click_count: 1, touch_finger_id: 0 }
-        }
-    });
-    matches!(
-        adapter.window().dispatch_event_with_result(WindowEvent::internal(event)),
-        Ok(WindowEventDispatchResult::Accepted)
-    )
-}
-
-/// Hand a move to the tree, for as long as a press is held.
-///
-/// No control is named: a drag that leaves the control it started on is
-/// ordinary, and the tree is what knows which item grabbed the pointer and how
-/// far it has travelled.
-fn send_pointer_move_to_tree(
-    adapter: Option<&Rc<dyn WindowAdapter>>,
-    position: LogicalPoint,
-    finger_id: i32,
-) -> bool {
-    let Some(adapter) = adapter else {
-        return false;
-    };
-    let event = i_slint_core::platform::InternalEvent::Mouse(BackendMouseEvent::Moved {
-        position,
-        touch_finger_id: finger_id,
-    });
-    matches!(
-        adapter.window().dispatch_event_with_result(WindowEvent::internal(event)),
-        Ok(WindowEventDispatchResult::Accepted)
-    )
-}
-
-/// Hand a key to the tree that has the focus.
-///
-/// This is the whole of the render thread's part in typing. What the key means
-/// -- an insertion at the cursor, a deletion of a word, a shortcut, an
-/// `accepted` handler -- is answered by the item that has the focus, through the
-/// same code that answers it when the window has the pointer, so a `TextInput`
-/// keeps its cursor, its selection and its IME, and the application's
-/// `accepted(text) =>` runs with the value the user actually typed.
 /// Identifies the channel, so diagnostics can tell which render thread a post
 /// was meant for.
 static NEXT_CHANNEL_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -3444,6 +3123,50 @@ pub(crate) fn channel(
 ///
 /// A worker thread has no window of its own to name, so `request_redraw` means
 /// every window that a render thread draws, and that is what this is for.
+/// Click the way the user does.
+///
+/// The pointer events go through the window's own pointer processing: the
+/// application tree runs the handlers, and the drawn tree receives the state
+/// pushes -- the same journey a real click takes, from the same entry point.
+/// The diagnostic drivers and the testing surfaces click through here rather
+/// than poking a tree directly.
+pub fn click(window: &i_slint_core::api::Window, x: f32, y: f32) -> bool {
+    use i_slint_core::input::{BackendMouseEvent, PointerEventButton};
+    use i_slint_core::lengths::LogicalPoint;
+    use i_slint_core::platform::InternalEvent;
+
+    let adapter = WindowInner::from_pub(window).window_adapter();
+    // The winit adapter is the only `WindowAdapter` this backend creates, and
+    // the internal token is the downcast the backend's own vtable offers.
+    let Some(internal) = adapter.internal(i_slint_core::InternalToken) else {
+        return false;
+    };
+    let winit_adapter = internal as *const dyn WindowAdapterInternal
+        as *const crate::WinitWindowAdapter;
+    // SAFETY: the internal object of this backend's window adapter is the
+    // adapter itself; the winit backend returns `self` from `internal`.
+    let winit_adapter = unsafe { &*winit_adapter };
+    let position = LogicalPoint::new(x, y);
+    let dispatch = |event: BackendMouseEvent| {
+        winit_adapter
+            .dispatch_pointer_event_impl(InternalEvent::Mouse(event));
+    };
+    dispatch(BackendMouseEvent::Moved { position, touch_finger_id: 0 });
+    dispatch(BackendMouseEvent::Pressed {
+        position,
+        button: PointerEventButton::Left,
+        click_count: 1,
+        touch_finger_id: 0,
+    });
+    dispatch(BackendMouseEvent::Released {
+        position,
+        button: PointerEventButton::Left,
+        click_count: 1,
+        touch_finger_id: 0,
+    });
+    true
+}
+
 pub fn hosts() -> Vec<RenderHost> {
     GLOBAL_HOSTS.lock().map(|hosts| hosts.clone()).unwrap_or_default()
 }

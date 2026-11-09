@@ -24,8 +24,10 @@ pub fn main() {
         use slint::private_unstable_api::re_exports as sp;
         let clicked = std::cell::Cell::new(false);
         let removed = std::cell::Cell::new(false);
+        let weak = main_window.as_weak();
         let timer = slint::Timer::default();
         timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(700), move || {
+            let window = weak.upgrade().expect("the main window outlives the driver");
             for host in slint::render_thread::hosts() {
                 if !clicked.get() {
                     // Tick the first list row's checkbox, then its remove
@@ -45,15 +47,7 @@ pub fn main() {
                     if let Some((_, x, y, w, h)) = first {
                         let (x, y) = (x + w / 2.0, y + h / 2.0);
                         eprintln!("[driver] tick checkbox at ({x},{y})");
-                        host.press_control(
-                            sp::PointerEventButton::Left,
-                            sp::LogicalPoint::new(x, y),
-                            None,
-                        );
-                        host.release_control(
-                            sp::PointerEventButton::Left,
-                            sp::LogicalPoint::new(x, y),
-                        );
+                        slint::render_thread::click(window.window(), x, y);
                         clicked.set(true);
                     }
                 } else if clicked.get() && !removed.get() {
@@ -71,15 +65,7 @@ pub fn main() {
                     if let Some((_, x, y, w, h)) = rightmost {
                         let (x, y) = (x + w / 2.0, y + h / 2.0);
                         eprintln!("[driver] click remove at ({x},{y})");
-                        host.press_control(
-                            sp::PointerEventButton::Left,
-                            sp::LogicalPoint::new(x, y),
-                            None,
-                        );
-                        host.release_control(
-                            sp::PointerEventButton::Left,
-                            sp::LogicalPoint::new(x, y),
-                        );
+                        slint::render_thread::click(window.window(), x, y);
                         removed.set(true);
                     }
                 }

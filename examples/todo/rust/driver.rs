@@ -17,10 +17,10 @@ use std::rc::Rc;
 
 slint::include_modules!();
 
-fn click_at(host: &slint::render_thread::RenderHost, x: f32, y: f32) {
-    use sp::{LogicalPoint, PointerEventButton};
-    host.press_control(PointerEventButton::Left, LogicalPoint::new(x, y), None);
-    host.release_control(PointerEventButton::Left, LogicalPoint::new(x, y));
+fn click_at(window: &slint::Weak<MainWindow>, x: f32, y: f32) {
+    if let Some(w) = window.upgrade() {
+        slint::render_thread::click(w.window(), x, y);
+    }
 }
 
 /// Read a `Property<SharedString>` held inside a pinned item.
@@ -239,7 +239,7 @@ fn main() {
                     if let Some((id, x, y, w, h)) = header.first() {
                         let (x, y) = (x + w / 2.0, y + h / 2.0);
                         eprintln!("[driver] t={n} ONE sort click id={id} at ({x},{y})");
-                        click_at(&host, x, y);
+                        click_at(&weak, x, y);
                         phase_cell.set(1);
                     }
                 }
@@ -252,7 +252,7 @@ fn main() {
                     if let Some((id, x, y, w, h)) = rows.first() {
                         let (x, y) = (x + w / 2.0, y + h / 2.0);
                         eprintln!("[driver] t={n} row tick id={id} at ({x},{y})");
-                        click_at(&host, x, y);
+                        click_at(&weak, x, y);
                         phase_cell.set(2);
                     }
                 }
@@ -272,7 +272,7 @@ fn main() {
                     if let Some((id, x, y, w, h)) = header.get(1) {
                         let (x, y) = (x + w / 2.0, y + h / 2.0);
                         eprintln!("[driver] t={n} hide-done click id={id} at ({x},{y})");
-                        click_at(&host, x, y);
+                        click_at(&weak, x, y);
                         phase_cell.set(3);
                     }
                 }
@@ -286,11 +286,11 @@ fn main() {
                     for (id, x, y, w, h) in popup_buttons.iter().take(1) {
                         let (x, y) = (x + w / 2.0, y + h / 2.0);
                         eprintln!("[driver] t={n} popup click id={id} at ({x},{y})");
-                        click_at(&host, x, y);
+                        click_at(&weak, x, y);
                     }
                 } else if n % 30 == 15 && phase_cell.get() == 2 {
                     eprintln!("[driver] t={n} click outside popup");
-                    click_at(&host, 10.0, 30.0);
+                    click_at(&weak, 10.0, 30.0);
                 }
                 if n >= 240 {
                     eprintln!("done");
@@ -311,11 +311,11 @@ fn main() {
                 for (id, x, y, w, h) in popup_buttons.iter().take(1) {
                     let (x, y) = (x + w / 2.0, y + h / 2.0);
                     eprintln!("[driver] t={n} popup click id={id} at ({x},{y})");
-                    click_at(&host, x, y);
+                    click_at(&weak, x, y);
                 }
             } else if phase == 210 {
                 eprintln!("[driver] t={n} click outside popup");
-                click_at(&host, 10.0, 30.0);
+                click_at(&weak, 10.0, 30.0);
             } else if n % 6 == 0 {
                 // Click the "Sort by name" checkbox: the leftmost press
                 // target in the header band.
@@ -324,7 +324,7 @@ fn main() {
                 header.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
                 if let Some((_, x, y, w, h)) = header.first() {
                     let (x, y) = (x + w / 2.0, y + h / 2.0);
-                    click_at(&host, x, y);
+                    click_at(&weak, x, y);
                 }
             } else if n % 6 == 3 {
                 // Click a list row, rotating through them.
@@ -334,7 +334,7 @@ fn main() {
                 if !rows.is_empty() {
                     let (_, x, y, w, h) = rows[n as usize % rows.len()];
                     let (x, y) = (x + w / 2.0, y + h / 2.0);
-                    click_at(&host, x, y);
+                    click_at(&weak, x, y);
                 }
             }
         }
