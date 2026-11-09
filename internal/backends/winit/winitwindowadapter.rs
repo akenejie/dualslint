@@ -482,6 +482,10 @@ pub struct WinitWindowAdapter {
     /// business, so the UI thread keeps this to know whether it owes the
     /// platform a change when the focus moves.
     render_ime_focused: Cell<Option<u64>>,
+    /// The viewport offset last pushed for a pressed scrollable, so a drag
+    /// that did not move pushes nothing.
+    pushed_viewport:
+        RefCell<Option<(u64, corelib::lengths::LogicalLength, corelib::lengths::LogicalLength)>>,
     /// The text-editing state last pushed to the drawing tree, so a key that
     /// changed nothing pushes nothing.
     ///
@@ -504,13 +508,14 @@ pub struct WinitWindowAdapter {
 
 /// What the UI thread resolved a pointer event to be.
 ///
-/// The button is carried along because the release has to end the press it
-/// began, and naming it on both is cheaper than remembering it separately.
+/// The press and the release carry the button: the drawn tree's state push
+/// is the same for any button, and the application tree's processing takes
+/// the position, which arrives with the event.
 #[derive(Clone, Copy)]
 enum PointerAction {
-    Moved { finger_id: i32 },
+    Moved,
     Pressed(PointerEventButton),
-    Released(PointerEventButton),
+    Released(#[expect(dead_code)] PointerEventButton),
 }
 
 impl WinitWindowAdapter {
@@ -565,6 +570,7 @@ impl WinitWindowAdapter {
             render_focused: Default::default(),
             render_ime_focused: Default::default(),
             pushed_text_state: Default::default(),
+            pushed_viewport: Default::default(),
             render_pressed_button: Default::default(),
             current_resize_direction: Default::default(),
             #[cfg(target_os = "ios")]
@@ -1505,14 +1511,32 @@ impl WinitWindowAdapter {
         event: impl Into<corelib::platform::InternalEvent>,
     ) -> bool {
         let event = event.into();
-        if !self.render_owns_controls()
-            || !self
-                .render_host()
-                .is_some_and(|host| self.apply_pointer_to_render_controls(&host, &event))
-        {
+        if !self.render_owns_controls() {
             self.dispatch_internal_event(event);
             return false;
         }
+        let Some(host) = self.render_host() else {
+            self.dispatch_internal_event(event);
+            return false;
+        };
+        // The drawn tree is told the pointer's effect on what it draws -- the
+        // hover, the pressed state -- decided from the geometry it published.
+        // What the pointer MEANS, the handlers it runs, is the application
+        // tree's to execute, which happens after; what the drawn tree needs of
+        // that execution arrives as the state pushes that follow.
+        self.apply_pointer_to_render_controls(&host, &event);
+        // The application tree processes the pointer: the grabs, the click
+        // counts, the handlers. Its repeater rows are materialized on demand,
+        // which a walk without this would miss.
+        if let Some(window_inner) = Some(WindowInner::from_pub(self.window())) {
+            crate::render_thread::ensure_item_tree_instantiated_for_window(&window_inner);
+        }
+        self.dispatch_internal_event(event.clone());
+        // The pointer moves what the drawn tree draws: the text cursor a click
+        // placed, the viewport a drag panned. The values are read off this
+        // tree, where the pointer just worked, and pushed as state.
+        self.push_text_state();
+        self.push_scroll_state(&host);
         true
     }
 
@@ -1528,8 +1552,8 @@ impl WinitWindowAdapter {
         // spellings of that, so they are named here once and the rest of the
         // function never has to know which device it came from.
         let (position, action) = match event {
-            Ev::Mouse(BackendMouseEvent::Moved { position, touch_finger_id }) => {
-                (*position, PointerAction::Moved { finger_id: *touch_finger_id })
+            Ev::Mouse(BackendMouseEvent::Moved { position, .. }) => {
+                (*position, PointerAction::Moved)
             }
             Ev::Mouse(BackendMouseEvent::Pressed { position, button, .. }) => {
                 (*position, PointerAction::Pressed(*button))
@@ -1551,33 +1575,25 @@ impl WinitWindowAdapter {
                 // nothing is held. The tree is told where the pointer last was, so
                 // that whatever it grabbed ends rather than waiting for a release
                 // that is not coming.
-                if let (Some(pressed), Some(button)) =
-                    (self.render_pressed.replace(None), self.render_pressed_button.take())
-                {
-                    host.release_control(button, self.cursor_pos.get());
+                if let Some(pressed) = self.render_pressed.replace(None) {
                     host.apply_control_state(pressed, false, false);
                 }
                 self.set_render_hover(host, None);
                 self.set_render_pressed(host, None);
                 return true;
             }
-            Ev::Touch { id, position, phase } => match phase {
+            Ev::Touch { position, phase, .. } => match phase {
                 corelib::input::TouchPhase::Started => {
                     (*position, PointerAction::Pressed(PointerEventButton::Left))
                 }
-                corelib::input::TouchPhase::Moved => {
-                    (*position, PointerAction::Moved { finger_id: *id })
-                }
+                corelib::input::TouchPhase::Moved => (*position, PointerAction::Moved),
                 corelib::input::TouchPhase::Ended => {
                     (*position, PointerAction::Released(PointerEventButton::Left))
                 }
                 corelib::input::TouchPhase::Cancelled => {
                     // A cancelled gesture never had a click in it, and the finger
                     // is gone without a release, so the tree's hold ends here.
-                    if let (Some(pressed), Some(button)) =
-                        (self.render_pressed.replace(None), self.render_pressed_button.take())
-                    {
-                        host.release_control(button, *position);
+                    if let Some(pressed) = self.render_pressed.replace(None) {
                         host.apply_control_state(pressed, false, false);
                     }
                     self.set_render_pressed(host, None);
@@ -1610,32 +1626,17 @@ impl WinitWindowAdapter {
                     // a control that takes none does.
                     return true;
                 };
-                if !press_target.pointer_reacts {
-                    // The compiler found that no pointer event here reaches the
-                    // screen; sending one would make the tree run through the
-                    // application's handlers for an answer that cannot change a
-                    // pixel.  A press already being held is left alone: it is
-                    // another finger's, and its release still has to arrive.
-                    return true;
-                }
                 if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
                     std::eprintln!("[input] press target {:?}", press_target.id);
                 }
                 self.set_render_pressed(host, Some(press_target.id));
                 self.render_pressed_button.set(Some(button));
-                // The press is the grab and the focus, and nothing else: whether
-                // the release that follows lands here is what makes a click.
-                // The press travels with the focus this thread already had: a
-                // control whose focus state draws nothing never got it in the
-                // tree, so the tree cannot answer `has-focus` for it, and the
-                // press is where that question is asked. It goes first so the
-                // tree dispatches it before the focus moves, which is what keeps
-                // a `FocusScope` from accepting the press differently just
-                // because it now has the focus.
-                host.press_control(button, position, self.render_focused.get());
-                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
-                    std::eprintln!("[input] press sent");
-                }
+                // The drawn tree is told the pressed state above; the press
+                // itself -- the grab, the click count, the handler -- is the
+                // application tree's to process, which happens after this
+                // match. The pointer_reacts gate above no longer decides
+                // whether an event is sent; it decided that for a tree that
+                // no longer receives one.
                 if press_target.focus_on_click {
                     // The focus opens the editing session: this tree's focus
                     // follows, the drawing tree's state is read back once, and
@@ -1652,26 +1653,23 @@ impl WinitWindowAdapter {
                     self.pull_text_state(host, press_target.id);
                 }
             }
-            PointerAction::Moved { finger_id } => {
+            PointerAction::Moved => {
                 self.set_render_hover(host, target);
-                // A move while a button is down is a drag, and a drag is the one
-                // thing a hover cannot express: the tree needs the sequence of
-                // points to measure. So while the press holds, the moves go to
-                // the tree as moves, and the tree's own grab decides which item
-                // keeps them -- a `Flickable` follows the pointer past its own
-                // edge, and a slider follows it along its track.
-                if self.render_pressed.get().is_some() {
-                    host.move_control(position, finger_id);
-                }
+                // A move while a button is down is a drag.  The drag's meaning
+                // -- the slider's track, the `Flickable`'s pan -- is processed
+                // by the application tree below, and what the drawn tree needs
+                // of it (the viewport, the knob) arrives as state pushes.
             }
-            PointerAction::Released(button) => {
+            PointerAction::Released(_) => {
                 // The release ends the hold on whichever control held it.  A
                 // release that ends it on the same control is a click, and what
                 // the click is worth is the tree's to decide, because that is
                 // the application's own code.
                 if let Some(pressed) = self.render_pressed.replace(None) {
                     self.render_pressed_button.set(None);
-                    host.release_control(button, position);
+                    // The drawn tree is told the released state; the release's
+                    // meaning -- whether it was a click, and what the click is
+                    // worth -- is the application tree's, processed below.
                     host.apply_control_state(
                         pressed,
                         self.render_hovered.get() == Some(pressed),
@@ -1696,12 +1694,19 @@ impl WinitWindowAdapter {
         host: &crate::render_thread::RenderHost,
         position: corelib::lengths::LogicalPoint,
     ) -> Option<i_slint_backend_scene::PressTarget> {
-        host.press_target_at(
+        let found = host.press_target_at(
             position.x,
             position.y,
             host.focused_control(),
             self.render_focused.get(),
-        )
+        );
+        if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+            let count = host.press_targets().len();
+            std::eprintln!(
+                "[input] press target at {position:?}: {found:?} (published targets: {count})"
+            );
+        }
+        found
     }
 
     /// Bring this thread's record of the render-side focus in step with what
@@ -1914,6 +1919,33 @@ impl WinitWindowAdapter {
             }
         }
         *self.pushed_text_state.borrow_mut() = Some(state);
+    }
+
+    /// Push the viewport of the pressed scrollable, if it moved.
+    ///
+    /// The drag that pans a scrollable is processed on this tree, and the
+    /// scroll position is what the drawn tree holds sovereignty over: the
+    /// drawn copy is told the offset the drag reached. Nothing is pushed when
+    /// nothing moved, which is almost every event.
+    fn push_scroll_state(&self, host: &crate::render_thread::RenderHost) {
+        let Some(id) = self.render_pressed.get() else { return };
+        let Some(item) = self.ui_tree_item(id) else { return };
+        let Some(flickable) = item.downcast::<i_slint_core::items::Flickable>() else {
+            return;
+        };
+        let flickable = flickable.as_pin_ref();
+        let x =
+            i_slint_core::items::Flickable::FIELD_OFFSETS.content_x().apply_pin(flickable).get();
+        let y =
+            i_slint_core::items::Flickable::FIELD_OFFSETS.content_y().apply_pin(flickable).get();
+        {
+            let last = self.pushed_viewport.borrow();
+            if last.as_ref() == Some(&(id, x, y)) {
+                return;
+            }
+        }
+        host.set_viewport_offset(id, x, y);
+        *self.pushed_viewport.borrow_mut() = Some((id, x, y));
     }
 
     /// The item the id names, on the tree this thread owns.
@@ -2373,6 +2405,15 @@ impl WinitWindowAdapter {
                 ));
                 let position = position.to_logical(runtime_window.scale_factor() as f64);
                 let cursor_pos = euclid::point2(position.x, position.y);
+                if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
+                    std::eprintln!(
+                        "[input] cursor moved: raw_event={:?} logical={:?} inner={:?} outer={:?}",
+                        position,
+                        cursor_pos,
+                        winit_window.inner_position().ok(),
+                        winit_window.outer_position().ok(),
+                    );
+                }
                 self.cursor_pos.set(cursor_pos);
                 // winit sends this event at a very high frequency, so coalesce the moves.
                 self.shared_backend_data.buffer_mouse_move(&self.self_weak, cursor_pos);

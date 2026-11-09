@@ -4350,11 +4350,11 @@ fn property_set_value_tokens(
     // and the drawn tree is where the value becomes pixels.  A write from the
     // drawn tree itself carries nothing: the guard in the carry sees the
     // caller's tree as the one on screen and stops there.
-    if ctx.generator_state.in_callback_body
-        && !matches!(
-            property_ownership_of(property, ctx),
-            crate::object_tree::PropertyOwnership::Ui
-        )
+    let in_callback = ctx.generator_state.in_callback_body;
+    let ui_owned =
+        matches!(property_ownership_of(property, ctx), crate::object_tree::PropertyOwnership::Ui);
+    if in_callback
+        && !ui_owned
         && let Some(carry) = handler_write_carry_tokens(property, &set, ctx)
     {
         return carry;
@@ -4416,10 +4416,10 @@ fn handler_write_carry_tokens(
     if matches!(ctx.generator_state.call_target, CallTarget::OwnTree) {
         return None;
     }
-    let llr::MemberReference::Relative { parent_level: 0, local_reference } = property else {
-        // A write that names a parent component or a global: the parents are
-        // reachable from the resolved item's own parent chain, and the
-        // globals have their own carries; both are later work.
+    let llr::MemberReference::Relative { local_reference, .. } = property else {
+        // A write to a global: the globals have their own carries through
+        // their public accessors, and a handler write to one is a call to
+        // that accessor already.
         return None;
     };
     if matches!(
@@ -4428,10 +4428,18 @@ fn handler_write_carry_tokens(
     ) {
         return None;
     }
+    // The access tokens are written against the handler's own scope: the
+    // sub-component the item the callback hangs on belongs to.  Resolving
+    // that item on the drawn tree by its stable id re-binds `_self` to the
+    // matching instance there, and every token -- the field walks, the parent
+    // chains a `root.` write climbs -- runs against the same structure the
+    // drawn tree has, because the two trees are the same structure.
     let inner_component = ctx.parent_sub_component_idx(0)?;
-    let inner_component_id = inner_component_id(&ctx.compilation_unit.sub_components[inner_component]);
+    let inner_component_id =
+        inner_component_id(&ctx.compilation_unit.sub_components[inner_component]);
     let global_access = &ctx.generator_state.global_access;
     Some(quote!({
+        eprintln!("[carry-gen] handler write carries (item resolved on the drawn tree)");
         let forwarded_item = self_rc.stable_id();
         let forwarded = #set;
         match #global_access.window_adapter_ref() {

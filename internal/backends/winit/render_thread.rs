@@ -351,6 +351,18 @@ pub enum RenderMessage {
     /// that moment is this thread's to present.  The reply says the present
     /// is done, so the mapping thread does not return before the frame is in
     /// the window's buffer.
+    /// The application tree's pointer processing panned a scrollable, and the
+    /// drawn copy is told where its viewport stands now.
+    SetViewportOffset {
+        /// The control the scrollable was published as.
+        id: u64,
+        /// The viewport's x offset.
+        x: i_slint_core::lengths::LogicalLength,
+        /// The viewport's y offset.
+        y: i_slint_core::lengths::LogicalLength,
+    },
+    /// The window was mapped a second time or re-mapped; the frame the screen
+    /// shows at that moment is presented before the reply.
     WindowMapped {
         /// Reply channel: the present completed.
         response: std::sync::mpsc::SyncSender<()>,
@@ -1384,6 +1396,20 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::RedrawOnce);
     }
 
+    /// Push the content offset of a pressed scrollable to the drawn copy.
+    ///
+    /// The drag is processed on the application's tree; the scroll position is
+    /// what the drawn tree holds sovereignty over, and this is the state it is
+    /// told.
+    pub fn set_viewport_offset(
+        &self,
+        id: u64,
+        x: i_slint_core::lengths::LogicalLength,
+        y: i_slint_core::lengths::LogicalLength,
+    ) {
+        let _ = self.sender.send(RenderMessage::SetViewportOffset { id, x, y });
+    }
+
     /// Present the frame for the window that was just mapped, and wait for it.
     ///
     /// The map and this present are the show moment: the frame the compositor
@@ -2009,6 +2035,33 @@ impl RenderCore {
                     }
                     RenderMessage::SetFontCollection(collection) => {
                         self.font_collection = Some(collection);
+                    }
+                    RenderMessage::SetViewportOffset { id, x, y } => {
+                        let changed = render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                            let flickable = item_rc.downcast::<i_slint_core::items::Flickable>()?;
+                            let item = flickable.as_pin_ref();
+                            let current_x = i_slint_core::items::Flickable::FIELD_OFFSETS
+                                .content_x()
+                                .apply_pin(item)
+                                .get();
+                            let current_y = i_slint_core::items::Flickable::FIELD_OFFSETS
+                                .content_y()
+                                .apply_pin(item)
+                                .get();
+                            if current_x == x && current_y == y {
+                                return Some(false);
+                            }
+                            i_slint_core::items::Flickable::FIELD_OFFSETS
+                                .content_x()
+                                .apply_pin(item)
+                                .set(x);
+                            i_slint_core::items::Flickable::FIELD_OFFSETS
+                                .content_y()
+                                .apply_pin(item)
+                                .set(y);
+                            Some(true)
+                        });
+                        present |= changed.unwrap_or(false);
                     }
                     RenderMessage::WindowMapped { response } => {
                         // The frame the screen sees at the show moment is the
@@ -3426,6 +3479,19 @@ pub(crate) fn set_active_host(host: &RenderHost) {
 /// The font data the UI thread's context scanned, handed to the mirror's
 /// context so the second context shares the collection instead of re-scanning.
 pub use i_slint_core::textlayout::sharedparley::SharedFontData;
+
+/// Materialize the repeater rows a window's tree describes, for a caller on
+/// the UI thread that is about to walk the tree -- the pointer's hit-test, a
+/// handler's item lookups. A tree whose drawing was handed over leaves the
+/// rows undone until something reads them; this is the something.
+pub fn ensure_item_tree_instantiated_for_window(window_inner: &WindowInner) {
+    for _ in 0..10u32 {
+        let Some(component) = window_inner.try_component() else { return };
+        if !i_slint_core::item_tree::ensure_item_tree_instantiated(&component) {
+            return;
+        }
+    }
+}
 
 pub(crate) fn create_host(
     event_loop_proxy: &winit::event_loop::EventLoopProxy<crate::SlintEvent>,
