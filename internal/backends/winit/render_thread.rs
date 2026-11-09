@@ -367,9 +367,6 @@ pub enum RenderMessage {
         /// Reply channel: the present completed.
         response: std::sync::mpsc::SyncSender<()>,
     },
-    /// One more frame the next time the loop draws: the drawing tree owes the
-    /// screen a frame that no particular message carries.
-    RedrawOnce,
     /// Instantiate the app's component on the render thread.  `factory` runs on
     /// the render thread (it must call the component's `new()` *there*, since
     /// ItemTree/Property are single-threaded) and returns the component's
@@ -1223,23 +1220,11 @@ impl RenderHost {
         self.coords.lock().unwrap().focus_order()
     }
 
-    /// Send an arbitrary closure to execute on the render thread.
-    pub fn send_user(&self, f: impl FnOnce() + Send + 'static) {
-        let _ = self.sender.send(RenderMessage::User(Box::new(f)));
-    }
-
     /// Ask the render thread to signal `tx` once its first frame for the
     /// attached component has been presented.  The UI thread maps the window
     /// on that signal, so the window never shows the compositor's nothing.
     pub fn notify_first_present(&self, tx: std::sync::mpsc::Sender<()>) {
         let _ = self.sender.send(RenderMessage::NotifyFirstPresent(tx));
-    }
-
-    /// Ask for one more frame.  The UI thread calls this right after mapping
-    /// the window: the frame presented before the map went into an unmapped
-    /// window, and a swap into an unmapped window does not reach the screen.
-    pub fn redraw_once(&self) {
-        let _ = self.sender.send(RenderMessage::RedrawOnce);
     }
 
     /// Push the content offset of a pressed scrollable to the drawn copy.
@@ -1918,9 +1903,6 @@ impl RenderCore {
                         self.window_mapped_notify = Some(response);
                         map_settle = Some((std::time::Instant::now(), false));
                         present = true;
-                    }
-                    RenderMessage::RedrawOnce => {
-                        frame_request.set(true);
                     }
                     // A mirror needs a GL context to present into, so it exists
                     // only on the GPU renderers; the software build keeps replaying
@@ -3167,6 +3149,8 @@ pub fn click(window: &i_slint_core::api::Window, x: f32, y: f32) -> bool {
     true
 }
 
+/// Every render thread of this process, for the APIs that are not about one
+/// window.
 pub fn hosts() -> Vec<RenderHost> {
     GLOBAL_HOSTS.lock().map(|hosts| hosts.clone()).unwrap_or_default()
 }
