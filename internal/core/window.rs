@@ -593,6 +593,17 @@ pub enum PopupWindowLocation {
     ChildWindow(LogicalPoint),
 }
 
+impl core::fmt::Debug for PopupWindowLocation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PopupWindowLocation::TopLevel(_) => f.write_str("TopLevel(..)"),
+            PopupWindowLocation::ChildWindow(point) => {
+                write!(f, "ChildWindow({point:?})")
+            }
+        }
+    }
+}
+
 /// This structure defines a graphical element that is designed to pop up from the surrounding
 /// UI content, for example to show a context menu.
 pub struct PopupWindow {
@@ -1186,6 +1197,12 @@ impl WindowInner {
                     let mouse_inside_popup = event
                         .position()
                         .is_none_or(|pos| geom.contains(pos - coordinates.to_vector()));
+                    if std::env::var_os("SLINT_POPUP_PROBE").is_some() {
+                        std::eprintln!(
+                            "[popup-walk] popup{idx} at {coordinates:?} inside={mouse_inside_popup} pos={:?}",
+                            event.position()
+                        );
+                    }
                     if mouse_inside_popup {
                         item_tree = Some(popup.component.clone());
                         offset = *coordinates;

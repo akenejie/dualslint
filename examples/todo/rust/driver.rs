@@ -174,9 +174,14 @@ fn main() {
         // Report what the UI-side model holds.
         let model = window.get_todo_model();
         let titles: Vec<String> = (0..model.row_count())
-            .filter_map(|i| model.row_data(i).map(|t| t.title.to_string()))
+            .filter_map(|i| model.row_data(i).map(|t| format!("{}:{}", t.checked, t.title)))
             .collect();
-        eprintln!("[ui] t={n} model({}): {titles:?}", titles.len());
+        eprintln!(
+            "[ui] t={n} sort={} hide={} model({}): {titles:?}",
+            window.get_is_sort_by_name(),
+            window.get_hide_done_items(),
+            titles.len()
+        );
 
         for host in slint::render_thread::hosts() {
             // Ask the render thread what it actually draws. Posted, not

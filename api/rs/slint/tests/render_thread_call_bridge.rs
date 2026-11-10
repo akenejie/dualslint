@@ -295,8 +295,12 @@ fn a_call_reaches_the_tree_the_window_shows() {
 
     // Nothing has taken the window over, so the call lands on the application's
     // own tree -- which is also what says the call goes through the hook at all.
+    // The two extra posts are the handler's own writes carrying: the body sets
+    // `count` and `note`, both portable, and each write posts a copy to the
+    // tree on screen even before one exists -- the guard in the carry runs the
+    // task against that same tree and leaves it as it is.
     app.invoke_add(2, SharedString::from("before the handover"));
-    assert_eq!(adapter.calls.get(), 1, "the call went through the hook");
+    assert_eq!(adapter.calls.get(), 3, "the call went through the hook, its writes with it");
     assert_eq!(
         (app.get_count(), app.get_note().as_str()),
         (3, "before the handover"),
@@ -360,19 +364,19 @@ fn a_call_that_cannot_travel_stays_with_the_caller() {
     // A struct is not `Send` as far as the bridge is concerned, so a call that
     // carries one stays on the tree the caller holds. That is a limitation, not
     // a decision about which tree is right: the window shows the other tree, and
-    // this call does not reach it. Until a struct of basic fields counts as
-    // portable, that is what a caller has to expect of one. What the application
-    // reads afterwards is the tree the window draws, which the call left alone.
+    // the call itself does not reach it. What the handler *wrote* is another
+    // matter: `count` and `note` are plain values, and a handler's writes to
+    // those carry, so the drawn tree shows what the call did to them.
     app.invoke_set_struct(Pt { x: 7 });
     assert_eq!(
         (mirror.get_count(), mirror.get_note().as_str()),
-        (1, ""),
-        "and did not reach the tree that is drawn"
+        (7, "struct"),
+        "the writes the call made carried, though the call itself stayed"
     );
     assert_eq!(
         (app.get_count(), app.get_note().as_str()),
-        (1, ""),
-        "so what the application reads is the tree the window draws, not the one the call wrote"
+        (7, "struct"),
+        "so what the application reads agrees with what the window draws"
     );
 
     // The value comes back from the tree that ran the call, whichever that was.

@@ -40,17 +40,19 @@ use std::str::FromStr;
 struct RustGeneratorContext {
     /// Path to the SharedGlobals structure that contains the global and the WindowAdapter
     global_access: TokenStream,
-    /// How a call from this context reaches the tree that is drawn.  A write
-    /// to a property the drawing thread owns, made from code that runs on the
-    /// application's tree, carries through this target: the value the handler
-    /// assigned has to reach the copy whose bindings decide the screen.
-    call_target: CallTarget,
     /// Whether the code being compiled is a handler body: code the
     /// application's tree runs in response to input.  Writes in a handler
     /// carry to the drawn tree when the property belongs to the drawing
     /// side; binding code does not, because each tree evaluates its own
     /// bindings and the drawing side's are the ones that decide the screen.
     in_callback_body: bool,
+    /// Whether a handler write from the code being compiled has a drawn tree
+    /// to carry to.  Every component of a window-rooted unit does -- the
+    /// widgets a window embeds and the rows its repeaters instantiate write
+    /// the same drawn copy their window's own handlers do.  A popup tree
+    /// lives on the drawing side alone and has no application copy to carry
+    /// from; a tray icon has no drawn tree at all.
+    carries_handler_writes: bool,
 }
 
 type EvaluationContext<'a> = llr_EvaluationContext<'a, RustGeneratorContext>;
@@ -233,7 +235,16 @@ pub fn generate(
     let sub_compos = llr
         .used_sub_components
         .iter()
-        .map(|sub_compo| generate_sub_component(*sub_compo, &llr, None, None, false))
+        .map(|sub_compo| {
+            generate_sub_component(
+                *sub_compo,
+                &llr,
+                None,
+                None,
+                false,
+                unit_carries_handler_writes(&llr, false),
+            )
+        })
         .collect::<Vec<_>>();
     let focus_affects_rendering = doc.focus_affects_rendering.get().unwrap_or(true);
     let ime_affects_rendering = doc.ime_affects_rendering.get().unwrap_or(true);
@@ -405,8 +416,8 @@ fn generate_public_component(
         current_scope: EvaluationScope::SubComponent(llr.item_tree.root, None),
         generator_state: RustGeneratorContext {
             global_access: quote!(_self.globals()),
-            call_target: call_target.clone(),
             in_callback_body: false,
+            carries_handler_writes: true,
         },
         argument_types: &[],
     };
@@ -929,8 +940,8 @@ fn generate_struct(the_struct: &Struct, unit: &llr::CompilationUnit) -> TokenStr
             unit,
             RustGeneratorContext {
                 global_access: quote!(compile_error!("no global access in a constant expression")),
-                call_target: CallTarget::OwnTree,
                 in_callback_body: false,
+                carries_handler_writes: false,
             },
         );
         let (field_names, field_values): (Vec<_>, Vec<_>) = the_struct
@@ -2084,7 +2095,12 @@ fn public_api(
                                 move |row, data| {
                                     let _ = weak.upgrade_in_event_loop(move |handle| {
                                         #write_back_self
-                                        #prop_access.get().set_row_data(row, data);
+                                        // The model may have shrunk since the row
+                                        // was edited on the drawn tree; a write
+                                        // past its end has nothing to land on.
+                                        if row < #prop_access.get().row_count() {
+                                            #prop_access.get().set_row_data(row, data);
+                                        }
                                     });
                                 }
                             };
@@ -2251,12 +2267,27 @@ fn emit_in_chunks(
 }
 
 /// Generate the rust code for the given component.
+/// Whether handler writes from a unit's components carry to the drawn tree.
+///
+/// A window-rooted unit does: the window handed its drawing over, and every
+/// component it embeds -- the widgets, the repeater rows -- writes the same
+/// drawn copy its own handlers do.  A popup tree exists on the drawing side
+/// alone, and a tray icon has no drawn tree to carry to.
+fn unit_carries_handler_writes(root: &llr::CompilationUnit, is_popup: bool) -> bool {
+    !is_popup
+        && root
+            .public_components
+            .iter()
+            .any(|c| matches!(c.top_level_type, llr::TopLevelComponentType::Window))
+}
+
 fn generate_sub_component(
     component_idx: llr::SubComponentIdx,
     root: &llr::CompilationUnit,
     parent_ctx: Option<&ParentScope>,
     index_property: Option<llr::PropertyIdx>,
     pinned_drop: bool,
+    carries_handler_writes: bool,
 ) -> TokenStream {
     let component = &root.sub_components[component_idx];
     let inner_component_id = inner_component_id(component);
@@ -2266,8 +2297,8 @@ fn generate_sub_component(
         component_idx,
         RustGeneratorContext {
             global_access: quote!(_self.globals()),
-            call_target: CallTarget::OwnTree,
             in_callback_body: false,
+            carries_handler_writes,
         },
         parent_ctx,
     );
@@ -3111,8 +3142,8 @@ fn generate_global(
         global_idx,
         RustGeneratorContext {
             global_access: quote!(_self.globals()),
-            call_target: CallTarget::OwnTree,
             in_callback_body: false,
+            carries_handler_writes: false,
         },
     );
 
@@ -3324,6 +3355,7 @@ fn generate_item_tree(
         parent_ctx,
         index_property,
         needs_window_adapter,
+        unit_carries_handler_writes(root, is_popup),
     );
     let inner_component_id = self::inner_component_id(&root.sub_components[sub_tree.root]);
     let parent_component_type = parent_ctx
@@ -3669,8 +3701,8 @@ fn generate_item_tree(
             sub_tree.root,
             RustGeneratorContext {
                 global_access: quote!(_self.globals.get().unwrap()),
-                call_target: CallTarget::OwnTree,
                 in_callback_body: false,
+                carries_handler_writes: false,
             },
             parent_ctx,
         );
@@ -3892,8 +3924,8 @@ fn generate_repeated_component(
         current_scope: EvaluationScope::SubComponent(repeated.sub_tree.root, Some(parent_ctx)),
         generator_state: RustGeneratorContext {
             global_access: quote!(_self.globals()),
-            call_target: CallTarget::OwnTree,
             in_callback_body: false,
+            carries_handler_writes: unit_carries_handler_writes(unit, false),
         },
         argument_types: &[],
     };
@@ -4274,8 +4306,8 @@ fn generate_repeated_component(
             repeated.sub_tree.root,
             RustGeneratorContext {
                 global_access: quote!(_self.globals.get().unwrap()),
-                call_target: CallTarget::OwnTree,
                 in_callback_body: false,
+                carries_handler_writes: false,
             },
             Some(parent_ctx),
         );
@@ -4357,9 +4389,11 @@ fn property_set_value_tokens(
     let in_callback = ctx.generator_state.in_callback_body;
     let ui_owned =
         matches!(property_ownership_of(property, ctx), crate::object_tree::PropertyOwnership::Ui);
+    // The value itself travels in the carry, so a type the thread refuses to
+    // move -- a model, an image -- keeps its write where the handler ran.
     if in_callback
         && !ui_owned
-        && let Some(carry) = handler_write_carry_tokens(property, &set, ctx)
+        && let Some(carry) = handler_write_carry_tokens(property, &value_tokens, &set, ctx)
     {
         return carry;
     }
@@ -4406,21 +4440,28 @@ fn property_ownership_of(
 
 /// The write, plus the copy of it that runs against the drawn tree.
 ///
-/// The item the value belongs to is found on the drawn tree by the stable id
-/// the handler's own item carries: the two trees are the same structure, so
-/// the same id names the same item on both sides.  The access tokens then run
-/// with `_self` re-bound to that item's enclosing component, which is what
-/// the tokens were written against.
+/// The handler's tokens run against the component instance the callback hangs
+/// on, which the closure holds as a `VRcMapped`: a projection of the item tree
+/// the component is embedded in.  The two trees are the same struct, so the
+/// copy of that component sits at the same byte offset in the drawn tree: the
+/// offset is measured here, where both addresses are live, and the drawn copy
+/// of the embedding tree is found by the stable id of its root item.  The
+/// value travels with the task, so the write lands twice on the same number.
 fn handler_write_carry_tokens(
     property: &llr::MemberReference,
-    set: &TokenStream,
+    value_tokens: &TokenStream,
+    set_tokens: &TokenStream,
     ctx: &EvaluationContext,
 ) -> Option<TokenStream> {
-    // A component with no drawn tree of its own has nothing to carry to.
-    if matches!(ctx.generator_state.call_target, CallTarget::OwnTree) {
+    // A component with no drawn tree of its own has nothing to carry to: a
+    // popup tree lives on the drawing side alone, a tray icon draws nothing.
+    // The flag covers every component of a window-rooted unit, not just the
+    // window's own scope -- the widgets it embeds and the rows its repeaters
+    // instantiate write the drawn copy all the same.
+    if !ctx.generator_state.carries_handler_writes {
         return None;
     }
-    let llr::MemberReference::Relative { local_reference, .. } = property else {
+    let llr::MemberReference::Relative { parent_level, local_reference } = property else {
         // A write to a global: the globals have their own carries through
         // their public accessors, and a handler write to one is a call to
         // that accessor already.
@@ -4432,20 +4473,62 @@ fn handler_write_carry_tokens(
     ) {
         return None;
     }
-    // The access tokens are written against the handler's own scope: the
-    // sub-component the item the callback hangs on belongs to.  Resolving
-    // that item on the drawn tree by its stable id re-binds `_self` to the
-    // matching instance there, and every token -- the field walks, the parent
-    // chains a `root.` write climbs -- runs against the same structure the
-    // drawn tree has, because the two trees are the same structure.
-    let inner_component = ctx.parent_sub_component_idx(0)?;
-    let inner_component_id =
-        inner_component_id(&ctx.compilation_unit.sub_components[inner_component]);
     let global_access = &ctx.generator_state.global_access;
+    // The component the write's tokens run against: the handler's own.  The
+    // drawn copy of it is what the posted task re-binds `_self` to.
+    let inner_component = ctx.parent_sub_component_idx(0)?;
+    let inner_component_id_tokens =
+        inner_component_id(&ctx.compilation_unit.sub_components[inner_component]);
+    // A write the handler's own component answers is carried as the value
+    // itself, so the drawn copy lands on exactly the number the handler
+    // computed.  A write that climbs to a parent -- the clear icon emptying
+    // the line edit's text, say -- carries as the whole statement re-run
+    // against the drawn copy, whose parent walk reaches the drawn parent the
+    // same way; the value expression then reads the drawn state, which the
+    // carries keep equal to what this state was when the handler ran.
+    let (app_write, posted_write) =
+        if *parent_level == 0 && crate::llr::is_thread_portable_type(&ctx.property_ty(property)) {
+            let prop = access_member(property, ctx).unwrap();
+            (
+                quote! {
+                    let forwarded_value = #value_tokens;
+                    #prop.set(forwarded_value.clone() as _);
+                },
+                quote!(#prop.set(forwarded_value as _);),
+            )
+        } else {
+            (quote!(#set_tokens;), quote!(#set_tokens;))
+        };
+    // The re-run form evaluates the value expression again, and an expression
+    // may read the event's arguments -- the position a click reported.  The
+    // arguments travel with the task under the name the tokens use.
+    let arg_inits = (0..ctx.argument_types.len())
+        .map(|i| proc_macro2::Literal::usize_unsuffixed(i))
+        .map(|i| quote!(args.#i.clone(),))
+        .collect::<Vec<_>>();
+    let app_args = quote!(#[allow(unused_variables)]
+        let forwarded_args = (#(#arg_inits)*););
+    let posted_args = quote!(#[allow(unused_variables)]
+        let args = forwarded_args;);
     Some(quote!({
-        eprintln!("[carry-gen] handler write carries (item resolved on the drawn tree)");
-        let forwarded_item = self_rc.stable_id();
-        let forwarded = #set;
+        #app_write
+        // The tree this component is embedded in, and where it sits in it:
+        // the drawn tree answers the same root-item id and holds the copy at
+        // the same offset.  The handler is a plain function pointer, so this
+        // reads the component's own weak back to its projection instead of
+        // capturing the handle.
+        let forwarded_self = _self.self_weak.get().unwrap().upgrade().unwrap();
+        let forwarded_origin = sp::VRcMapped::origin(&forwarded_self);
+        let forwarded_item = sp::ItemRc::new(forwarded_origin.clone(), 0).stable_id();
+        let forwarded_offset = {
+            let origin_addr = sp::VRef::as_ptr(::core::pin::Pin::into_inner(
+                sp::VRc::borrow_pin(&forwarded_origin),
+            ))
+            .as_ptr() as usize;
+            let self_addr = (&*_self) as *const _ as usize;
+            self_addr - origin_addr
+        };
+        #app_args
         match #global_access.window_adapter_ref() {
             Ok(window_adapter) => {
                 let Some(local_tree) = #global_access.root_item_tree_weak.upgrade() else {
@@ -4457,15 +4540,19 @@ fn handler_write_carry_tokens(
                     if tree_identity == local_identity {
                         return;
                     }
-                    let Some(item) = sp::find_item_by_stable_id(&tree, forwarded_item) else {
-                        return;
-                    };
-                    let component = sp::VRc::map_dyn(item.item_tree().clone(), |tree| {
-                        sp::VRef::downcast_pin::<#inner_component_id>(tree)
-                            .expect("the item's tree is not the component the write belongs to")
-                    });
-                    let _self = component.as_pin_ref();
-                    #set;
+                    #posted_args
+                    // The item's tree is the drawn copy of the tree the offset
+                    // was measured on; the helper re-binds `_self` to the copy
+                    // of this component that sits inside it.
+                    sp::component_copy_at_offset(
+                        &tree,
+                        forwarded_item,
+                        forwarded_offset,
+                        |component: ::core::pin::Pin<&#inner_component_id_tokens>| {
+                            let _self = component;
+                            #posted_write
+                        },
+                    );
                 })
             }
             Err(_) => {}
@@ -5885,8 +5972,8 @@ fn compile_builtin_function_call(
                     popup.item_tree.root,
                     RustGeneratorContext {
             global_access: quote!(_self.globals()),
-            call_target: CallTarget::OwnTree,
             in_callback_body: false,
+            carries_handler_writes: false,
         },
                     Some(&parent_ctx),
                 );
@@ -6046,8 +6133,8 @@ fn compile_builtin_function_call(
                 popup.item_tree.root,
                 RustGeneratorContext {
                     global_access: quote!(_self.globals()),
-                    call_target: CallTarget::OwnTree,
                     in_callback_body: false,
+                    carries_handler_writes: false,
                 },
                 None,
             );
@@ -7605,8 +7692,8 @@ fn generate_translations(
         current_scope: EvaluationScope::Global(0.into()),
         generator_state: RustGeneratorContext {
             global_access: quote!(compile_error!("language rule can't access state")),
-            call_target: CallTarget::OwnTree,
             in_callback_body: false,
+            carries_handler_writes: false,
         },
         argument_types: &[Type::Int32],
     };

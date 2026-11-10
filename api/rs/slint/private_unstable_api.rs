@@ -205,8 +205,8 @@ pub mod re_exports {
     };
     pub use i_slint_core::item_tree::{
         ControlKind, ControlSlot, IndexRange, ItemTree, ItemTreeRc, ItemTreeRefPin, ItemTreeVTable,
-        ItemTreeWeak, ensure_item_tree_instantiated, item_tree_identity, register_item_tree,
-        unregister_item_tree,
+        ItemTreeWeak, ensure_item_tree_instantiated, find_item_by_stable_id, item_tree_identity,
+        register_item_tree, unregister_item_tree,
     };
     pub use i_slint_core::item_tree::{
         ItemTreeNode, ItemVisitorRefMut, ItemVisitorResult, ItemVisitorVTable, ItemWeak,
@@ -256,4 +256,6 @@ pub mod re_exports {
 
     #[cfg(feature = "live-preview")]
     pub use i_slint_live_preview::live_component as live_preview;
+
+    pub use i_slint_core::item_tree::component_copy_at_offset;
 }

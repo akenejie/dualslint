@@ -1679,6 +1679,40 @@ pub fn find_item_by_stable_id(item_tree: &ItemTreeRc, id: u64) -> Option<ItemRc>
     found
 }
 
+/// Run `body` against the copy of a component that sits `offset` bytes into
+/// the item tree whose root item answers `root_item_id`.
+///
+/// Two instances of one component definition are the same struct, so a field
+/// sits at the same offset in both. This is how a handler write reaches the
+/// copy of a component that the drawn tree holds: the offset was measured on
+/// the application tree, where the component address and its embedding
+/// tree address were both live, and the drawn copy of that tree is found by
+/// the stable id of its root item. `None` when the tree holds no such item
+/// -- a popup component, say, which the walk from the window root never
+/// visits.
+pub fn component_copy_at_offset<T: 'static, R: 'static>(
+    tree: &ItemTreeRc,
+    root_item_id: u64,
+    offset: usize,
+    body: impl FnOnce(core::pin::Pin<&T>) -> R,
+) -> Option<R> {
+    let item = find_item_by_stable_id(tree, root_item_id)?;
+    let origin = item.item_tree().clone();
+    // SAFETY: `origin` owns the tree for the whole call, so the borrow of
+    // it outlives the reference the body runs against.
+    let origin_addr =
+        vtable::VRef::as_ptr(core::pin::Pin::into_inner(vtable::VRc::borrow_pin(&origin))).as_ptr()
+            as usize;
+    // SAFETY: the two trees are the same component definition, so the
+    // field sits at the same offset in both; an item tree is pinned for
+    // its whole life, and so is everything inside it, and `origin` keeps
+    // the allocation alive past the call.
+    #[allow(unsafe_code)]
+    let component =
+        unsafe { core::pin::Pin::new_unchecked(&*((origin_addr + offset) as *const T)) };
+    Some(body(component))
+}
+
 fn visit_internal<State>(
     item_tree: &ItemTreeRc,
     order: TraversalOrder,

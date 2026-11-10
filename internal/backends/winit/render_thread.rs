@@ -2202,6 +2202,22 @@ impl RenderCore {
                                 item.set_text_editing_state(state);
                                 Some(true)
                             });
+                        // The caret moved or the text changed under it, so the
+                        // cursor shows now and the blink starts over: a cursor
+                        // that vanishes the instant an arrow key moves it reads
+                        // as gone, not as blinking. Same rule upstream applies
+                        // where the editing runs; here the editing runs on the
+                        // UI thread and this is the tree that draws.
+                        if changed == Some(true)
+                            && let Some(adapter) = render_window_adapter.as_ref()
+                            && let Some(text_input) =
+                                render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                                    item_rc.downcast::<i_slint_core::items::TextInput>()
+                                })
+                        {
+                            WindowInner::from_pub(adapter.window())
+                                .set_cursor_blink_binding(&text_input.as_pin_ref().cursor_visible);
+                        }
                         // The text on screen is what changed, and the `edited`
                         // and `accepted` callbacks fired where the editing
                         // happened -- on the UI thread -- so a frame is all
