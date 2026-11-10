@@ -851,7 +851,6 @@ impl RenderHost {
         let _ = self.sender.send(RenderMessage::SetTextState { id, state });
     }
 
-
     /// Tell the tree that the wheel belongs to this control.
     ///
     /// Which control it is, the UI thread decided from the published geometry;
@@ -1868,30 +1867,32 @@ impl RenderCore {
                         self.font_collection = Some(collection);
                     }
                     RenderMessage::SetViewportOffset { id, x, y } => {
-                        let changed = render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
-                            let flickable = item_rc.downcast::<i_slint_core::items::Flickable>()?;
-                            let item = flickable.as_pin_ref();
-                            let current_x = i_slint_core::items::Flickable::FIELD_OFFSETS
-                                .content_x()
-                                .apply_pin(item)
-                                .get();
-                            let current_y = i_slint_core::items::Flickable::FIELD_OFFSETS
-                                .content_y()
-                                .apply_pin(item)
-                                .get();
-                            if current_x == x && current_y == y {
-                                return Some(false);
-                            }
-                            i_slint_core::items::Flickable::FIELD_OFFSETS
-                                .content_x()
-                                .apply_pin(item)
-                                .set(x);
-                            i_slint_core::items::Flickable::FIELD_OFFSETS
-                                .content_y()
-                                .apply_pin(item)
-                                .set(y);
-                            Some(true)
-                        });
+                        let changed =
+                            render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                                let flickable =
+                                    item_rc.downcast::<i_slint_core::items::Flickable>()?;
+                                let item = flickable.as_pin_ref();
+                                let current_x = i_slint_core::items::Flickable::FIELD_OFFSETS
+                                    .content_x()
+                                    .apply_pin(item)
+                                    .get();
+                                let current_y = i_slint_core::items::Flickable::FIELD_OFFSETS
+                                    .content_y()
+                                    .apply_pin(item)
+                                    .get();
+                                if current_x == x && current_y == y {
+                                    return Some(false);
+                                }
+                                i_slint_core::items::Flickable::FIELD_OFFSETS
+                                    .content_x()
+                                    .apply_pin(item)
+                                    .set(x);
+                                i_slint_core::items::Flickable::FIELD_OFFSETS
+                                    .content_y()
+                                    .apply_pin(item)
+                                    .set(y);
+                                Some(true)
+                            });
                         present |= changed.unwrap_or(false);
                     }
                     RenderMessage::WindowMapped { response } => {
@@ -2206,6 +2207,33 @@ impl RenderCore {
                         // happened -- on the UI thread -- so a frame is all
                         // that is left to do here.
                         present |= changed.unwrap_or(false);
+                        // The caret moved on the drawn tree, and the platform's
+                        // input method follows the caret: the properties the IME
+                        // is told -- the cursor rectangle above all, measured off
+                        // the font this thread shaped -- are notified to the UI
+                        // thread, which owns the IME conversation.
+                        if changed == Some(true)
+                            && let Some(adapter) = render_window_adapter.as_ref()
+                            && let Some(props) =
+                                render_item_rcs.borrow().get(&id).cloned().and_then(|item_rc| {
+                                    let text_input =
+                                        item_rc.downcast::<i_slint_core::items::TextInput>()?;
+                                    Some(
+                                        text_input
+                                            .as_pin_ref()
+                                            .input_method_properties(adapter, &item_rc),
+                                    )
+                                })
+                            && let (Some(proxy), Some(window_id)) =
+                                (self.event_loop_proxy.as_ref(), surface.owner)
+                        {
+                            let _ = proxy.send_event(crate::SlintEvent(
+                                crate::event_loop::CustomEvent::RenderCaretMoved {
+                                    window_id,
+                                    properties: props,
+                                },
+                            ));
+                        }
                     }
                     RenderMessage::RunOnScreenTree { task, done } => {
                         // The call runs here because the tree it belongs to is
@@ -3062,8 +3090,6 @@ fn send_gesture_to_tree(
     )
 }
 
-
-
 /// Hand one half of a click to the control the UI thread named.
 ///
 /// The position is the one the pointer is at, in the coordinates of the window
@@ -3123,15 +3149,14 @@ pub fn click(window: &i_slint_core::api::Window, x: f32, y: f32) -> bool {
     let Some(internal) = adapter.internal(i_slint_core::InternalToken) else {
         return false;
     };
-    let winit_adapter = internal as *const dyn WindowAdapterInternal
-        as *const crate::WinitWindowAdapter;
+    let winit_adapter =
+        internal as *const dyn WindowAdapterInternal as *const crate::WinitWindowAdapter;
     // SAFETY: the internal object of this backend's window adapter is the
     // adapter itself; the winit backend returns `self` from `internal`.
     let winit_adapter = unsafe { &*winit_adapter };
     let position = LogicalPoint::new(x, y);
     let dispatch = |event: BackendMouseEvent| {
-        winit_adapter
-            .dispatch_pointer_event_impl(InternalEvent::Mouse(event));
+        winit_adapter.dispatch_pointer_event_impl(InternalEvent::Mouse(event));
     };
     dispatch(BackendMouseEvent::Moved { position, touch_finger_id: 0 });
     dispatch(BackendMouseEvent::Pressed {

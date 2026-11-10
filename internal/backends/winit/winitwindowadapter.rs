@@ -1517,10 +1517,7 @@ impl WinitWindowAdapter {
     /// does: the drawing states to the drawn tree, the meaning to the
     /// application tree.  Public so the diagnostic drivers and the testing
     /// surfaces click the way the user does, through the same path.
-    pub fn dispatch_pointer_event_impl(
-        &self,
-        event: corelib::platform::InternalEvent,
-    ) -> bool {
+    pub fn dispatch_pointer_event_impl(&self, event: corelib::platform::InternalEvent) -> bool {
         let event = event.into();
         if !self.render_owns_controls() {
             self.dispatch_internal_event(event);
@@ -2138,11 +2135,14 @@ impl WinitWindowAdapter {
             std::eprintln!("[input] ime sync target={target:?} previous={previous:?}");
         }
 
+        // `read-only` is a property the compiler assigned to this thread: the
+        // value lives in this tree's copy, and the answer is read from here
+        // rather than asked of the drawing side.
         let editable = target.is_some_and(|id| {
-            !matches!(
-                host.get_control_property(id, "read-only"),
-                Some(crate::render_thread::ControlPropertyValue::Bool(true))
-            )
+            self.ui_tree_item(id)
+                .and_then(|item| item.downcast::<i_slint_core::items::TextInput>())
+                .map(|text_input| !text_input.as_pin_ref().read_only())
+                .unwrap_or(false)
         });
         let props =
             if editable { target.and_then(|id| host.input_method_properties(id)) } else { None };
@@ -2151,6 +2151,19 @@ impl WinitWindowAdapter {
             std::eprintln!("[input] ime sync props read in {:?}", ime_started.elapsed());
         }
         self.update_render_ime(host, props);
+    }
+
+    /// The caret of the open editing session moved on the drawn tree, and the
+    /// values the IME is told came with it: the cursor rectangle measured
+    /// where the font was shaped.  The hints stay this thread's -- the compiler
+    /// assigned them here -- and the rest is handed to the platform.
+    pub(crate) fn handle_render_caret_moved(
+        &self,
+        properties: corelib::window::InputMethodProperties,
+    ) {
+        if let Some(host) = self.render_host() {
+            self.update_render_ime(&host, Some(properties));
+        }
     }
 
     /// Bring the platform's input method in step with values already in hand.

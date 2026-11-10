@@ -40,6 +40,15 @@ pub enum CustomEvent {
         /// The control the tree focused, as published in the control table.
         focus: Option<u64>,
     },
+    /// The caret of the text control in an open editing session moved on the
+    /// drawn tree, and the input method's cursor area follows it: the values
+    /// the IME is told were measured where the font was shaped.
+    RenderCaretMoved {
+        /// The window whose text control moved the caret.
+        window_id: winit::window::WindowId,
+        /// The fresh input-method values, caret rectangle included.
+        properties: i_slint_core::window::InputMethodProperties,
+    },
     /// Emitted from quit_event_loop with the current event loop generation
     Exit(usize),
     #[cfg(enable_accesskit)]
@@ -57,6 +66,9 @@ impl std::fmt::Debug for CustomEvent {
             Self::UserEventWithEventLoop(_) => write!(f, "UserEventWithEventLoop"),
             Self::RenderFocusChanged { window_id, focus } => {
                 write!(f, "RenderFocusChanged({window_id:?}, {focus:?})")
+            }
+            Self::RenderCaretMoved { window_id, .. } => {
+                write!(f, "RenderCaretMoved({window_id:?})")
             }
             Self::Exit(_) => write!(f, "Exit"),
             #[cfg(enable_accesskit)]
@@ -169,6 +181,11 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
             CustomEvent::RenderFocusChanged { window_id, focus } => {
                 if let Some(window) = self.shared_backend_data.window_by_id(window_id) {
                     window.handle_render_focus_changed(focus);
+                }
+            }
+            CustomEvent::RenderCaretMoved { window_id, properties } => {
+                if let Some(window) = self.shared_backend_data.window_by_id(window_id) {
+                    window.handle_render_caret_moved(properties);
                 }
             }
             CustomEvent::Exit(generation) => {
