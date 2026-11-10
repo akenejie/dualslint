@@ -335,33 +335,6 @@ fn a_disabled_item_takes_no_press() {
     assert_eq!(targets.len(), 1, "only the enabled touch area takes a press: {targets:?}");
 }
 
-/// What the press would change is the compiler's answer, carried through the
-/// tree to the render thread and published with the item.  The UI thread reads
-/// it to skip a press that cannot change a pixel.
-#[test]
-fn a_press_target_carries_whether_a_press_can_change_the_screen() {
-    i_slint_backend_testing::init_no_event_loop();
-    let instance = build_source(
-        r#"
-        export component Controls {
-            VerticalLayout {
-                TouchArea { width: 100px; height: 20px; clicked => { self.width += 1px; } }
-                TouchArea { width: 100px; height: 20px; }
-            }
-        }
-        "#,
-        LogicalSize::new(400.0, 300.0),
-    );
-    let targets = encode_window_controls(instance.window()).expect("walks").press_targets;
-    let reacts: Vec<bool> = targets.iter().map(|t| t.pointer_reacts).collect();
-
-    assert_eq!(
-        reacts,
-        vec![true, false],
-        "the touch area with a click handler reacts, the bare one does not"
-    );
-}
-
 /// Two overlapping touch areas and a focus scope in front of both: enough to
 /// tell front-to-back order apart from the order the tree paints them in.
 const OVERLAPPING: &str = r#"

@@ -244,13 +244,6 @@ pub struct PressTarget {
     pub behavior: PressBehavior,
     /// Whether the item takes the focus when it is pressed.
     pub focus_on_click: bool,
-    /// Whether a pointer event on this item, or on something inside it, can
-    /// change what is on screen.
-    ///
-    /// The compiler worked this out per element and the render thread only
-    /// publishes it.  A press on an item that changes nothing on screen needs
-    /// not be sent on at all.
-    pub pointer_reacts: bool,
     /// Whether this item's pressed state shows on screen: the pressed-state
     /// update is only sent for items whose visuals react to it.  The compiler
     /// worked this out per element, like `pointer_reacts`.

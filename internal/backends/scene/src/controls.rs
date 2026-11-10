@@ -174,7 +174,6 @@ impl<'a> ControlEncoder<'a> {
             geometry: LogicalRect::new(window_origin, geometry.size),
             behavior,
             focus_on_click: focus_on_click(item),
-            pointer_reacts: item.pointer_reacts(),
             press_draws: item.press_draws(),
         });
     }

@@ -505,11 +505,11 @@ fn a_tree_that_only_ticks_sets_up_a_handover() {
     // shelf. What the drawn tree does afterwards is its own business.
 }
 
-/// A tree that ticks and carries a count: the timer keeps running on the
-/// application tree after the handover -- the handler is application code --
-/// and the count the handler writes carries to the drawn tree.
+/// A tree that ticks and carries a count: the timers are time-based triggers,
+/// neither input nor OS communication, so they run on the drawn tree -- the
+/// same autonomy the animations have -- and the tick updates the drawn tree.
 #[test]
-fn a_ticking_tree_hands_over_and_keeps_ticking_from_the_application_side() {
+fn a_ticking_tree_hands_over_and_keeps_ticking_on_the_drawn_side() {
     let platform = PlatformShowingTree::install();
     let app = TimerTick::new().expect("the platform makes windows");
     let adapter = platform.adapter_of_last_window();
@@ -527,19 +527,14 @@ fn a_ticking_tree_hands_over_and_keeps_ticking_from_the_application_side() {
     WindowInner::from_pub(app.window()).run_render_handover();
     assert_eq!(mirror.get_ticks(), after_handover, "the count traveled with the handover");
 
-    // More time passes: the timer still runs on the application tree -- the
-    // handler is application code -- and the count it writes carries to the
-    // drawn tree.
+    // More time passes: the drawn tree's own timer is the one that counts now,
+    // the shelf having silenced the one this thread still calls ours.
     i_slint_backend_testing::testing_backend::mock_elapsed_time(3000);
     i_slint_core::platform::update_timers_and_animations();
 
-    let app_now = app.get_ticks();
-    assert!(app_now > after_handover, "the application tree keeps ticking");
-    assert_eq!(
-        mirror.get_ticks(),
-        app_now,
-        "the tick the handler wrote carried to the drawn tree"
-    );
+    let mirror_now = mirror.get_ticks();
+    assert!(mirror_now > after_handover, "the drawn tree keeps ticking");
+    assert_eq!(app.get_ticks(), mirror_now, "what the application reads is the drawn tree's count");
 }
 
 /// With no second thread, the core focuses a clicked `FocusScope` itself, which
