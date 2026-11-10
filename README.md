@@ -211,6 +211,11 @@ publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hov
   ソートやフィルタで `set_xxx` に渡すモデルを作り替える処理は、`.slint` 側にコールバックとして宣言します。コンパイラが `on_xxx`（ハンドラ設定）と `invoke_xxx`（呼び出し）のアクセサを生成するので、UI コードはモデルを変更したあとに必ず `invoke_xxx` を呼びます。アプリケーションの状態から表示モデルを作り直す手順を一つの関数にまとめることで、同期のタイミングを呼び出し一箇所に集約できます。
 
   ```slint
+  export struct Task {
+      title: string,
+      done: bool,
+  }
+
   export component TaskList inherits Window {
       in property <[Task]> tasks;
       callback re-apply-view();   // 表示の作り直しを UI 側へ依頼する
