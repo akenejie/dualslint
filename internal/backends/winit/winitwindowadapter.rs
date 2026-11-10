@@ -411,7 +411,7 @@ pub struct WinitWindowAdapter {
     /// render thread, which is what makes the render thread the thread that
     /// draws.  Drawing from here on would race it for the window, so this
     /// window stops presenting on its own.
-    graphics_handed_over: Cell<bool>,
+    pub(crate) graphics_handed_over: Cell<bool>,
 
     #[cfg(target_arch = "wasm32")]
     virtual_keyboard_helper: RefCell<Option<super::wasm_input_helper::WasmInputHelper>>,
@@ -1929,6 +1929,55 @@ impl WinitWindowAdapter {
         *self.pushed_text_state.borrow_mut() = Some(state);
     }
 
+    /// Push the viewport of the scrollable whose animation is running, if it
+    /// moved since the last push.
+    ///
+    /// The flick's deceleration is an animation on this tree's copy: the
+    /// release started it where the drag ended. The drawn tree holds the
+    /// scroll position's sovereignty, so the advancing value is read here (the
+    /// read is what advances a time-based animation) and the change is pushed
+    /// as state, every cycle the animation is still active. When the value
+    /// settles, the reads stop changing and this costs one lookup per event
+    /// loop pass.
+    pub(crate) fn push_animated_viewport(&self) {
+        let tracked = self.pushed_viewport.borrow().clone();
+        let Some((id, _, _)) = tracked else { return };
+        let Some(item) = self.ui_tree_item(id) else { return };
+        let Some(flickable) = item.downcast::<i_slint_core::items::Flickable>() else { return };
+        let flickable = flickable.as_pin_ref();
+        let x = i_slint_core::items::Flickable::FIELD_OFFSETS
+            .content_x()
+            .apply_pin(flickable)
+            .get();
+        let y = i_slint_core::items::Flickable::FIELD_OFFSETS
+            .content_y()
+            .apply_pin(flickable)
+            .get();
+        let changed = tracked.as_ref().is_some_and(|(_, lx, ly)| *lx != x || *ly != y);
+        if !changed {
+            return;
+        }
+        if let Some(host) = self.render_host() {
+            host.set_viewport_offset(id, x, y);
+            *self.pushed_viewport.borrow_mut() = tracked;
+        }
+    }
+
+    /// The scrollable the pressed control pans, and the id it was published as.
+    ///
+    /// A drag that starts on a control inside a scrollable -- a cell's
+    /// `TouchArea` inside the grid, say -- pans the scrollable: the pan is the
+    /// ancestor `Flickable`'s, reached by walking the pressed item's parents.
+    fn pan_flickable_of(&self, id: u64) -> Option<(u64, ItemRc)> {
+        let mut item = self.ui_tree_item(id)?;
+        loop {
+            if item.downcast::<i_slint_core::items::Flickable>().is_some() {
+                return Some((item.stable_id(), item));
+            }
+            item = item.parent_item(corelib::item_tree::ParentItemTraversalMode::StopAtPopups)?;
+        }
+    }
+
     /// Push the viewport of the pressed scrollable, if it moved.
     ///
     /// The drag that pans a scrollable is processed on this tree, and the
@@ -1937,7 +1986,12 @@ impl WinitWindowAdapter {
     /// nothing moved, which is almost every event.
     fn push_scroll_state(&self, host: &crate::render_thread::RenderHost) {
         let Some(id) = self.render_pressed.get() else { return };
-        let Some(item) = self.ui_tree_item(id) else { return };
+        // A drag that starts on a control inside a scrollable -- a cell's
+        // `TouchArea` inside the grid, say -- pans the scrollable: the pan is
+        // the ancestor `Flickable`'s, reached by walking the pressed item's
+        // parents. The pan targets that Flickable, and the viewport it moves
+        // is the one pushed.
+        let Some((pan_id, item)) = self.pan_flickable_of(id) else { return };
         let Some(flickable) = item.downcast::<i_slint_core::items::Flickable>() else {
             return;
         };
@@ -1948,12 +2002,12 @@ impl WinitWindowAdapter {
             i_slint_core::items::Flickable::FIELD_OFFSETS.content_y().apply_pin(flickable).get();
         {
             let last = self.pushed_viewport.borrow();
-            if last.as_ref() == Some(&(id, x, y)) {
+            if last.as_ref() == Some(&(pan_id, x, y)) {
                 return;
             }
         }
-        host.set_viewport_offset(id, x, y);
-        *self.pushed_viewport.borrow_mut() = Some((id, x, y));
+        host.set_viewport_offset(pan_id, x, y);
+        *self.pushed_viewport.borrow_mut() = Some((pan_id, x, y));
     }
 
     /// The item the id names, on the tree this thread owns.

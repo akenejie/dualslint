@@ -278,7 +278,18 @@ impl winit::application::ApplicationHandler<SlintEvent> for EventLoopState {
                 .filter_map(|w| w.upgrade())
             {
                 if w.window().has_active_animations() {
-                    w.request_redraw();
+                    // An animation on a tree whose drawing was handed over: the
+                    // animated values advance with the wall clock, and a redraw
+                    // of this window draws nothing -- the drawn tree holds the
+                    // pixels. What the animation moves that the drawn tree
+                    // draws (a flick's decelerating viewport) is read and
+                    // pushed as state; the value's own read is what advances
+                    // it. When the animation settles, the pushes stop.
+                    if w.graphics_handed_over.get() {
+                        w.push_animated_viewport();
+                    } else {
+                        w.request_redraw();
+                    }
                 }
             }
         }
