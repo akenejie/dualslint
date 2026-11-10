@@ -1595,15 +1595,33 @@ fn render_handover_state(
         Some(quote!(#(#routes)*))
     });
 
+    // The timers: the application tree's run the handlers -- the input
+    // inversion's rule: the application code runs on the application tree, and
+    // the writes carry. The drawn tree's copies of the timers would run the
+    // same handlers a second time on the render thread, so they are shelved:
+    // their callbacks check the flag and stop.
     let route_body = quote!(#(#carries)* #(#global_carries)* #(#routes)* #(#global_routes)*
-
-        // A backend drew a tree of its own for the window, so this component's
-        // copy of the controls is a husk: the state it would compute is not what
-        // is on screen. Shelving it stops the timers it runs, which describe
-        // state nothing draws and would otherwise go on firing on this thread.
-        // The tree the backend draws carries its own timers, so the window keeps
-        // animating without this thread even waking up.
-        sp::VRc::as_pin_ref(&component.0).globals().slint_shelve(););
+        let drawn_tree = sp::VRc::into_dyn(component.0.clone());
+        let adapter = sp::WindowInner::from_pub(
+            slint::ComponentHandle::window(&component),
+        )
+        .window_adapter();
+        adapter
+            .post_on_screen_tree(
+                drawn_tree,
+                Box::new(move |tree: &sp::ItemTreeRc| {
+                    let component = sp::VRc::map_dyn(
+                        tree.clone(),
+                        |tree: core::pin::Pin<sp::VRef<'_, sp::ItemTreeVTable>>| {
+                            sp::VRef::downcast_pin::<#inner_component_id>(tree).expect(
+                                "the tree on screen is not the component the handover belongs to",
+                            )
+                        },
+                    );
+                    let _self = component.as_pin_ref();
+                    _self.globals().slint_shelve();
+                }),
+            ););
     let global_weaks = quote!(#(#global_weaks)*);
     (global_weaks, route_body)
 }
