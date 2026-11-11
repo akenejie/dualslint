@@ -245,7 +245,7 @@ pub struct PressTarget {
     pub focus_on_click: bool,
     /// Whether this item's pressed state shows on screen: the pressed-state
     /// update is only sent for items whose visuals react to it.  The compiler
-    /// worked this out per element, like `pointer_reacts`.
+    /// worked this out per element, like `hover_draws`.
     pub press_draws: bool,
 }
 

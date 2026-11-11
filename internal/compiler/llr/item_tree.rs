@@ -522,12 +522,6 @@ pub struct TreeNode {
     /// method is told.
     pub ime_ui_owned: bool,
     /// Whether the application reacts to a pointer event on this node's item.
-    ///
-    /// Decided per element by the `property_ownership` pass before the
-    /// lowering, and carried into the item tree so the UI thread can tell, from
-    /// a control id alone, whether a pointer event on this control has to reach
-    /// the drawing thread at all.
-    pub pointer_reacts: bool,
     /// Whether this node's pointer state shows on screen.
     pub hover_draws: bool,
     /// Whether the pressed state of this node's item shows on screen.

@@ -1932,7 +1932,18 @@ fn public_api(
             // each tree keeps its own copy; the drawn tree's copy is whatever its
             // own bindings made it. Everything that can travel is routed, writes
             // included, so for it the two trees are the same tree.
-            let read = if call_target.takes(&[], &p.ty) && p.ty.is_property_type() {
+            //
+            // Where the read answers from is the owner's decision: a property
+            // the classification gives to the UI thread is the application
+            // tree's to hold -- its writes land there and nothing carries them
+            // -- so a read answers locally. One the drawing side owns, or one
+            // both sides hold, is answered from the tree the window draws,
+            // whose bindings decide what is seen.
+            let ui_owned = matches!(
+                property_ownership_of(&p.prop, ctx),
+                crate::object_tree::PropertyOwnership::Ui
+            );
+            let read = if call_target.takes(&[], &p.ty) && p.ty.is_property_type() && !ui_owned {
                 call_target.wrap(quote!(#prop_expression))
             } else {
                 quote!(
@@ -2019,6 +2030,102 @@ fn public_api(
                             quote!(let _self = sp::VRc::as_pin_ref(&handle.0);),
                         ),
                     };
+                    // The rows the application changes on its own -- a push to
+                    // the model it holds, say -- reach the drawn copy through a
+                    // carried model: the property stores a wrapper that hears
+                    // the source's change notifications and posts the rows
+                    // here, the same way a setter's carry does. The wrapper
+                    // dies when the property is assigned again, which takes
+                    // its listener along.
+                    let model_row_sync = match call_target {
+                        CallTarget::OwnTree => quote!(),
+                        _ => {
+                            let posted = match call_target {
+                                CallTarget::ScreenTree { inner_component, .. } => quote! {
+                                    let component = sp::VRc::map_dyn(tree.clone(), |tree| {
+                                        sp::VRef::downcast_pin::<#inner_component>(tree).expect(
+                                            "the tree on screen is not the component the carry belongs to",
+                                        )
+                                    });
+                                    let _self = component.as_pin_ref();
+                                    #prop_access.set(sp::screen_tree_model_carry(
+                                        &#prop_access.get(),
+                                        rows,
+                                        write_back,
+                                    ));
+                                },
+                                CallTarget::GlobalTree { root_inner, global_id, .. } => quote! {
+                                    let root_pinned =
+                                        sp::VRef::downcast_pin::<#root_inner>(sp::VRc::borrow_pin(tree));
+                                    let Some(root_pinned) = root_pinned else { return };
+                                    let _self = root_pinned.globals().#global_id.as_ref();
+                                    #prop_access.set(sp::screen_tree_model_carry(
+                                        &#prop_access.get(),
+                                        rows,
+                                        write_back,
+                                    ));
+                                },
+                                CallTarget::OwnTree => quote!(),
+                            };
+                            quote! {
+                                #write_back_weak
+                                let row_forward = {
+                                    let weak = weak.clone();
+                                    move |rows: sp::Vec<_>| {
+                                        // The component the row state lives on is
+                                        // upgraded from the weak here, so nothing the
+                                        // call borrowed escapes into the listener.
+                                        let (window_adapter, local_tree) = match weak.upgrade() {
+                                            Some(handle) => {
+                                                #write_back_self
+                                                match _self.globals().window_adapter_ref() {
+                                                    Ok(window_adapter) => {
+                                                        match _self
+                                                            .globals()
+                                                            .root_item_tree_weak
+                                                            .upgrade()
+                                                        {
+                                                            Some(local_tree) => {
+                                                                (window_adapter.clone(), local_tree)
+                                                            }
+                                                            None => return,
+                                                        }
+                                                    }
+                                                    Err(_) => return,
+                                                }
+                                            }
+                                            None => return,
+                                        };
+                                        let local_identity = sp::item_tree_identity(&local_tree);
+                                        let weak = weak.clone();
+                                        window_adapter.window().post_on_screen_tree(
+                                            local_tree,
+                                            move |tree| {
+                                                if sp::item_tree_identity(tree) == local_identity {
+                                                    return;
+                                                }
+                                                let write_back = move |row, data| {
+                                                    let _ = weak.upgrade_in_event_loop(move |handle| {
+                                                        #write_back_self
+                                                        // The model may have shrunk since the
+                                                        // row was edited on the drawn tree.
+                                                        if row < #prop_access.get().row_count() {
+                                                            #prop_access.get().set_row_data(row, data);
+                                                        }
+                                                    });
+                                                };
+                                                #posted
+                                            },
+                                        );
+                                    }
+                                };
+                                #prop_access.set(sp::carried_model(
+                                    #prop_access.get(),
+                                    row_forward,
+                                ));
+                            }
+                        }
+                    };
                     (
                         quote!(),
                         quote!(
@@ -2047,7 +2154,8 @@ fn public_api(
                                     });
                                 }
                             };
-                            #carry
+                            #carry;
+                            #model_row_sync
                         ),
                     )
                 } else if let Type::Array(array) = &p.ty
@@ -3442,7 +3550,6 @@ fn generate_item_tree(
                 let is_accessible = node.is_accessible;
                 let focus_draws = node.focus_draws;
                 let ime_ui_owned = node.ime_ui_owned;
-                let pointer_reacts = node.pointer_reacts;
                 let hover_draws = node.hover_draws;
                 let press_draws = node.press_draws;
                 // The compiler assigns each element a constant id: its index in
@@ -3455,7 +3562,6 @@ fn generate_item_tree(
                         is_accessible: #is_accessible,
                         focus_draws: #focus_draws,
                         ime_ui_owned: #ime_ui_owned,
-                        pointer_reacts: #pointer_reacts,
                         hover_draws: #hover_draws,
                         press_draws: #press_draws,
                         children_count: #children_count,

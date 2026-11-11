@@ -1421,7 +1421,6 @@ fn make_tree(
             // focus analysis, so OR it into the sub-component's root item.
             tree_node.focus_draws |= e.focus_draws;
             tree_node.ime_ui_owned |= e.ime_ui_owned;
-            tree_node.pointer_reacts |= e.pointer_reacts;
             tree_node.hover_draws |= e.hover_draws;
             tree_node.press_draws |= e.press_draws;
             tree_node
@@ -1430,7 +1429,6 @@ fn make_tree(
             is_accessible: !e.accessibility_props.0.is_empty(),
             focus_draws: e.focus_draws,
             ime_ui_owned: e.ime_ui_owned,
-            pointer_reacts: e.pointer_reacts,
             hover_draws: e.hover_draws,
             press_draws: e.press_draws,
             sub_component_path: sub_component_path.into(),
@@ -1442,7 +1440,6 @@ fn make_tree(
             is_accessible: false,
             focus_draws: false,
             ime_ui_owned: false,
-            pointer_reacts: false,
             hover_draws: false,
             press_draws: false,
             sub_component_path: sub_component_path.into(),
@@ -1454,7 +1451,6 @@ fn make_tree(
             is_accessible: false,
             focus_draws: false,
             ime_ui_owned: false,
-            pointer_reacts: false,
             hover_draws: false,
             press_draws: false,
             sub_component_path: sub_component_path.into(),

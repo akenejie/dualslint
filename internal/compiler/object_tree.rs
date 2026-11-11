@@ -1366,7 +1366,6 @@ pub struct Element {
     /// is -- means the event has to reach the drawing thread, which is where
     /// the application lives.  The answer covers the elements inside this one
     /// as well, because a press reaches them too.
-    pub pointer_reacts: bool,
 
     /// Whether this element's hovered state shows on screen.
     ///

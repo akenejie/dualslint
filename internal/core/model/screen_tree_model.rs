@@ -3,11 +3,114 @@
 
 //! The drawn tree's editable copy of an application model.
 
-use crate::model::{Model, ModelNotify, ModelRc, ModelTracker};
+use crate::model::{Model, ModelChangeListenerContainer, ModelNotify, ModelRc, ModelTracker};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
+
+/// The application's model as the property the generated setter stores: a
+/// wrapper that hears the source's row changes.
+///
+/// A model is a shared reference the thread boundary refuses to move, so the
+/// drawn tree holds a copy of the rows ([`ScreenTreeModel`]) and follows the
+/// application's rows through the carries. The carries that a handler's write
+/// triggers cover the writes the `.slint` code makes; the rows an application
+/// changes on its own -- a push to the `VecModel` it holds, say -- change
+/// nothing the carry machinery sees. This wrapper is what closes that gap:
+/// the generated setter stores it in place of the plain model, its listener
+/// rides the source's own change notifications, and every change is read back
+/// as rows and handed to `forward`, which posts them to the drawn copy. The
+/// wrapper's own tracker fires the same way, so the application tree's
+/// repeaters -- bound to the property this sits in -- update as upstream
+/// would.
+///
+/// Everything else delegates: reads, writes and the `Any` downcast reach the
+/// source, so application code that holds the model it set keeps working
+/// unchanged. The wrapper dies when the property is assigned again, which
+/// takes its listener with it.
+struct CarriedModelSource<T> {
+    source: ModelRc<T>,
+    forward: Box<dyn Fn(Vec<T>)>,
+    notify: ModelNotify,
+}
+
+impl<T: Clone + PartialEq + 'static> crate::model::ModelChangeListener for CarriedModelSource<T> {
+    fn row_changed(self: core::pin::Pin<&Self>, _row: usize) {
+        self.changed()
+    }
+    fn row_added(self: core::pin::Pin<&Self>, _index: usize, _count: usize) {
+        self.changed()
+    }
+    fn row_removed(self: core::pin::Pin<&Self>, _index: usize, _count: usize) {
+        self.changed()
+    }
+    fn reset(self: core::pin::Pin<&Self>) {
+        self.changed()
+    }
+}
+
+impl<T: Clone + PartialEq + 'static> CarriedModelSource<T> {
+    /// Read the source's rows back and hand them to the forward channel, then
+    /// tell this wrapper's own listeners: the application tree's repeaters sit
+    /// on this tracker, and upstream they would have heard the source
+    /// directly.
+    fn changed(self: core::pin::Pin<&Self>) {
+        let this = self.get_ref();
+        let rows: Vec<T> = this.source.iter().collect();
+        (this.forward)(rows.clone());
+        this.notify.reset();
+    }
+}
+
+struct CarriedModel<T: Clone + PartialEq + 'static> {
+    inner: core::pin::Pin<Box<ModelChangeListenerContainer<CarriedModelSource<T>>>>,
+}
+
+impl<T: Clone + PartialEq + 'static> Model for CarriedModel<T> {
+    type Data = T;
+
+    fn row_count(&self) -> usize {
+        self.inner.source.row_count()
+    }
+
+    fn row_data(&self, row: usize) -> Option<T> {
+        self.inner.source.row_data(row)
+    }
+
+    fn set_row_data(&self, row: usize, data: T) {
+        self.inner.source.set_row_data(row, data)
+    }
+
+    fn model_tracker(&self) -> &dyn ModelTracker {
+        &self.inner.notify
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self.inner.source.as_any()
+    }
+}
+
+/// Wrap the model the application assigned so its row changes carry to the
+/// drawn tree, and keep the application tree's own repeaters hearing them.
+///
+/// `forward` receives the source's rows after every change; the generated
+/// setter builds it to post the rows to the drawn copy. The returned model is
+/// what the property stores.
+pub fn carried_model<T: Clone + PartialEq + 'static>(
+    source: ModelRc<T>,
+    forward: impl Fn(Vec<T>) + 'static,
+) -> ModelRc<T> {
+    let inner = Box::pin(ModelChangeListenerContainer::new(CarriedModelSource {
+        source: source.clone(),
+        forward: Box::new(forward),
+        notify: ModelNotify::default(),
+    }));
+    // The listener rides the source's own change notifications: the application
+    // mutates the model it holds, and this wrapper hears it.
+    source.model_tracker().attach_peer(inner.as_ref().model_peer());
+    ModelRc::new(Rc::new(CarriedModel { inner }))
+}
 
 /// The rows the drawn tree shows: an editable copy of the model the
 /// application holds.

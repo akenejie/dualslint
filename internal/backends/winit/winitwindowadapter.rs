@@ -1857,7 +1857,7 @@ impl WinitWindowAdapter {
     /// change did to the screen is pushed to the drawing tree as state: the
     /// string, the offsets and the composition it is to show. A key that
     /// changed nothing pushes nothing.
-    fn dispatch_key_event(&self, event: &InternalKeyEvent) {
+    pub(crate) fn dispatch_key_event(&self, event: &InternalKeyEvent) {
         if self.render_owns_controls()
             && let Some(host) = self.render_host()
         {
@@ -2043,7 +2043,8 @@ impl WinitWindowAdapter {
         // too -- this is what lets a press inside a popup open an editing
         // session the same way a press on the window's own controls does.
         for popup in window_inner.active_popups().iter() {
-            if let Some(item) = i_slint_core::item_tree::find_item_by_stable_id(&popup.component, id)
+            if let Some(item) =
+                i_slint_core::item_tree::find_item_by_stable_id(&popup.component, id)
             {
                 return Some(item);
             }

@@ -733,12 +733,7 @@ fn set_global_on(
 
 /// Carry a global property's value from the instance the application holds to
 /// the tree the window shows, when a backend draws one of its own.
-fn forward_global_property(
-    instance: &Instance,
-    global_name: &str,
-    prop_name: &str,
-    value: Value,
-) {
+fn forward_global_property(instance: &Instance, global_name: &str, prop_name: &str, value: Value) {
     let Some(adapter) = instance.window_adapter_or_default() else { return };
     let Some(local_tree) = instance.self_weak.get().and_then(|w| w.upgrade()) else { return };
     let local_tree = VRc::into_dyn(local_tree);
@@ -764,7 +759,8 @@ fn forward_global_property(
             .expect("the tree on screen is not this interpreter component");
         // The screen tree is the same program, so the global resolves on it
         // the same way; a set that fails there has nothing to say.
-        let _ = set_global_on(screen.get_ref(), &carried.global, &carried.prop, carried.value.clone());
+        let _ =
+            set_global_on(screen.get_ref(), &carried.global, &carried.prop, carried.value.clone());
     };
     adapter.run_on_screen_tree(local_tree, Box::new(run));
 }

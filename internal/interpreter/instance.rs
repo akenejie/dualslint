@@ -1157,7 +1157,6 @@ fn build_tree_nodes(
                     is_accessible: node.is_accessible,
                     focus_draws: node.focus_draws,
                     ime_ui_owned: node.ime_ui_owned,
-                    pointer_reacts: node.pointer_reacts,
                     hover_draws: node.hover_draws,
                     press_draws: node.press_draws,
                     children_count: node.children.len() as u32,

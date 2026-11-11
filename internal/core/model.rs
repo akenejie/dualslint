@@ -26,7 +26,8 @@ mod screen_tree_model;
 
 pub use repeater::{Conditional, ListViewProperties, RepeatedItemTree, Repeater, RepeaterTracker};
 pub use screen_tree_model::{
-    NestedScreenTreeModel, ScreenTreeModel, screen_tree_model_carry, screen_tree_model_nested_carry,
+    NestedScreenTreeModel, ScreenTreeModel, carried_model, screen_tree_model_carry,
+    screen_tree_model_nested_carry,
 };
 
 /// Error returned by the row mutation functions of [`Model`] when the modification

@@ -1763,7 +1763,7 @@ fn generate_item_tree(
                 let item_array_index = item_array.len() as u32;
 
                 item_tree_array.push(format!(
-                    "slint::private_api::make_item_node({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                    "slint::private_api::make_item_node({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                     children_count,
                     children_index,
                     parent_index,
@@ -1771,7 +1771,6 @@ fn generate_item_tree(
                     node.is_accessible,
                     node.focus_draws,
                     node.ime_ui_owned,
-                    node.pointer_reacts,
                     node.hover_draws,
                     node.press_draws,
                     item_tree_array.len() as u32

@@ -152,32 +152,6 @@ fn is_press_drawn(elem: &ElementRc) -> bool {
     e.property_analysis.borrow().get("pressed").is_some_and(|a| a.is_used())
 }
 
-fn is_pointer_handled(elem: &ElementRc) -> bool {
-    let e = elem.borrow();
-    if e.change_callbacks.contains_key("clicked")
-        || e.change_callbacks.contains_key("pointer-event")
-        || e.change_callbacks.contains_key("toggled")
-        || e.change_callbacks.contains_key("accepted")
-        || e.binding("clicked").is_some()
-        || e.binding("pointer-event").is_some()
-        || e.binding("toggled").is_some()
-        || e.binding("accepted").is_some()
-        || e.binding("pressed").is_some()
-        || e.binding("released").is_some()
-    {
-        return true;
-    }
-    let Some(b) = e.builtin_type() else {
-        return false;
-    };
-    // A text input moves its caret with the pointer by itself, so the press
-    // has to reach the tree that draws it.
-    if b.name == "TextInput" {
-        return true;
-    }
-    is_hover_drawn(elem) || is_press_drawn(elem)
-}
-
 pub fn property_ownership(doc: &Document) {
     let mut doc_focus_affects = false;
     let mut doc_ime_affects = false;
@@ -199,13 +173,11 @@ pub fn property_ownership(doc: &Document) {
             let ime_ui = is_ime_ui(elem);
             let hover_draws = is_hover_drawn(elem);
             let press_draws = is_press_drawn(elem);
-            let pointer_handled = is_pointer_handled(elem);
             let mut emut = elem.borrow_mut();
             emut.focus_draws = focus_draws;
             emut.ime_ui_owned = ime_ui;
             emut.hover_draws = hover_draws;
             emut.press_draws = press_draws;
-            emut.pointer_reacts = pointer_handled;
             drop(emut);
             doc_focus_affects |= focus_draws;
             doc_ime_affects |= ime_ui;

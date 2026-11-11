@@ -609,7 +609,6 @@ fn duplicate_element_with_mapping(
         debug: elem.debug.clone(),
         focus_draws: elem.focus_draws,
         ime_ui_owned: elem.ime_ui_owned,
-        pointer_reacts: elem.pointer_reacts,
         hover_draws: elem.hover_draws,
 
         press_draws: elem.press_draws,

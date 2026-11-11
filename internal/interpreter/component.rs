@@ -349,9 +349,7 @@ impl ComponentInstanceInner {
         // values the call moved, so nothing the drawn tree animates on its own
         // is rewound by it.
         let adapter = self.0.window_adapter_or_default();
-        if adapter.as_ref().is_none_or(|a| {
-            a.hosts_drawn_tree()
-        }) {
+        if adapter.as_ref().is_none_or(|a| a.hosts_drawn_tree()) {
             return public_api::invoke(&self.0, name, args);
         }
         let adapter = adapter.unwrap();

@@ -3139,6 +3139,28 @@ pub(crate) fn channel(
 // Accessor helpers
 // ---------------------------------------------------------------------------
 
+/// Send a key to a window the way the windowing system would: through the
+/// adapter's own key dispatch, which decides the focus, runs the editing and
+/// pushes the state the drawn copy shows. The diagnostic drivers use this to
+/// exercise the keyboard without a real keyboard.
+pub fn send_key(window: &i_slint_core::api::Window, text: &str) -> bool {
+    use i_slint_core::input::{InternalKeyEvent, KeyEvent, KeyEventType};
+
+    let adapter = WindowInner::from_pub(window).window_adapter();
+    let Some(internal) = adapter.internal(i_slint_core::InternalToken) else { return false };
+    let winit_adapter =
+        internal as *const dyn WindowAdapterInternal as *const crate::WinitWindowAdapter;
+    // SAFETY: the internal object of this backend's window adapter is the
+    // adapter itself; the winit backend returns `self` from `internal`.
+    let winit_adapter = unsafe { &*winit_adapter };
+    let mut key_event = KeyEvent::default();
+    key_event.text = text.into();
+    let event =
+        InternalKeyEvent { key_event, event_type: KeyEventType::KeyPressed, ..Default::default() };
+    winit_adapter.dispatch_key_event(&event);
+    true
+}
+
 /// Every render thread of this process, for the APIs that are not about one
 /// window.
 ///
