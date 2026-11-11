@@ -597,10 +597,15 @@ pub enum RenderMessage {
     },
     /// Drop the render-thread GL state (window hidden / context suspended).
     /// The render thread releases its `Arc<winit::window::Window>`, allowing
-    /// the UI thread's `suspend` to actually destroy the native window.
+    /// the UI thread's `suspend` to actually destroy the native window. The
+    /// answer tells the UI thread the release has happened: destroying the
+    /// native window while a frame is still presenting into it would ask the X
+    /// server about a window that is no longer there.
     Suspend {
         /// The winit window that is going away.
         window_id: winit::window::WindowId,
+        /// The answer the UI thread waits on before it destroys the window.
+        response: std::sync::mpsc::SyncSender<()>,
     },
     /// Terminate the render thread.
     Quit,
@@ -1304,7 +1309,16 @@ impl RenderHost {
 
     /// Ask the render thread to tear down its GL context and release the window.
     pub(crate) fn submit_suspend(&self, window_id: winit::window::WindowId) {
-        let _ = self.sender.send(RenderMessage::Suspend { window_id });
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        if self.sender.send(RenderMessage::Suspend { window_id, response: tx }).is_err() {
+            return;
+        }
+        // The native window is destroyed the moment this returns, and a frame
+        // still presenting into it would ask the X server about a window that
+        // is no longer there. The render thread answers from its own loop
+        // without needing anything from the UI thread's event loop; the bound
+        // is for a wedged thread, and the destroy proceeds regardless.
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
     }
 
     /// Wait until the render thread is ready to take a window's graphics.
@@ -2334,13 +2348,14 @@ impl RenderCore {
                         // there is no other thread left that draws.
                         present = true;
                     }
-                    RenderMessage::Suspend { window_id } => {
+                    RenderMessage::Suspend { window_id, response } => {
                         // Drop the GL context + canvas and release the winit window
                         // Arc so the UI thread can destroy the native window. A
                         // window that is not the one being drawn into leaves the
                         // surface alone: its published geometry belongs to the
                         // window that is still there.
                         if !surface.release(window_id) {
+                            let _ = response.send(());
                             continue;
                         }
                         // The component and its window stay.  They belong to this
@@ -2353,6 +2368,7 @@ impl RenderCore {
                         render_control_order.clear();
                         render_item_rcs.borrow_mut().clear();
                         interaction.clear();
+                        let _ = response.send(());
                     }
                     RenderMessage::Quit => {
                         quit = true;
@@ -3138,6 +3154,53 @@ pub(crate) fn channel(
 // ---------------------------------------------------------------------------
 // Accessor helpers
 // ---------------------------------------------------------------------------
+
+/// Press and release are the two halves of [`click`], split so a diagnostic
+/// can put real time between them: the frame the press schedules is then well
+/// under way when the release arrives, which is the timing a user's click has
+/// and an atomic click does not.
+pub fn press(window: &i_slint_core::api::Window, x: f32, y: f32) -> bool {
+    use i_slint_core::input::PointerEventButton;
+    dispatch_at(window, x, y, |winit_adapter, position| {
+        winit_adapter.dispatch_pointer_event(BackendMouseEvent::Pressed {
+            position,
+            button: PointerEventButton::Left,
+            click_count: 1,
+            touch_finger_id: 0,
+        });
+    })
+}
+
+/// Release the press [`press`] started.
+pub fn release(window: &i_slint_core::api::Window, x: f32, y: f32) -> bool {
+    use i_slint_core::input::PointerEventButton;
+    dispatch_at(window, x, y, |winit_adapter, position| {
+        winit_adapter.dispatch_pointer_event(BackendMouseEvent::Released {
+            position,
+            button: PointerEventButton::Left,
+            click_count: 1,
+            touch_finger_id: 0,
+        });
+    })
+}
+
+fn dispatch_at(
+    window: &i_slint_core::api::Window,
+    x: f32,
+    y: f32,
+    dispatch: impl FnOnce(&crate::WinitWindowAdapter, LogicalPoint),
+) -> bool {
+    let adapter = WindowInner::from_pub(window).window_adapter();
+    let Some(internal) = adapter.internal(i_slint_core::InternalToken) else { return false };
+    let winit_adapter =
+        internal as *const dyn WindowAdapterInternal as *const crate::WinitWindowAdapter;
+    // SAFETY: the internal object of this backend's window adapter is the
+    // adapter itself; the winit backend returns `self` from `internal`.
+    let winit_adapter = unsafe { &*winit_adapter };
+    let position = LogicalPoint::new(x, y);
+    dispatch(winit_adapter, position);
+    true
+}
 
 /// Send a key to a window the way the windowing system would: through the
 /// adapter's own key dispatch, which decides the focus, runs the editing and
