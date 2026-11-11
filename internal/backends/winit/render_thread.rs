@@ -2014,9 +2014,10 @@ impl RenderCore {
                         // Hover and press are *state* the UI thread resolved from
                         // the published geometry, and both are plain properties of
                         // the interactive item, so they are assigned rather than
-                        // synthesized as input. The click itself is not state: it
-                        // is a decision the item tree has to make, and that is what
-                        // `ActivateControl` below delegates to the tree.
+                        // synthesized as input. The click itself is not state: its
+                        // meaning -- the handler it runs -- belongs to the tree the
+                        // application holds, which the UI thread dispatches to
+                        // directly; the drawing tree only shows the state.
                         let Some(item_rc) = render_item_rcs.borrow().get(&id).cloned() else {
                             continue;
                         };

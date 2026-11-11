@@ -14,7 +14,6 @@ use i_slint_core::graphics::euclid;
 use i_slint_core::lengths::{LogicalRect, PhysicalPx};
 
 pub mod controls;
-pub mod property_ownership;
 
 /// Physical-pixel geometry, the space a rendering backend draws in.
 pub type PhysicalLength = euclid::Length<f32, PhysicalPx>;

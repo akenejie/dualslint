@@ -1715,9 +1715,7 @@ impl WinitWindowAdapter {
                 // The drawn tree is told the pressed state above; the press
                 // itself -- the grab, the click count, the handler -- is the
                 // application tree's to process, which happens after this
-                // match. The pointer_reacts gate above no longer decides
-                // whether an event is sent; it decided that for a tree that
-                // no longer receives one.
+                // match.
                 if press_target.focus_on_click {
                     // The focus opens the editing session: this tree's focus
                     // follows, the drawing tree's state is read back once, and
