@@ -4392,7 +4392,7 @@ fn property_ownership_of(
 /// value travels with the task, so the write lands twice on the same number.
 fn handler_write_carry_tokens(
     property: &llr::MemberReference,
-    value_tokens: &TokenStream,
+    _value_tokens: &TokenStream,
     set_tokens: &TokenStream,
     ctx: &EvaluationContext,
 ) -> Option<TokenStream> {
@@ -4404,7 +4404,7 @@ fn handler_write_carry_tokens(
     if !ctx.generator_state.carries_handler_writes {
         return None;
     }
-    let llr::MemberReference::Relative { parent_level, local_reference } = property else {
+    let llr::MemberReference::Relative { parent_level: _, local_reference } = property else {
         // A write to a global: the globals have their own carries through
         // their public accessors, and a handler write to one is a call to
         // that accessor already.
@@ -4429,30 +4429,35 @@ fn handler_write_carry_tokens(
     // against the drawn copy, whose parent walk reaches the drawn parent the
     // same way; the value expression then reads the drawn state, which the
     // carries keep equal to what this state was when the handler ran.
-    let (app_write, posted_write) =
-        if *parent_level == 0 && crate::llr::is_thread_portable_type(&ctx.property_ty(property)) {
-            let prop = access_member(property, ctx).unwrap();
+    // A write is carried as the value itself: the handler's copy is read back
+    // after the set, and the drawn copy is assigned exactly that value.  The
+    // value expression is never re-evaluated on the drawn tree, because it may
+    // name locals the handler's own scope declared -- an inlined call's
+    // argument, say -- which a second evaluation could not reach.
+    let ty = ctx.property_ty(property);
+    let (app_write, posted_write) = match access_member(property, ctx) {
+        MemberAccess::Direct(prop) => {
+            let read_back = primitive_property_value(&ty, MemberAccess::Direct(prop.clone()));
             (
                 quote! {
-                    let forwarded_value = #value_tokens;
-                    #prop.set(forwarded_value.clone() as _);
+                    #set_tokens;
+                    let forwarded_value = #read_back;
                 },
                 quote!(#prop.set(forwarded_value as _);),
             )
-        } else {
-            (quote!(#set_tokens;), quote!(#set_tokens;))
-        };
-    // The re-run form evaluates the value expression again, and an expression
-    // may read the event's arguments -- the position a click reported.  The
-    // arguments travel with the task under the name the tokens use.
-    let arg_inits = (0..ctx.argument_types.len())
-        .map(|i| proc_macro2::Literal::usize_unsuffixed(i))
-        .map(|i| quote!(args.#i.clone(),))
-        .collect::<Vec<_>>();
-    let app_args = quote!(#[allow(unused_variables)]
-        let forwarded_args = (#(#arg_inits)*););
-    let posted_args = quote!(#[allow(unused_variables)]
-        let args = forwarded_args;);
+        }
+        MemberAccess::Option(prop) => {
+            let read_back = primitive_property_value(&ty, MemberAccess::Option(prop.clone()));
+            (
+                quote! {
+                    #set_tokens;
+                    let forwarded_value = #read_back;
+                },
+                quote!(#prop.map(|x| x.set(forwarded_value as _));),
+            )
+        }
+        MemberAccess::OptionFn(..) => return None,
+    };
     Some(quote!({
         #app_write
         // The tree this component is embedded in, and where it sits in it:
@@ -4471,7 +4476,6 @@ fn handler_write_carry_tokens(
             let self_addr = (&*_self) as *const _ as usize;
             self_addr - origin_addr
         };
-        #app_args
         match #global_access.window_adapter_ref() {
             Ok(window_adapter) => {
                 let Some(local_tree) = #global_access.root_item_tree_weak.upgrade() else {
@@ -4483,7 +4487,6 @@ fn handler_write_carry_tokens(
                     if tree_identity == local_identity {
                         return;
                     }
-                    #posted_args
                     // The item's tree is the drawn copy of the tree the offset
                     // was measured on; the helper re-binds `_self` to the copy
                     // of this component that sits inside it.

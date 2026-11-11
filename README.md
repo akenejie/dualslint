@@ -89,7 +89,9 @@ UI スレッド                              Render スレッド
   アプリ tree のポップアップ処理が受け、閉じは close policy が決めて mirror へ carry されます。
 - ハンドラが書いた値は、mirror の対応するコンポーネントへ carry されます。carry の値はコンパイラが
   分類した所有権で決まり、スレッドを越えられる型の書き込みだけが運ばれます（モデルや画像は
-  参照なので運べず、その表示は `set_xxx` での再同期に従います）。
+  参照なので運べず、その表示は `set_xxx` での再同期に従います）。アプリケーションからの
+  callback / function の呼び出し（`invoke_xxx`）も意味論なので、アプリの tree で実行されます。
+  呼ばれた本体が書いた値は同じ carry が運びます。
 
 ## ハンドオーバー（描画権の引き渡し）
 
@@ -121,7 +123,6 @@ UI スレッド → 描画スレッドは **mpsc チャネル** です。送信�
 pub enum RenderMessage {
     Configure { window, width, height, scale_factor },
     Resize { window_id, width, height },
-    User(Box<dyn FnOnce() + Send>),              // 任意クロージャを render スレッドで実行
     AttachComponent { factory, property_access }, // mirror tree を render スレッド上で生成
     WindowMapped,                                // ウィンドウの map に同期した確定プレゼント
     NotifyFirstPresent(tx),                      // 初回プレゼントの通知

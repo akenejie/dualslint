@@ -548,25 +548,6 @@ pub fn invoke(
     invoke_on(instance, name, args)
 }
 
-/// Whether a call to `name` on `instance` can be carried to the thread that
-/// draws the window, run there, and bring its value back.
-///
-/// A window-rooted component's callback or function runs against the tree the
-/// window shows, which a backend may draw on another thread, so its arguments
-/// travel there and its return value comes back. Only plain values can make the
-/// trip; a model or a callback is a reference into the tree the caller holds.
-pub fn can_cross_threads(instance: &Instance, name: &str) -> bool {
-    use i_slint_compiler::llr::is_thread_portable_type;
-    let Some((public, _)) = resolve_root(instance) else { return false };
-    let Some(prop) = find_public_property(public, name) else { return false };
-    let (args, ret) = match &prop.ty {
-        Type::Callback(callback) => (&callback.args, &callback.return_type),
-        Type::Function(function) => (&function.args, &function.return_type),
-        _ => return false,
-    };
-    is_thread_portable_type(ret) && args.iter().all(is_thread_portable_type)
-}
-
 /// Run a public callback or function on `instance` without any thought for
 /// another thread.
 ///
@@ -657,7 +638,7 @@ fn resolve_root(instance: &Instance) -> Option<(&PublicComponent, Pin<Rc<SubComp
 /// Name-based lookup of a public property on an exported global singleton.
 /// Returns the looked-up property plus the runtime `GlobalInstance`.
 fn resolve_global<'a>(
-    instance: &'a VRc<ItemTreeVTable, Instance>,
+    instance: &'a Instance,
     global_name: &str,
     prop_name: &str,
 ) -> Option<(&'a PublicProperty, Rc<crate::globals::GlobalInstance>)> {
@@ -676,7 +657,7 @@ fn resolve_global<'a>(
 /// whose `public_properties` map carries the entry, so the member index
 /// must be resolved against the target global, not the source.
 fn resolve_global_property(
-    instance: &VRc<ItemTreeVTable, Instance>,
+    instance: &Instance,
     source_inst: Rc<crate::globals::GlobalInstance>,
     prop: &PublicProperty,
 ) -> Option<(Rc<crate::globals::GlobalInstance>, i_slint_compiler::llr::LocalMemberIndex)> {
@@ -712,6 +693,15 @@ pub fn set_global(
     instance: &VRc<ItemTreeVTable, Instance>,
     global_name: &str,
     prop_name: &str,
+    value: Value,
+) -> Result<(), SetPropertyError> {
+    set_global_on(instance, global_name, prop_name, value)
+}
+
+fn set_global_on(
+    instance: &Instance,
+    global_name: &str,
+    prop_name: &str,
     mut value: Value,
 ) -> Result<(), SetPropertyError> {
     let (prop, source_inst) =
@@ -726,11 +716,57 @@ pub fn set_global(
         .ok_or(SetPropertyError::NoSuchProperty)?;
     match member {
         i_slint_compiler::llr::LocalMemberIndex::Property(_) => {
-            crate::eval::store_global(&target_inst, &member, value);
+            crate::eval::store_global(&target_inst, &member, value.clone());
+            // The value is on the tree the instance holds; a backend that draws
+            // a tree of its own holds another copy of the global, and that is
+            // the one whose bindings decide what is seen. Carry the value there
+            // too, for a type that can travel -- the same rule the root's
+            // public properties follow.
+            if i_slint_compiler::llr::is_thread_portable_type(&prop.ty) {
+                forward_global_property(instance, global_name, prop_name, value.clone());
+            }
             Ok(())
         }
         _ => Err(SetPropertyError::NoSuchProperty),
     }
+}
+
+/// Carry a global property's value from the instance the application holds to
+/// the tree the window shows, when a backend draws one of its own.
+fn forward_global_property(
+    instance: &Instance,
+    global_name: &str,
+    prop_name: &str,
+    value: Value,
+) {
+    let Some(adapter) = instance.window_adapter_or_default() else { return };
+    let Some(local_tree) = instance.self_weak.get().and_then(|w| w.upgrade()) else { return };
+    let local_tree = VRc::into_dyn(local_tree);
+    struct Carried {
+        global: String,
+        prop: String,
+        value: Value,
+    }
+    unsafe impl Send for Carried {}
+    let state = Carried { global: global_name.to_string(), prop: prop_name.to_string(), value };
+    struct CarriedPtr(*const Carried);
+    unsafe impl Send for CarriedPtr {}
+    impl CarriedPtr {
+        fn get(&self) -> &Carried {
+            // SAFETY: the pointee outlives this call, which returns before it.
+            unsafe { &*self.0 }
+        }
+    }
+    let ptr = CarriedPtr(&state as *const _);
+    let run = move |tree: &ItemTreeRc| {
+        let carried = ptr.get();
+        let screen = VRef::downcast_pin::<Instance>(VRc::borrow_pin(tree))
+            .expect("the tree on screen is not this interpreter component");
+        // The screen tree is the same program, so the global resolves on it
+        // the same way; a set that fails there has nothing to say.
+        let _ = set_global_on(screen.get_ref(), &carried.global, &carried.prop, carried.value.clone());
+    };
+    adapter.run_on_screen_tree(local_tree, Box::new(run));
 }
 
 /// Install a handler on a public callback declared on an exported global

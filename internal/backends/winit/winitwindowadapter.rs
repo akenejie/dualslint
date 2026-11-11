@@ -2017,7 +2017,8 @@ impl WinitWindowAdapter {
     /// the id names, so the first session materializes the rows it needs and
     /// the lookup is retried once.
     fn ui_tree_item(&self, id: u64) -> Option<ItemRc> {
-        let component = WindowInner::from_pub(self.window()).component();
+        let window_inner = WindowInner::from_pub(self.window());
+        let component = window_inner.component();
         if let Some(item) = i_slint_core::item_tree::find_item_by_stable_id(&component, id) {
             return Some(item);
         }
@@ -2033,7 +2034,21 @@ impl WinitWindowAdapter {
                 return Some(item);
             }
         }
-        i_slint_core::item_tree::find_item_by_stable_id(&component, id)
+        if let Some(item) = i_slint_core::item_tree::find_item_by_stable_id(&component, id) {
+            return Some(item);
+        }
+        // A popup's items live in a tree of their own. The structure the
+        // application tree holds includes the popups its shows opened, so the
+        // id the drawn copy published for a popup's control names an item here
+        // too -- this is what lets a press inside a popup open an editing
+        // session the same way a press on the window's own controls does.
+        for popup in window_inner.active_popups().iter() {
+            if let Some(item) = i_slint_core::item_tree::find_item_by_stable_id(&popup.component, id)
+            {
+                return Some(item);
+            }
+        }
+        None
     }
 
     /// Focus the control the id names, on the tree this thread owns.

@@ -332,7 +332,6 @@ pub enum RenderMessage {
         height: u32,
     },
     /// Execute an arbitrary closure on the render thread.
-    User(Box<dyn FnOnce() + Send>),
     /// Ask this thread to signal the UI thread once its first frame for the
     /// attached component is on the screen.  The UI thread maps the window
     /// only then: a window that maps before the first present shows whatever
@@ -1856,9 +1855,6 @@ impl RenderCore {
                             let context = WindowInner::from_pub(adapter.window()).context();
                             context.set_accent_color(color);
                         }
-                    }
-                    RenderMessage::User(f) => {
-                        f();
                     }
                     RenderMessage::NotifyFirstPresent(tx) => {
                         self.first_present_notify = Some(tx);

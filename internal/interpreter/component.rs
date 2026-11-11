@@ -311,54 +311,65 @@ impl ComponentInstanceInner {
         public_api::set(&self.0, name, value)
     }
 
+    /// Carry the portable public values the application's tree now holds to
+    /// the tree the window draws.
+    ///
+    /// `Value` is not `Send` because a model is a shared reference, but the
+    /// carried values are plain ones, and the task runs before
+    /// `run_on_screen_tree` returns, which is what lending them through a
+    /// pointer here makes sound.
+    fn carry_portable_state(
+        instance: &VRc<ItemTreeVTable, Instance>,
+        adapter: &i_slint_core::window::WindowAdapterRc,
+        changed: Vec<(String, Value)>,
+    ) {
+        struct CarriedState(Vec<(String, Value)>);
+        unsafe impl Send for CarriedState {}
+        let state = CarriedState(changed);
+        struct StatePtr(*const CarriedState);
+        unsafe impl Send for StatePtr {}
+        let state = StatePtr(&state as *const _);
+        let local_tree = VRc::into_dyn(instance.clone());
+        let run = move |tree: &i_slint_core::item_tree::ItemTreeRc| {
+            let state = &state;
+            // SAFETY: the pointer is to `state`, which outlives this call.
+            let state = unsafe { &*state.0 };
+            let screen = vtable::VRef::downcast_pin::<Instance>(VRc::borrow_pin(tree))
+                .expect("the tree on screen is not this interpreter component");
+            public_api::apply_portable_public_state(screen.get_ref(), &state.0);
+        };
+        adapter.run_on_screen_tree(local_tree, Box::new(run));
+    }
+
     pub fn invoke(&self, name: &str, args: &[Value]) -> Option<Value> {
-        // A window-rooted component's call belongs on the tree the window shows,
-        // which a backend may draw on another thread. Plain arguments and a
-        // plain return can make that trip; anything else stays here, because a
-        // model or a callback is a reference into the tree the caller holds.
-        if public_api::can_cross_threads(&self.0, name)
-            && let Some(adapter) = self.0.window_adapter_or_default()
-        {
-            // The carried call and its answer. `Value` is not `Send` because a
-            // model is a shared reference, but a call that can cross carries
-            // only plain values, and the backend runs the task before returning,
-            // so lending it here is what keeps the value where it belongs.
-            struct CarriedCall {
-                name: String,
-                args: Vec<Value>,
-                result: Option<Value>,
-            }
-            // SAFETY: see the comment above; `can_cross_threads` admitted the
-            // call because every value in it is a plain one, and the task runs
-            // before `run_on_screen_tree` returns.
-            unsafe impl Send for CarriedCall {}
-
-            let mut call =
-                CarriedCall { name: name.to_string(), args: args.to_vec(), result: None };
-            // The closure needs the call for `'static`, but its answer has to
-            // reach the caller here, so the task holds a pointer to it and the
-            // synchronous call is what makes that sound.
-            struct CallPtr(*mut CarriedCall);
-            unsafe impl Send for CallPtr {}
-
-            let call_ptr = CallPtr(&mut call as *mut _);
-            let local_tree = VRc::into_dyn(self.0.clone());
-            let run = move |tree: &i_slint_core::item_tree::ItemTreeRc| {
-                // Hold the wrapper whole, so the closure carries the `Send`
-                // wrapper rather than the raw pointer on its own.
-                let call_ptr = &call_ptr;
-                // SAFETY: the pointer is to `call`, which outlives this call.
-                let call = unsafe { &mut *call_ptr.0 };
-                // The screen tree is this component's, built from the same
-                // program, so it is an interpreter instance.
-                let screen = vtable::VRef::downcast_pin::<Instance>(VRc::borrow_pin(tree))
-                    .expect("the tree on screen is not this interpreter component");
-                call.result = public_api::invoke_on(screen.get_ref(), &call.name, &call.args);
-            };
-            adapter.run_on_screen_tree(local_tree, Box::new(run));
-            return call.result;
+        // A call from application code is semantics: it runs on the tree the
+        // caller holds, the same tree its handlers run on, and what the called
+        // body changed carries to the tree the window draws -- the same rule
+        // the generated accessors follow. The carry takes the portable public
+        // values the call moved, so nothing the drawn tree animates on its own
+        // is rewound by it.
+        let adapter = self.0.window_adapter_or_default();
+        if adapter.as_ref().is_none_or(|a| {
+            a.hosts_drawn_tree()
+        }) {
+            return public_api::invoke(&self.0, name, args);
         }
-        public_api::invoke(&self.0, name, args)
+        let adapter = adapter.unwrap();
+        {
+            let before = public_api::portable_public_state(&self.0);
+            let result = public_api::invoke(&self.0, name, args);
+            let after = public_api::portable_public_state(&self.0);
+            let changed: Vec<(String, Value)> = after
+                .into_iter()
+                .filter(|(name, value)| {
+                    before.iter().find(|(n, _)| n == name).is_some_and(|(_, old)| old != value)
+                })
+                .collect();
+            if !changed.is_empty() {
+                Self::carry_portable_state(&self.0, &adapter, changed);
+            }
+            result
+        }
     }
 
     pub fn set_callback(
