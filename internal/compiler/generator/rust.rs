@@ -5992,6 +5992,111 @@ fn compile_builtin_function_call(
                         shared_global.clone()
                     }
                 };
+                // A show that runs on the application tree is only half the
+                // story: the popup is structure the drawn tree holds on its own
+                // -- the mirror's `show` ran there, and the geometry the pointer
+                // is hit-tested against is published from there. So the same
+                // construction is posted to the copy on screen, with `_self`
+                // re-bound the way a handler write's carry does. A show that
+                // already runs on the drawn tree posts to itself, and the guard
+                // in the task leaves it alone.
+                let popup_show_carry = if ctx.generator_state.in_callback_body
+                    && ctx.generator_state.carries_handler_writes
+                {
+                    let carry_component = ctx.parent_sub_component_idx(0).map(|idx| {
+                        inner_component_id(&ctx.compilation_unit.sub_components[idx])
+                    });
+                    let component_access_tokens = component_access_tokens.clone();
+                    carry_component.map(|carry_component| {
+                        let show_tokens = item_owner(anchor_ref).then_named(
+                            "carry_anchor_owner",
+                            |owner| {
+                                let (_, carry_parent_item) =
+                                    native_item_from_owner(anchor_ref, ctx, &owner);
+                                component_access_tokens.then(|component_access_tokens| {
+                                    let compo = quote!(#component_access_tokens #suffix);
+                                    quote!({
+                                        let parent_item = &#carry_parent_item;
+                                        let shared_global = #compo.globals.get().unwrap();
+                                        let window_adapter = shared_global.window_adapter_impl();
+                                        let window = sp::WindowInner::from_pub(window_adapter.window());
+                                        let globals = #globals_init;
+                                        let popup_instance = #popup_window_id::new(
+                                            #compo.self_weak.get().unwrap().clone(),
+                                            globals,
+                                        )
+                                        .unwrap();
+                                        let popup_instance_vrc = sp::VRc::map(popup_instance.clone(), |x| x);
+                                        if let Some(current_id) = #compo.#popup_id_name.take() {
+                                            window.close_popup(current_id);
+                                        }
+                                        let popup_instance_vrc_for_position = popup_instance_vrc.clone();
+                                        let access_position = sp::Box::new(move || {
+                                            let _self =
+                                                popup_instance_vrc_for_position.as_pin_ref(); #position
+                                        });
+                                        let popup_id = window.show_popup(
+                                            &sp::VRc::into_dyn(popup_instance.into()),
+                                            access_position,
+                                            #close_policy,
+                                            parent_item,
+                                            #window_kind,
+                                            sp::Box::new(|_| {}),
+                                        );
+                                        #compo.#popup_id_name.set(Some(popup_id));
+                                        #popup_window_id::user_init(popup_instance_vrc.clone());
+                                    })
+                                })
+                            },
+                        );
+                        quote!({
+                            let forwarded_self = _self.self_weak.get().unwrap().upgrade().unwrap();
+                            let forwarded_origin = sp::VRcMapped::origin(&forwarded_self);
+                            let forwarded_item =
+                                sp::ItemRc::new(forwarded_origin.clone(), 0).stable_id();
+                            let forwarded_offset = {
+                                let origin_addr = sp::VRef::as_ptr(::core::pin::Pin::into_inner(
+                                    sp::VRc::borrow_pin(&forwarded_origin),
+                                ))
+                                .as_ptr() as usize;
+                                let self_addr = (&*_self) as *const _ as usize;
+                                self_addr - origin_addr
+                            };
+                            match _self.globals().window_adapter_ref() {
+                                Ok(window_adapter) => {
+                                    let Some(local_tree) =
+                                        _self.globals().root_item_tree_weak.upgrade()
+                                    else {
+                                        unreachable!("the tree the handler runs on is its own root");
+                                    };
+                                    let local_identity = sp::item_tree_identity(&local_tree);
+                                    window_adapter.window().post_on_screen_tree(
+                                        local_tree,
+                                        move |tree| {
+                                            if sp::item_tree_identity(tree) == local_identity {
+                                                return;
+                                            }
+                                            sp::component_copy_at_offset(
+                                                &tree,
+                                                forwarded_item,
+                                                forwarded_offset,
+                                                |component: ::core::pin::Pin<
+                                                    &#carry_component,
+                                                >| {
+                                                    let _self = component;
+                                                    #show_tokens
+                                                },
+                                            );
+                                        },
+                                    );
+                                }
+                                Err(_) => {}
+                            }
+                        })
+                    }).unwrap_or_default()
+                } else {
+                    quote!()
+                };
                 // The optional 4th argument is a property reference to the synthesized `is-open`,
                 // mapped in this show call's own frame (see lower_show_popup_window), so it resolves
                 // directly against `ctx`/`_self`, exactly like `parent_ref`.
@@ -6055,6 +6160,7 @@ fn compile_builtin_function_call(
                         );
                         #compo.#popup_id_name.set(Some(popup_id));
                         #popup_window_id::user_init(popup_instance_vrc.clone());
+                        #popup_show_carry
                     })
                     })
                 })

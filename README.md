@@ -33,6 +33,10 @@ GUI は人間とコンピュータの間の情報伝達のための手段です�
 「UI スレッドが描画した図をシリアライズして render へ送る」方式は、所有権を UI が握るために生まれた
 中間表現であり、**思想違反として廃止済み**です。描画は上流のコード（`FemtoVGRenderer::render()`）を
 render スレッド上でそのまま駆動します。
+6. **所有権はコンパイラが割り当てる。** 各プロパティは使用解析で Ui / Render / Shared に分類され、
+   その割り当ては生成コードに埋め込まれます。UI イベントに起因する処理（ハンドラ）はアプリケーションの
+   tree で実行され、描画に必要な値は mirror の対応するコピーへ carry されます。時間起点の処理
+   （アニメーション・タイマ）は入力でも OS 通信でもないので、mirror tree の自治です。
 
 ## アーキテクチャ（2スレッド分離）
 
@@ -43,8 +47,9 @@ render スレッド上でそのまま駆動します。
 | 担当 | UI スレッド | 描画スレッド（Render スレッド） |
 |---|---|---|
 | ウィンドウ / イベントループ | ✅ winit のイベントループとネイティブウィンドウ | — |
-| 入力（マウス・キーボード）・OS イベント | ✅ 座標を論理ピクセルへ直し、発行済み geometry で hit-test | — |
-| 画面に描かれる item tree・プロパティ | — | ✅ factory から作った mirror tree（bindings/timers 含む） |
+| 入力（マウス・キーボード）・OS イベント | ✅ 座標を論理ピクセルへ直す。ポインタの意味論（グラブ・クリック回数・ハンドラ実行）はアプリ自身の tree が処理する | — |
+| ハンドラ（UIイベントに起因する処理） | ✅ アプリの tree で実行。描画に必要な値は mirror へ carry | — |
+| 画面に描かれる item tree・プロパティ | — | ✅ factory から作った mirror tree（bindings / timers / アニメーション含む） |
 | テキストレイアウト（sharedparley） | — | ✅ 上流の描画経路内で実施 |
 | GL コンテキスト（glutin） | — | ✅ |
 | 描画（上流 `FemtoVGRenderer` / `SoftwareRenderer`） | — | ✅ |
@@ -57,26 +62,33 @@ UI スレッド                              Render スレッド
 │ window (native)            │          │ property graph / bindings  │
 │ app 自身の component の handle │          │ glutin GL context          │
 │ 入力イベントの解決          │          │ 上流 renderer::render()    │
-│  └─ hit-test / 動詞化 ─────┼────┐     │ swap / present             │
+│  └─ アプリ tree で意味論 ──┼────┐     │ swap / present             │
 └────────────────────────────┘    │     └─────────────▲──────────────┘
                                   │ mpsc             │
                      {Configure, Resize,  ───────────┘
                       AttachComponent,                  control geometry /
-                     ApplyControlState,                 状態を共有表へ publish
-                     ActivateControl,
-                     KeyToRenderControl,
-                     SetControlProperty,
-                     GetControlProperty,
-                     RunOnScreenTree, …}
+                      ApplyControlState,                状態を共有表へ publish
+                      SetTextState,
+                      SetViewportOffset,
+                      SetControlFocus,
+                      SetControlProperty,
+                      GetControlProperty,
+                      RunOnScreenTree, …}
 ```
 
 - **画面の扱い方**は上流と同じ 1 本の tree に対するものだけです。UI スレッドから見ると、その tree は
   スレッドを隔てた別インスタンスなので、`render_thread` の API（下表）を介して操作します。
 - アプリの handle が握る component（`AppWindow` 等）は UI スレッド側にも残りますが、**それは描画の
   対象ではありません**。表示されているのは render スレッドが factory から作った mirror です。
-- 入力は生のまま render へ渡しません。UI スレッドが publish 済み geometry で hit-test し、コントロールを
-  名指す「動詞」（hover / press / activate / scroll / pinch / rotate）だけを渡します。コントロールが
-  何をするか（`clicked` / `toggled` / `accepted` の実行）は、tree を所有する render スレッドの責務です。
+- 入力は生のまま render へ渡しません。UI スレッドはイベントをアプリ自身の tree のウィンドウ処理へ渡し、
+  意味論（グラブ、クリック回数、ハンドラの実行）はそちらで決まります。画面の mirror tree へは、
+  hit-test の結果として決まる**状態**（hover / pressed、テキスト編集の状態、スクロールのビューポート）
+  だけが push されます。wheel / pinch / rotate は描画の主権に属する入力なので mirror tree で処理します。
+  ポップアップは mirror tree だけが持つ構造で（`show` がそちらへ行くため）、その中のイベントは
+  mirror tree が処理し、アプリへの効果は host callback の転送で戻ります。
+- ハンドラが書いた値は、mirror の対応するコンポーネントへ carry されます。carry の値はコンパイラが
+  分類した所有権で決まり、スレッドを越えられる型の書き込みだけが運ばれます（モデルや画像は
+  参照なので運べず、その表示は `set_xxx` での再同期に従います）。
 
 ## ハンドオーバー（描画権の引き渡し）
 
@@ -95,7 +107,9 @@ UI スレッド                              Render スレッド
 
 ハンドオーバー前後で、アプリが show 前に設定した public プロパティの値は mirror へ引き継がれます
 （`run_render_handover`）。show 後の public プロパティの setter も、型がスレッドを越えられるものなら
-描画中の tree（screen tree）へ転送されます。
+描画中の tree（screen tree）へ転送されます。ハンドラが mirror の項目のプロパティに書いた値も同じです:
+ハンドラはアプリの tree で実行され、持ち運べる型の書き込みは mirror の対応するコピーへ carry されます
+（モデルや画像など参照の型は運べず、呼び出し側の tree が持つ値のままです）。
 
 ## 描画スレッドのプロトコル
 
@@ -108,18 +122,22 @@ pub enum RenderMessage {
     Resize { window_id, width, height },
     User(Box<dyn FnOnce() + Send>),              // 任意クロージャを render スレッドで実行
     AttachComponent { factory, property_access }, // mirror tree を render スレッド上で生成
-    ApplyControlState { id, hovered, pressed },
+    WindowMapped,                                // ウィンドウの map に同期した確定プレゼント
+    NotifyFirstPresent(tx),                      // 初回プレゼントの通知
+    SetFontCollection(data),                     // フォントコレクションの共有
+    ApplyControlState { id, hovered, pressed },  // hover / press の状態 push
+    SetTextState { id, state },                  // テキスト編集の状態 push（text・cursor・anchor・preedit）
+    GetTextState { id, response },               // 同状態の読み取り（編集セッション開始時の pull）
+    SetViewportOffset { id, x, y },              // スクロールのビューポート push（描画の主権）
+    SetControlFocus { id } / ClearControlFocus { id }, // mirror 側フォーカスの指示
+    CursorGeometry { id, query, response },      // キャレット矩形（mirror が測る）
+    InputMethodProperties { id, response },      // IME へ渡す性質（mirror が測る）
     SetControlProperty { id, property, value, response },
     GetControlProperty { id, property, response },
-    ActivateControl { id, response },
-    KeyToRenderControl { event, response },
-    PressControl { id, button, position },
-    MoveControl { position, finger_id },
-    ReleaseControl { id, button, position },
-    ScrollControl { id, position, delta_x, delta_y },
+    ScrollControl { id, position, delta_x, delta_y }, // wheel（描画の主権に属する入力）
     PinchControl { id, position, delta },
     RotateControl { id, position, delta },
-    RunOnScreenTree { task, done },
+    RunOnScreenTree { task, done },              // mirror tree でクロージャを実行
     RequestRedraw,
     SetAccent { color },
     HitTest { x, y, response },
@@ -146,30 +164,34 @@ rendered tree のコントロールは、共有座標表（`coordinate_map()` �
 
 | API | 意味 |
 |---|---|
-| `hit_test(x, y)` / `control_at(x, y)` | publish 済み geometry で最も特定度の高いコントロール id を得る |
-| `apply_control_state(id, hovered, pressed)` | hover / press 状態を要求（bindings が上流のとおり再計算される） |
-| `activate_control(id)` | クリック = press/release の組を tree に届ける。`clicked` の発火は tree の責務 |
-| `press_control` / `move_control` / `release_control` / `scroll_control` / `pinch_control` / `rotate_control` | drag・wheel・ピンチ・回転の動詞 |
-| `send_key_to_control(event)` | `InternalKeyEvent` をそのまま tree へ。解釈（カーソル移動・選択・IME・`accepted`）は item の仕事 |
+| `hit_test(x, y)` / `control_at(x, y)` | publish 済み geometry で最も特定度の高いコントロール id を得る。UI スレッドの hit-test（描画状態の適用と、イベントをどちらの tree へ渡すかの判定）に使う |
+| `apply_control_state(id, hovered, pressed)` | hover / press の状態を mirror の該当項目へ割り当てる（bindings が上流のとおり再計算される） |
+| `set_text_state(id, state)` / `get_text_state(id)` | テキスト編集の状態（text・cursor・anchor・preedit）の push と、編集セッション開始時の pull |
+| `set_viewport_offset(id, x, y)` | スクロールのビューポートの push。drag による pan はアプリ tree が処理し、届いた位置が mirror の主権になる |
+| `set_control_focus(id)` / `clear_control_focus(id)` / `focused_control()` | mirror 側のフォーカス。UI スレッドがフォーカスを決め、mirror へ通知する |
+| `cursor_geometry(id, query)` / `input_method_properties(id)` / `ime_ui_owned(id)` | キャレット矩形と IME の性質。mirror が自分のフォントで測り、UI スレッドの IME 会話に使う |
 | `get_control_property(id, name)` / `set_control_property(id, name, value)` | 名前ベースのプロパティ読み書き（`text` / `color` / `checked` 等） |
 | `ComponentPropertyAccess::new(read, write)` | built-in item にない複合 component のプロパティは、app が貸す 2 つのクロージャで解決 |
-| `run_on_screen_tree(local_tree, task)` | window-rooted な callback / function 呼び出しを描画中の tree で実行し、戻り値を回収 |
+| `press_targets()` / `press_target_at(...)` / `control_coord(id)` / `focus_order()` | 公開されたコントロールの表（press 対象・座標・Tab 順）の読み取り |
+| `run_on_screen_tree(local_tree, task)` / `post_on_screen_tree(task)` | mirror tree でクロージャを実行する。前者は戻り値を待ち、後者は投げっぱなし |
+| `scroll_control` / `pinch_control` / `rotate_control` | wheel・ピンチ・回転。描画の主権に属する入力で、mirror tree が処理する |
+| `notify_first_present(tx)` / `present_for_mapped_window()` / `send_font_collection(data)` | 起動時の確定プレゼント（`WindowMapped` と組み合わせる）とフォントコレクションの共有 |
 
-publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hover / press の状態と、`checked` のような
-トグルの値を tree が持つため、UI スレッドは自分の記憶で推測しません。
+publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hover / press は push され、`checked` の
+ようなトグルの値はハンドラの carry で届くため、UI スレッドは自分の記憶で推測しません。
 
 ## 上流slintからの変更点
 
 | 領域 | 変更 |
 |---|---|
-| `internal/backends/winit/render_thread.rs` | **新規（本体）**。render スレッドの GL/software ドライバ。`RenderMessage` プロトコル・`RenderHost`（送信側）・mirror tree 生成（`AttachComponent`）・control 借用 API・`RunOnScreenTree` |
-| `internal/backends/winit/winitwindowadapter.rs` | `draw()` は描画しない（handover を開始するだけ）。入力イベントを publish geometry で解決して動詞化。`request_redraw()` のフィルタ |
+| `internal/backends/winit/render_thread.rs` | **新規（本体）**。render スレッドの GL/software ドライバ。`RenderMessage` プロトコル・`RenderHost`（送信側）・mirror tree 生成（`AttachComponent`）・状態 push の受領・`RunOnScreenTree` |
+| `internal/backends/winit/winitwindowadapter.rs` | `draw()` は描画しない（handover を開始するだけ）。ポインタの意味論をアプリ tree のウィンドウ処理へディスパッチし、描画状態を mirror へ push。ハンドラが書いた値の carry。`request_redraw()` のフィルタ |
 | `internal/backends/winit/lib.rs` | `pub mod render_thread`。デフォルトレンダラ選択を「render スレッドが描けるもの」（femtovg / software）に変更 |
 | `internal/backends/winit/renderer/sw.rs` | ソフトウェア描画の UI スレッド駆動を撤去し、render スレッドの present 経路へ |
 | `internal/backends/scene/` | **新規クレート**。control プロトコル型（`PublishedControls` / `ControlPropertyValue` / C ABI）と geometry のみのコントロール走査（`encode_window_controls`） |
 | `internal/backends/android-activity/` | 同思想の render スレッド（`SkiaRenderer` を `ANativeWindow` に束縛、CPU ラスタ含む） |
-| `internal/core/` | `WindowInner::render_factory`（生成コードが factory を残す場所）、`WindowAdapter::run_on_screen_tree()`、`render_handover`、`ComponentPropertyAccess` の土台 |
-| `internal/compiler/` | Rust/C++/LLR: window-rooted な `invoke_*` の screen tree へのルーティング、複合 component の public プロパティが unused-remove されないよう保持、no_std でも通る render factory 登録 |
+| `internal/core/` | `WindowInner::render_factory`（生成コードが factory を残す場所）、`WindowAdapter::run_on_screen_tree()` / `post_on_screen_tree()`、`render_handover`、`hosts_drawn_tree`（キー配送の可視性ゲート）、`ComponentPropertyAccess` の土台 |
+| `internal/compiler/` | 所有権分類（`passes/property_ownership.rs`）とその LLR への埋め込み、ハンドラ書き込みの carry コード生成、window-rooted な `invoke_*` の screen tree へのルーティング、複合 component の public プロパティが unused-remove されないよう保持、no_std でも通る render factory 登録 |
 | `internal/interpreter/` | `CompilationUnit` を `Send + Sync` 化（`RwLock` / `AtomicUsize`）して render スレッドでも instance を生成可能に。window-rooted 呼び出しの screen tree ルーティング |
 | `api/rs/slint` / `api/cpp` / `api/node` / `api/python` | `slint::render_thread`（`request_redraw`・control 借用・`attach_component*`）の公開とバインディング |
 
@@ -180,10 +202,15 @@ publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hov
 | 項目 | 説明 |
 |---|---|
 | `request_redraw()` | 任意スレッドから再描画を要求。`Window::request_redraw()` の置き換え |
+| `click(window, x, y)` | ウィンドウのポインタ経路（アプリ tree の意味論を含む）をそのまま通るクリック。診断ドライバ用 |
 | `RenderHost::attach_component(_to)` / `attach_component_with(_to)` | mirror tree を明示的に生成（自動ハンドオーバーを使わない場合） |
-| `RenderHost::hit_test` / `control_at` / `apply_control_state` / `activate_control` / `press_control` / `move_control` / `release_control` / `scroll_control` / `pinch_control` / `rotate_control` / `send_key_to_control` | control 借用 API |
+| `RenderHost::hit_test` / `control_at` / `apply_control_state` | 公開 geometry に対する hit-test と描画状態の push |
+| `RenderHost::set_text_state` / `get_text_state` / `set_viewport_offset` / `set_control_focus` / `clear_control_focus` | mirror への状態 push（テキスト編集・スクロール・フォーカス） |
+| `RenderHost::scroll_control` / `pinch_control` / `rotate_control` | wheel・ピンチ・回転（描画の主権に属する入力） |
 | `RenderHost::get_control_property` / `set_control_property` | 名前ベースのプロパティ読み書き |
-| `RenderHost::has_attached_component` / `run_on_screen_tree` / `send_user` / `send_quit` | render スレッドの状態確認と同期呼び出し |
+| `RenderHost::press_targets` / `press_target_at` / `control_coord` / `focus_order` / `cursor_geometry` / `input_method_properties` / `ime_ui_owned` / `focused_control` | 公開表の読み取り |
+| `RenderHost::has_attached_component` / `run_on_screen_tree` / `post_on_screen_tree` / `send_quit` | render スレッドの状態確認と mirror tree での実行 |
+| `notify_first_present` / `present_for_mapped_window` / `send_font_collection` | 起動時の確定プレゼントとフォントコレクションの共有 |
 | `coordinate_map()` / `active_host()` / `hosts()` / `hwnd()` | 共有座標表とホスト列挙（`hwnd` は Windows） |
 
 ## 上流 API との関係
@@ -198,15 +225,18 @@ publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hov
   描かないため window は blank になり、その旨を一度だけ報告します（Android は例外で、Skia を
   render スレッド経由で使用）。
 - **複数 window は 1 window につき 1 つの render スレッド** です。window ごとに別スレッドが
-  立ち上がり、それぞれが自分の mirror tree と描画コンテキストを所有します。drag の一部
-  （`MoveControl` は実装済み）など、未対応の動詞は「残る gap」としてレンダラの実装コメントに
-  記録されています。
+  立ち上がり、それぞれが自分の mirror tree と描画コンテキストを所有します。pointer の drag は
+  アプリ tree が処理します。未対応の入力（touch の一部など）は「残る gap」としてレンダラの
+  実装コメントに記録されています。
 
 ### 状態・モデルの同期に関する設計規約
 
-- **UI スレッドが状態・モデルを管理し、必要に応じて Render 側へ明示的に同期する:**
-  dualslint では、アプリケーションのデータモデル（`VecModel` 等）や状態は UI スレッド側で管理されます。モデルの変更（アイテムの追加や削除など）やソート・フィルタの適用を行った際、render スレッド側の mirror tree へ変更を反映させるには、UI 側から `set_xxx` 等を呼び出して明示的にデータを同期させる必要があります。
-  フレームワーク側で暗黙的な全状態コピーや全自動同期は行わず、不必要なパフォーマンス低下や所有権の曖昧さを排除するため、状態の伝達タイミングはアプリケーション側の判断と責任に委ねられています。
+- **持ち運べる値は carry が運び、モデルは明示的に同期する:**
+  コンパイラが分類した所有権のもと、ハンドラが書いた持ち運べる型の値（数値・文字列・色など）と、
+  公開 setter に渡った持ち運べる型の値は、mirror の対応するコピーへ自動で carry されます。一方、
+  アプリケーションのデータモデル（`VecModel` 等）は参照でスレッドを越えて運べないため、mirror の表示を
+  変えるには UI 側から `set_xxx` を呼び出して明示的に再同期する必要があります。行の追加・削除を
+  mirror が追うのは、その再同期が行われたときです。
 - **導出される表示は「再適用する同期関数」をアプリ側で定義し、モデルを変更したら呼び出す:**
   ソートやフィルタで `set_xxx` に渡すモデルを作り替える処理は、`.slint` 側にコールバックとして宣言します。コンパイラが `on_xxx`（ハンドラ設定）と `invoke_xxx`（呼び出し）のアクセサを生成するので、UI コードはモデルを変更したあとに必ず `invoke_xxx` を呼びます。アプリケーションの状態から表示モデルを作り直す手順を一つの関数にまとめることで、同期のタイミングを呼び出し一箇所に集約できます。
 
