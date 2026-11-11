@@ -4434,26 +4434,39 @@ fn handler_write_carry_tokens(
     // value expression is never re-evaluated on the drawn tree, because it may
     // name locals the handler's own scope declared -- an inlined call's
     // argument, say -- which a second evaluation could not reach.
-    let ty = ctx.property_ty(property);
+    // The read-back is the property's own value, in its native type: the set
+    // on the drawn copy assigns what the set here assigned, with no
+    // conversion in between. The walk to a parent can die (a popup closed
+    // itself, a row left the model), so there the value reads as an `Option`
+    // and only a write that landed here is carried. A type the thread refuses
+    // to move -- a model, an image, a brush -- keeps its write where the
+    // handler ran; the drawn tree follows those through `set_xxx`.
+    if !crate::llr::is_send_type(&ctx.property_ty(property)) {
+        return None;
+    }
     let (app_write, posted_write) = match access_member(property, ctx) {
         MemberAccess::Direct(prop) => {
-            let read_back = primitive_property_value(&ty, MemberAccess::Direct(prop.clone()));
+            let read_back = MemberAccess::Direct(prop.clone()).get_property();
             (
                 quote! {
                     #set_tokens;
                     let forwarded_value = #read_back;
                 },
-                quote!(#prop.set(forwarded_value as _);),
+                quote!(#prop.set(forwarded_value);),
             )
         }
         MemberAccess::Option(prop) => {
-            let read_back = primitive_property_value(&ty, MemberAccess::Option(prop.clone()));
+            let read_back = quote!(#prop.map(|x| x.get()));
             (
                 quote! {
                     #set_tokens;
                     let forwarded_value = #read_back;
                 },
-                quote!(#prop.map(|x| x.set(forwarded_value as _));),
+                quote! {
+                    if let Some(forwarded_value) = forwarded_value {
+                        #prop.map(|x| x.set(forwarded_value));
+                    }
+                },
             )
         }
         MemberAccess::OptionFn(..) => return None,
