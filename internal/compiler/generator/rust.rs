@@ -1736,54 +1736,6 @@ impl CallTarget {
         }
     }
 
-    /// The statements a one-way call runs: posted to the tree on screen,
-    /// without waiting for it to have run.
-    ///
-    /// The compiler posts calls whose effect is the point and whose types
-    /// carry nothing that needs bringing back -- a callback that answers
-    /// `void`, a property assignment. Waiting for such a call would stall the
-    /// caller on a round trip that returns nothing, and a call posted when no
-    /// tree is drawn anymore is dropped, because there is nothing left for it
-    /// to reach.
-    fn wrap_oneshot(&self, call: TokenStream) -> TokenStream {
-        match self {
-            CallTarget::OwnTree => call,
-            CallTarget::ScreenTree { window, inner_component } => quote! {
-                #window.post_on_screen_tree(
-                    sp::VRc::into_dyn(self.0.clone()),
-                    move |tree| {
-                        let component = sp::VRc::map_dyn(tree.clone(), |tree| {
-                            sp::VRef::downcast_pin::<#inner_component>(tree)
-                                .expect("the tree on screen is not the component the call belongs to")
-                        });
-                        let _self = component.as_pin_ref();
-                        #call
-                    },
-                )
-            },
-            CallTarget::GlobalTree { root_inner, global_id, .. } => quote! {
-                let _self = self.0.as_ref();
-                match _self.globals().window_adapter_ref() {
-                    Ok(window_adapter) => {
-                        let Some(local_tree) = _self.globals().root_item_tree_weak.upgrade() else {
-                            return;
-                        };
-                        window_adapter.window().post_on_screen_tree(local_tree, move |tree| {
-                            let Some(root_pinned) =
-                                sp::VRef::downcast_pin::<#root_inner>(sp::VRc::borrow_pin(tree))
-                            else {
-                                return;
-                            };
-                            let _self = root_pinned.globals().#global_id.as_ref();
-                            #call
-                        })
-                    }
-                    Err(_) => #call,
-                }
-            },
-        }
-    }
-
     /// The statements a property carry runs: the value assigned onto the tree
     /// on screen, one way.
     ///
@@ -1901,22 +1853,15 @@ fn public_api(
                 (0..callback.args.len()).map(|i| format_ident!("arg_{}", i)).collect::<Vec<_>>();
             let caller_ident = accessor_names::rust_accessor_ident(name, AccessorKind::Invoker);
             let call = quote!(#prop.call(&(#(#args_name,)*)));
-            // A callback that answers void has nothing to bring back, so the
-            // call goes one way: posted to the tree on screen rather than
-            // waited on. One that returns a value still needs the answer, so
-            // it waits.
-            let call = if call_target.takes(&callback.args, &callback.return_type) {
-                if matches!(callback.return_type, Type::Void) {
-                    call_target.wrap_oneshot(call)
-                } else {
-                    call_target.wrap(call)
-                }
-            } else {
-                quote!(
-                    let _self = #self_init;
-                    #call
-                )
-            };
+            // A call from application code is semantics: it runs on the tree
+            // the caller holds, the same tree its handlers run on. What the
+            // called body writes travels on its own -- a handler write carries
+            // to the drawn tree, a popup it opens carries the same way -- so
+            // the drawn copy follows without the call itself crossing.
+            let call = quote!(
+                let _self = #self_init;
+                #call
+            );
             property_and_callback_accessors.push(quote!(
                 #[allow(dead_code)]
                 pub fn #caller_ident(&self, #(#args_name : #callback_args,)*) -> #return_type {
@@ -1953,14 +1898,12 @@ fn public_api(
                 (0..function.args.len()).map(|i| format_ident!("arg_{}", i)).collect::<Vec<_>>();
             let caller_ident = accessor_names::rust_accessor_ident(name, AccessorKind::Invoker);
             let call = quote!(#prop(#(#args_name,)*));
-            let call = if call_target.takes(&function.args, &function.return_type) {
-                call_target.wrap(call)
-            } else {
-                quote!(
-                    let _self = #self_init;
-                    #call
-                )
-            };
+            // Same rule as the callbacks: a function answers from the tree the
+            // caller holds, where the application's own state lives.
+            let call = quote!(
+                let _self = #self_init;
+                #call
+            );
             property_and_callback_accessors.push(quote!(
                 #[allow(dead_code)]
                 pub fn #caller_ident(&self, #(#args_name : #callback_args,)*) -> #return_type {
@@ -6116,20 +6059,102 @@ fn compile_builtin_function_call(
                     // immediately and with `false` from every close path (see window.rs). Passing it
                     // directly into `show_popup` avoids an extra registration call and a second popup
                     // lookup. Menus and `is-open`-less popups get a no-op setter.
-                    let (is_open_self_weak_decl, is_open_setter) = match &is_open_set_expr {
-                        Some(set_expr) => (
-                            quote!(let is_open_self_weak = _self.self_weak.get().unwrap().clone();),
+                    // A popup closed on this tree leaves the copy on the drawn
+                    // tree standing: the mirror's own close policy never runs,
+                    // because no pointer meaning is processed there. So the
+                    // close posts too, taking the drawn copy's own popup id and
+                    // closing it against the mirror's window. A close that runs
+                    // on the drawn tree posts to itself, and the guard in the
+                    // task leaves it alone.
+                    let close_carry = if ctx.generator_state.carries_handler_writes {
+                        let close_component =
+                            ctx.parent_sub_component_idx(0).map(|idx| {
+                                inner_component_id(&ctx.compilation_unit.sub_components[idx])
+                            });
+                        close_component.map(|close_component| {
                             quote! {
-                                sp::Box::new(move |value: bool| {
-                                    if let Some(is_open_self) = is_open_self_weak.upgrade() {
-                                        let _self = is_open_self.as_pin_ref();
-                                        #set_expr
+                                if !value {
+                                    let forwarded_self =
+                                        _self.self_weak.get().unwrap().upgrade().unwrap();
+                                    let forwarded_origin = sp::VRcMapped::origin(&forwarded_self);
+                                    let forwarded_item =
+                                        sp::ItemRc::new(forwarded_origin.clone(), 0).stable_id();
+                                    let forwarded_offset = {
+                                        let origin_addr =
+                                            sp::VRef::as_ptr(::core::pin::Pin::into_inner(
+                                                sp::VRc::borrow_pin(&forwarded_origin),
+                                            ))
+                                            .as_ptr() as usize;
+                                        let self_addr =
+                                            (&*_self) as *const _ as usize;
+                                        self_addr - origin_addr
+                                    };
+                                    if let Ok(carry_adapter) =
+                                        _self.globals().window_adapter_ref()
+                                    {
+                                        if let Some(local_tree) =
+                                            _self.globals().root_item_tree_weak.upgrade()
+                                        {
+                                            let local_identity =
+                                                sp::item_tree_identity(&local_tree);
+                                            carry_adapter.window().post_on_screen_tree(
+                                                local_tree,
+                                                move |tree| {
+                                                    if sp::item_tree_identity(tree)
+                                                        == local_identity
+                                                    {
+                                                        return;
+                                                    }
+                                                    sp::component_copy_at_offset(
+                                                        &tree,
+                                                        forwarded_item,
+                                                        forwarded_offset,
+                                                        |component: ::core::pin::Pin<
+                                                            &#close_component,
+                                                        >| {
+                                                            let _self = component;
+                                                            if let Some(current_id) =
+                                                                #compo.#popup_id_name.take()
+                                                            {
+                                                                if let Some(adapter) = sp::ItemRc::new_root(tree.clone()).window_adapter() {
+                                                                    sp::WindowInner::from_pub(
+                                                                        adapter.window(),
+                                                                    )
+                                                                    .close_popup(current_id);
+                                                                }
+                                                            }
+                                                        },
+                                                    );
+                                                },
+                                            );
+                                        }
                                     }
-                                })
-                            },
-                        ),
-                        None => (quote!(), quote!(sp::Box::new(|_| {}))),
+                                }
+                            }
+                        }).unwrap_or_default()
+                    } else {
+                        quote!()
                     };
+                    // The setter carries the close whether or not the popup
+                    // exposes `is-open`: the close has to reach the drawn copy
+                    // either way, and the property write only happens when
+                    // there is one.
+                    let is_open_write = match &is_open_set_expr {
+                        Some(set_expr) => quote!(#set_expr),
+                        None => quote!(),
+                    };
+                    let (is_open_self_weak_decl, is_open_setter) = (
+                        quote!(let is_open_self_weak = _self.self_weak.get().unwrap().clone();),
+                        quote! {
+                            sp::Box::new(move |value: bool| {
+                                if let Some(is_open_self) = is_open_self_weak.upgrade() {
+                                    let _self = is_open_self.as_pin_ref();
+                                    #is_open_write
+                                    #close_carry
+                                }
+                            })
+                        },
+                    );
                     quote!({
                         let parent_item = &#parent_item;
                         // Use the newly created window adapter if we are able to create one. Otherwise use the parent's one

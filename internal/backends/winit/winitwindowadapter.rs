@@ -1527,38 +1527,21 @@ impl WinitWindowAdapter {
             self.dispatch_internal_event(event);
             return false;
         };
-        // Where the pointer's meaning runs, decided before the drawn states
-        // are applied: they consume the pressed record a release routes by.
-        let routed_to_drawn = self.pointer_routes_to_drawn(&host, &event);
         // The drawn tree is told the pointer's effect on what it draws -- the
         // hover, the pressed state -- decided from the geometry it published.
         // What the pointer MEANS, the handlers it runs, is the application
         // tree's to execute, which happens after; what the drawn tree needs of
-        // that execution arrives as the state pushes that follow.
-        self.apply_pointer_to_render_controls(&host, &event, routed_to_drawn);
+        // that execution arrives as the state pushes that follow. The popup a
+        // show opened is structure the application tree holds too -- the show
+        // ran here and carried its construction to the drawn copy -- so the
+        // application tree's own popup walk receives everything inside it,
+        // with nothing delegated to the drawing side.
+        self.apply_pointer_to_render_controls(&host, &event);
         // The application tree processes the pointer: the grabs, the click
         // counts, the handlers. Its repeater rows are materialized on demand,
         // which a walk without this would miss.
         if let Some(window_inner) = Some(WindowInner::from_pub(self.window())) {
             crate::render_thread::ensure_item_tree_instantiated_for_window(&window_inner);
-        }
-        if routed_to_drawn {
-            // The control under the pointer is one only the drawn tree holds:
-            // a popup's, the popup being structure that tree keeps on its own
-            // -- the show ran there, the geometry is published from there, and
-            // the application tree has no copy to hand the event to. The event
-            // runs where the structure lives, and the application's share of
-            // it arrives through the host callbacks the drawn tree's handlers
-            // reach.
-            host.post_on_screen_tree(Box::new(move |tree| {
-                let Some(adapter) =
-                    i_slint_core::item_tree::ItemRc::new_root(tree.clone()).window_adapter()
-                else {
-                    return;
-                };
-                let _ = adapter.window().dispatch_event(WindowEvent::internal(event));
-            }));
-            return true;
         }
         self.dispatch_internal_event(event.clone());
         // The pointer moves what the drawn tree draws: the text cursor a click
@@ -1569,59 +1552,11 @@ impl WinitWindowAdapter {
         true
     }
 
-    /// Whether this pointer event's meaning belongs to the drawn tree.
-    ///
-    /// The application tree runs what the pointer means wherever it holds the
-    /// control the pointer is on. A control that exists only on the drawn tree
-    /// -- everything inside a popup, whose show ran there -- takes its events
-    /// there too. A press on nothing while a popup is up belongs to the popup
-    /// as well: its close policy is the drawn tree's to apply, and the click
-    /// would otherwise fall through to whatever control the popup floats over.
-    fn pointer_routes_to_drawn(
-        &self,
-        host: &crate::render_thread::RenderHost,
-        event: &corelib::platform::InternalEvent,
-    ) -> bool {
-        let corelib::platform::InternalEvent::Mouse(mouse_event) = event else {
-            return false;
-        };
-        match mouse_event {
-            corelib::input::BackendMouseEvent::Pressed { position, .. } => {
-                match host.control_at(position.x, position.y) {
-                    Some(id) => self.ui_tree_item(id).is_none(),
-                    // A press on empty space while a popup is up: the popup's
-                    // own items are the ones this tree cannot name, so their
-                    // presence is what says a popup is open.
-                    None => host
-                        .press_targets()
-                        .iter()
-                        .any(|target| self.ui_tree_item(target.id).is_none()),
-                }
-            }
-            // A release and a drag go where the press went: the hold the
-            // release ends, and the pan the drag continues, are the pressing
-            // control's.
-            corelib::input::BackendMouseEvent::Released { .. }
-            | corelib::input::BackendMouseEvent::Moved { .. } => self
-                .render_pressed
-                .get()
-                .is_some_and(|pressed| self.ui_tree_item(pressed).is_none()),
-            _ => false,
-        }
-    }
-
     /// The pointer, resolved against the published geometry.
-    ///
-    /// `routed` marks an event whose meaning the drawn tree runs itself -- a
-    /// popup's.  Such a tree manages its own hover and pressed states through
-    /// the very event processing that runs the handlers, so the state pushes
-    /// here would only arrive ahead of the event and clear the pressed flag
-    /// the release still needs to see for a click to be one.
     fn apply_pointer_to_render_controls(
         &self,
         host: &crate::render_thread::RenderHost,
         event: &corelib::platform::InternalEvent,
-        routed: bool,
     ) -> bool {
         use corelib::platform::InternalEvent as Ev;
         // A finger and a mouse are the same question written twice: where is it
@@ -1653,12 +1588,10 @@ impl WinitWindowAdapter {
                 // that whatever it grabbed ends rather than waiting for a release
                 // that is not coming.
                 if let Some(pressed) = self.render_pressed.replace(None) {
-                    if !routed {
-                        host.apply_control_state(pressed, false, false);
-                    }
+                    host.apply_control_state(pressed, false, false);
                 }
-                self.set_render_hover(host, None, routed);
-                self.set_render_pressed(host, None, routed);
+                self.set_render_hover(host, None);
+                self.set_render_pressed(host, None);
                 return true;
             }
             Ev::Touch { position, phase, .. } => match phase {
@@ -1673,11 +1606,9 @@ impl WinitWindowAdapter {
                     // A cancelled gesture never had a click in it, and the finger
                     // is gone without a release, so the tree's hold ends here.
                     if let Some(pressed) = self.render_pressed.replace(None) {
-                        if !routed {
-                            host.apply_control_state(pressed, false, false);
-                        }
+                        host.apply_control_state(pressed, false, false);
                     }
-                    self.set_render_pressed(host, None, routed);
+                    self.set_render_pressed(host, None);
                     return true;
                 }
             },
@@ -1694,7 +1625,7 @@ impl WinitWindowAdapter {
             // A press brings the hover with it, because the control that is held
             // is also the one the pointer is on.
             PointerAction::Pressed(button) => {
-                self.set_render_hover(host, target, routed);
+                self.set_render_hover(host, target);
                 // The tree hands the press to the item under the pointer and,
                 // when that item lets the press through, to the items below
                 // it.  This resolves which item ends up with it, and whether a
@@ -1710,7 +1641,7 @@ impl WinitWindowAdapter {
                 if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
                     std::eprintln!("[input] press target {:?}", press_target.id);
                 }
-                self.set_render_pressed(host, Some(press_target.id), routed);
+                self.set_render_pressed(host, Some(press_target.id));
                 self.render_pressed_button.set(Some(button));
                 // The drawn tree is told the pressed state above; the press
                 // itself -- the grab, the click count, the handler -- is the
@@ -1733,7 +1664,7 @@ impl WinitWindowAdapter {
                 }
             }
             PointerAction::Moved => {
-                self.set_render_hover(host, target, routed);
+                self.set_render_hover(host, target);
                 // A move while a button is down is a drag.  The drag's meaning
                 // -- the slider's track, the `Flickable`'s pan -- is processed
                 // by the application tree below, and what the drawn tree needs
@@ -1749,15 +1680,13 @@ impl WinitWindowAdapter {
                     // The drawn tree is told the released state; the release's
                     // meaning -- whether it was a click, and what the click is
                     // worth -- is the application tree's, processed below.
-                    if !routed {
-                        host.apply_control_state(
-                            pressed,
-                            self.render_hovered.get() == Some(pressed),
-                            false,
-                        );
-                    }
+                    host.apply_control_state(
+                        pressed,
+                        self.render_hovered.get() == Some(pressed),
+                        false,
+                    );
                 }
-                self.set_render_hover(host, target, routed);
+                self.set_render_hover(host, target);
             }
         }
         true
@@ -1824,17 +1753,12 @@ impl WinitWindowAdapter {
 
     /// Move the hover, which is a property on the control that had it and on the
     /// one that has it now.
-    fn set_render_hover(
-        &self,
-        host: &crate::render_thread::RenderHost,
-        target: Option<u64>,
-        routed: bool,
-    ) {
+    fn set_render_hover(&self, host: &crate::render_thread::RenderHost, target: Option<u64>) {
         if self.render_hovered.get() == target {
             return;
         }
         if let Some(previous) = self.render_hovered.replace(target) {
-            if !routed && host.control_coord(previous).is_some_and(|c| c.hover_draws) {
+            if host.control_coord(previous).is_some_and(|c| c.hover_draws) {
                 host.apply_control_state(
                     previous,
                     false,
@@ -1843,7 +1767,7 @@ impl WinitWindowAdapter {
             }
         }
         if let Some(target) = target {
-            if !routed && host.control_coord(target).is_some_and(|c| c.hover_draws) {
+            if host.control_coord(target).is_some_and(|c| c.hover_draws) {
                 host.apply_control_state(target, true, self.render_pressed.get() == Some(target));
             }
         }
@@ -1858,17 +1782,12 @@ impl WinitWindowAdapter {
     /// shows on screen; hover and press are decided separately, so a control
     /// whose colors react to a press but not to a hover receives only the
     /// press updates.
-    fn set_render_pressed(
-        &self,
-        host: &crate::render_thread::RenderHost,
-        target: Option<u64>,
-        routed: bool,
-    ) {
+    fn set_render_pressed(&self, host: &crate::render_thread::RenderHost, target: Option<u64>) {
         if self.render_pressed.get() == target {
             return;
         }
         if let Some(previous) = self.render_pressed.replace(target) {
-            if !routed && host.control_coord(previous).is_some_and(|c| c.press_draws) {
+            if host.control_coord(previous).is_some_and(|c| c.press_draws) {
                 host.apply_control_state(
                     previous,
                     self.render_hovered.get() == Some(previous),
@@ -1877,7 +1796,7 @@ impl WinitWindowAdapter {
             }
         }
         if let Some(target) = target {
-            if !routed && host.control_coord(target).is_some_and(|c| c.press_draws) {
+            if host.control_coord(target).is_some_and(|c| c.press_draws) {
                 host.apply_control_state(target, self.render_hovered.get() == Some(target), true);
             }
         }

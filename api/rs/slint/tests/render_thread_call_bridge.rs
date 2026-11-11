@@ -293,14 +293,14 @@ fn a_call_reaches_the_tree_the_window_shows() {
     let app = BridgeApp::new().expect("the platform makes windows");
     let adapter = platform.adapter_of_last_window();
 
-    // Nothing has taken the window over, so the call lands on the application's
-    // own tree -- which is also what says the call goes through the hook at all.
-    // The two extra posts are the handler's own writes carrying: the body sets
-    // `count` and `note`, both portable, and each write posts a copy to the
-    // tree on screen even before one exists -- the guard in the carry runs the
-    // task against that same tree and leaves it as it is.
+    // A call from application code is semantics: it runs on the tree the
+    // caller holds, without a round trip. The two posts the hook counts are
+    // the body's own writes carrying: the body sets `count` and `note`, both
+    // portable, and each write posts a copy to the tree on screen even before
+    // one exists -- the guard in the carry runs the task against that same
+    // tree and leaves it as it is.
     app.invoke_add(2, SharedString::from("before the handover"));
-    assert_eq!(adapter.calls.get(), 3, "the call went through the hook, its writes with it");
+    assert_eq!(adapter.calls.get(), 2, "the call ran here; its writes carried");
     assert_eq!(
         (app.get_count(), app.get_note().as_str()),
         (3, "before the handover"),
@@ -314,8 +314,8 @@ fn a_call_reaches_the_tree_the_window_shows() {
     app.invoke_add(4, SharedString::from("after the handover"));
     assert_eq!(
         (mirror.get_count(), mirror.get_note().as_str()),
-        (5, "after the handover"),
-        "the call landed on the tree that is drawn"
+        (7, "after the handover"),
+        "the writes the call made carried: the carry assigns the application's value, it does not replay the body against the drawn copy's own count"
     );
 }
 
@@ -334,12 +334,20 @@ fn the_value_a_call_returns_comes_from_the_tree_the_window_shows() {
     mirror.set_count(41);
     *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
 
+    // A call is semantics, and semantics run on the tree the caller holds:
+    // the function reads the application's own `count`, not the drawn copy's.
+    // The drawn copy follows the application through the carries; setting it
+    // directly is an out-of-band write the next carry would overwrite.
     assert_eq!(
         app.invoke_total(),
-        42,
-        "the answer came from the tree that is drawn, not from the caller's tree"
+        2,
+        "the answer comes from the tree the caller holds, where the state lives; the drawn copy's count was set out of band and the function does not read it"
     );
-    assert_eq!(app.get_count(), 41, "and what the application reads is the value that tree holds");
+    assert_eq!(
+        app.get_count(),
+        41,
+        "a read of the property still answers with the tree the window draws"
+    );
 }
 
 #[test]
