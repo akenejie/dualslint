@@ -1739,12 +1739,11 @@ impl CallTarget {
     /// The statements a property carry runs: the value assigned onto the tree
     /// on screen, one way.
     ///
-    /// This is [`Self::wrap_oneshot`] with one guard added: a backend that
-    /// draws the tree the caller holds runs the task against that same tree,
-    /// where the setter has already assigned the value. Assigning again would
-    /// restart an animated property from its current frame -- for a condition
-    /// like `alternate-reverse` that frame is the target, so the animation
-    /// would freeze where it began.
+    /// A backend that draws the tree the caller holds runs the task against
+    /// that same tree, where the setter has already assigned the value.
+    /// Assigning again would restart an animated property from its current
+    /// frame -- for a condition like `alternate-reverse` that frame is the
+    /// target, so the animation would freeze where it began.
     fn wrap_carry(&self, call: TokenStream) -> TokenStream {
         match self {
             // A target with no drawn tree of its own has nothing to carry to:

@@ -146,18 +146,82 @@ pub fn set_on(instance: &Instance, name: &str, mut value: Value) -> Result<(), S
         return Err(SetPropertyError::WrongType);
     }
     let portable = i_slint_compiler::llr::is_thread_portable_type(&prop.ty);
-    let ctx = EvalContext::new(sub);
+    let ctx = EvalContext::new(sub.clone());
     store_property(&ctx, &prop.prop, value.clone());
     // The value is now on the tree the instance holds, but a backend may draw a
     // tree of its own, and that is the one whose bindings decide what is seen.
     // Carry the value there too, for a property whose type can travel; one that
-    // cannot (a model, an image, a brush -- a shared reference `Send` refuses to
-    // cross a thread) is the one known gap, and it is owned by whichever tree
-    // the caller ran against, each side keeping its own copy.
+    // cannot -- an image, a brush, a model whose rows hold a nested model --
+    // is owned by whichever tree the caller ran against, each side keeping its
+    // own copy.
     if portable {
         forward_public_property(instance, name, value);
+    } else if let (Type::Array(element), Value::Model(model)) = (&prop.ty, &value)
+        && i_slint_compiler::llr::is_send_type(element)
+    {
+        // A model whose rows are plain values follows a different road: the
+        // rows travel as values, and the application's model is stored as a
+        // carried model whose listener hears the application's row changes and
+        // posts them, so the drawn copy follows the rows without the
+        // application re-applying -- the same rule the generated setters
+        // follow.
+        let model = model.clone();
+        let carrier = instance.self_weak.get().and_then(|w| w.upgrade());
+        let Some(carrier) = carrier else { return Ok(()) };
+        let name = name.to_string();
+        let forward = move |rows: Vec<Value>| {
+            forward_model_rows(&carrier, &name, rows);
+        };
+        let carried = i_slint_core::model::carried_model(model, forward);
+        let ctx = EvalContext::new(sub.clone());
+        store_property(&ctx, &prop.prop, Value::Model(carried));
     }
     Ok(())
+}
+
+/// Post the model's rows to the tree the window draws, where they land in the
+/// drawn copy's `ScreenTreeModel`.
+///
+/// `Value` is not `Send` because a model is a shared reference, but the rows
+/// of a model whose element type passes `is_send_type` are plain values, and
+/// the task runs before `run_on_screen_tree` returns, which is what lending
+/// them through a pointer here makes sound.
+fn forward_model_rows(instance: &VRc<ItemTreeVTable, Instance>, name: &str, rows: Vec<Value>) {
+    let Some(adapter) = instance.window_adapter_or_default() else { return };
+    let Some(local_tree) = instance.self_weak.get().and_then(|w| w.upgrade()) else { return };
+    let local_tree = VRc::into_dyn(local_tree);
+    struct CarriedRows(Vec<Value>);
+    unsafe impl Send for CarriedRows {}
+    let state = CarriedRows(rows);
+    struct RowsPtr(*const CarriedRows);
+    unsafe impl Send for RowsPtr {}
+    impl RowsPtr {
+        fn get(&self) -> &CarriedRows {
+            // SAFETY: the pointee outlives this call, which returns before it.
+            unsafe { &*self.0 }
+        }
+    }
+    let ptr = RowsPtr(&state as *const _);
+    let name = name.to_string();
+    let run = move |tree: &ItemTreeRc| {
+        let carried = ptr.get();
+        let screen = VRef::downcast_pin::<Instance>(VRc::borrow_pin(tree))
+            .expect("the tree on screen is not this interpreter component");
+        // The rows land in the drawn copy's `ScreenTreeModel`: the same model
+        // across carries, updated in place with per-row notifications.
+        let current = get_local(screen.get_ref(), &name);
+        let current = match current {
+            Some(Value::Model(model)) => model,
+            _ => return,
+        };
+        let synced = i_slint_core::model::screen_tree_model_carry::<Value>(
+            &current,
+            carried.0.clone(),
+            |_, _| {},
+        );
+        let _ = set_local(screen.get_ref(), &name, Value::Model(synced));
+    };
+    adapter.run_on_screen_tree(local_tree, Box::new(run));
 }
 
 /// Write a public property on `instance` itself, without carrying the value to
