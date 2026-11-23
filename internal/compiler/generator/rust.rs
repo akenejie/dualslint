@@ -1833,6 +1833,22 @@ impl CallTarget {
 }
 
 /// Public API for Global and root component
+/// The write-back's `upgrade_in_event_loop` call, with the global's public
+/// wrapper named where the inference cannot reach it through the trait's
+/// associated `StaticSelf`. `weak` is the tokens naming the weak handle.
+fn upgrade_call(
+    global_wrapper: &Option<proc_macro2::Ident>,
+    weak: TokenStream,
+    body: TokenStream,
+) -> TokenStream {
+    match global_wrapper {
+        Some(wrapper) => {
+            quote!(#weak.upgrade_in_event_loop(move |handle: #wrapper| { #body }))
+        }
+        None => quote!(#weak.upgrade_in_event_loop(move |handle| { #body })),
+    }
+}
+
 fn public_api(
     public_properties: &llr::PublicProperties,
     private_properties: &llr::PrivateProperties,
@@ -2019,6 +2035,13 @@ fn public_api(
                     // weak, a global's is a `Global` weak -- both `Send`, so
                     // the closure they travel in can cross to the thread the
                     // application runs on.
+                    // The write-back's `handle` names the global's public
+                    // wrapper. Its type reaches the closure through the weak,
+                    // but the trait's associated `StaticSelf` does not always
+                    // let the inference name it; the annotation in
+                    // `upgrade_call` is what settles it.
+                    let global_wrapper =
+                        ctx.current_global().map(|g| format_ident!("{}", ident(&g.name)));
                     let (write_back_weak, write_back_self) = match call_target {
                         CallTarget::GlobalTree { .. } => (
                             quote!(let weak = slint::Global::as_weak(self);),
@@ -2036,6 +2059,18 @@ fn public_api(
                     // here, the same way a setter's carry does. The wrapper
                     // dies when the property is assigned again, which takes
                     // its listener along.
+                    let model_row_sync_upgraded = upgrade_call(
+                        &global_wrapper,
+                        quote!(weak),
+                        quote! {
+                            #write_back_self
+                            // The model may have shrunk since the row was
+                            // edited on the drawn tree.
+                            if row < #prop_access.get().row_count() {
+                                #prop_access.get().set_row_data(row, data);
+                            }
+                        },
+                    );
                     let model_row_sync = match call_target {
                         CallTarget::OwnTree => quote!(),
                         _ => {
@@ -2104,14 +2139,7 @@ fn public_api(
                                                     return;
                                                 }
                                                 let write_back = move |row, data| {
-                                                    let _ = weak.upgrade_in_event_loop(move |handle| {
-                                                        #write_back_self
-                                                        // The model may have shrunk since the
-                                                        // row was edited on the drawn tree.
-                                                        if row < #prop_access.get().row_count() {
-                                                            #prop_access.get().set_row_data(row, data);
-                                                        }
-                                                    });
+                                                    let _ = #model_row_sync_upgraded;
                                                 };
                                                 #posted
                                             },
@@ -2142,15 +2170,7 @@ fn public_api(
                             let write_back = {
                                 #write_back_weak
                                 move |row, data| {
-                                    let _ = weak.upgrade_in_event_loop(move |handle| {
-                                        #write_back_self
-                                        // The model may have shrunk since the row
-                                        // was edited on the drawn tree; a write
-                                        // past its end has nothing to land on.
-                                        if row < #prop_access.get().row_count() {
-                                            #prop_access.get().set_row_data(row, data);
-                                        }
-                                    });
+                                    let _ = #model_row_sync_upgraded;
                                 }
                             };
                             #carry;
@@ -2184,6 +2204,8 @@ fn public_api(
                     // weak, a global's is a `Global` weak -- both `Send`, so
                     // the closure they travel in can cross to the thread the
                     // application runs on.
+                    let global_wrapper =
+                        ctx.current_global().map(|g| format_ident!("{}", ident(&g.name)));
                     let (write_back_weak, write_back_self) = match call_target {
                         CallTarget::GlobalTree { .. } => (
                             quote!(let weak = slint::Global::as_weak(self);),
@@ -2194,6 +2216,16 @@ fn public_api(
                             quote!(let _self = sp::VRc::as_pin_ref(&handle.0);),
                         ),
                     };
+                    let nested_upgraded = upgrade_call(
+                        &global_wrapper,
+                        quote!(weak),
+                        quote! {
+                            #write_back_self
+                            if let Some(row_model) = #prop_access.get().row_data(row) {
+                                row_model.set_row_data(col, data);
+                            }
+                        },
+                    );
                     (
                         quote!(),
                         quote!(
@@ -2210,12 +2242,7 @@ fn public_api(
                             let write_back = {
                                 #write_back_weak
                                 move |row, col, data| {
-                                    let _ = weak.upgrade_in_event_loop(move |handle| {
-                                        #write_back_self
-                                        if let Some(row_model) = #prop_access.get().row_data(row) {
-                                            row_model.set_row_data(col, data);
-                                        }
-                                    });
+                                    let _ = #nested_upgraded;
                                 }
                             };
                             #carry
@@ -6233,9 +6260,14 @@ fn compile_builtin_function_call(
                                                         |component: ::core::pin::Pin<
                                                             &#close_component,
                                                         >| {
+                                                            // The re-bound component is the
+                                                            // one the popup id was stored
+                                                            // on; the show-scope's own
+                                                            // handle must not be captured
+                                                            // here, for it is not `Send`.
                                                             let _self = component;
                                                             if let Some(current_id) =
-                                                                #compo.#popup_id_name.take()
+                                                                _self.#popup_id_name.take()
                                                             {
                                                                 if let Some(adapter) = sp::ItemRc::new_root(tree.clone()).window_adapter() {
                                                                     sp::WindowInner::from_pub(

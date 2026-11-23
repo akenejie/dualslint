@@ -16,6 +16,56 @@ use i_slint_core::model::Model;
 use std::pin::Pin;
 use std::rc::Rc;
 
+/// The chain of `sub_components` positions from a root instance down to
+/// `sub`, so the matching sub-component of another instance of the same
+/// component can be found by walking the same positions.
+///
+/// A sub-component inside a repeater row is not reached by this walk -- the
+/// rows are not in their parent's `sub_components` -- and a popup declared in
+/// one stays where the show ran.
+fn sub_path_from_root(sub: &Pin<Rc<SubComponentInstance>>) -> Vec<usize> {
+    let mut path = Vec::new();
+    let mut node = sub.clone();
+    loop {
+        let Some(parent) = node.parent.upgrade() else { break };
+        let Some(idx) = parent.sub_components.iter().position(|s| core::ptr::addr_eq(&**s, &*node))
+        else {
+            break;
+        };
+        path.push(idx);
+        node = core::pin::Pin::new(parent);
+    }
+    path.reverse();
+    path
+}
+
+/// Walk `path` down from a root instance's root sub-component.
+fn sub_at_path(
+    root: &crate::instance::Instance,
+    path: &[usize],
+) -> Option<Pin<Rc<SubComponentInstance>>> {
+    let mut sub = root.root_sub_component.clone();
+    for idx in path {
+        sub = sub.sub_components.iter().nth(*idx)?.clone();
+    }
+    Some(sub)
+}
+
+/// Whether the window the show ran on keeps a drawn tree of its own.  A
+/// backend that draws one holds the mirror this show has to carry to.
+fn carries_to_screen(owner: &Pin<Rc<SubComponentInstance>>) -> bool {
+    owner
+        .root
+        .get()
+        .and_then(|w| w.upgrade())
+        .and_then(|inst| inst.window_adapter_or_default())
+        .is_some_and(|adapter| {
+            !i_slint_core::window::WindowInner::from_pub(adapter.window())
+                .window_adapter()
+                .hosts_drawn_tree()
+        })
+}
+
 pub(crate) fn show_popup_window(ctx: &mut EvalContext, arguments: &[Expression]) -> Value {
     // Expected args (from `BuiltinFunction::ShowPopupWindow`):
     //   0: NumberLiteral(popup_index) into the declaring sub-component's popup_windows
@@ -107,18 +157,50 @@ pub(crate) fn show_popup_window(ctx: &mut EvalContext, arguments: &[Expression])
     // Keeps the caller's synthesized `is-open` property in sync:
     // `show_popup` invokes this setter with `true` on show and `false` from
     // every close path. The reference resolves in the show call's own frame.
-    let is_open_setter: Box<dyn Fn(bool)> = match is_open_args.first() {
-        Some(Expression::PropertyReference(is_open_ref)) => {
-            let is_open_ref = is_open_ref.clone();
-            let current_weak = std::rc::Rc::downgrade(&Pin::into_inner(current.clone()));
-            Box::new(move |value: bool| {
-                if let Some(current) = current_weak.upgrade() {
-                    let ctx = EvalContext::new(Pin::new(current));
-                    store_property(&ctx, &is_open_ref, Value::Bool(value));
-                }
-            })
+    // A close on this tree is also what ends the copy the drawn tree holds --
+    // the drawn tree applies no close policy of its own, because no pointer
+    // meaning is processed there -- so `false` carries the close: the drawn
+    // copy's owner is found by walking the same sub-component positions, and
+    // its popup by the id its own show recorded.
+    let mirror_close = carries_to_screen(&owner).then(|| {
+        (
+            sub_path_from_root(&owner),
+            *popup_index as usize,
+            adapter.clone(),
+            vtable::VRc::into_dyn(vtable::VRc::clone(
+                owner
+                    .root
+                    .get()
+                    .and_then(|w| w.upgrade())
+                    .as_ref()
+                    .expect("the owner's root is set when the adapter is"),
+            )),
+        )
+    });
+    let is_open_setter: Box<dyn Fn(bool)> = {
+        let mirror_close = mirror_close.clone();
+        match is_open_args.first() {
+            Some(Expression::PropertyReference(is_open_ref)) => {
+                let is_open_ref = is_open_ref.clone();
+                let current_weak = std::rc::Rc::downgrade(&Pin::into_inner(current.clone()));
+                Box::new(move |value: bool| {
+                    if let Some(current) = current_weak.upgrade() {
+                        let ctx = EvalContext::new(Pin::new(current));
+                        store_property(&ctx, &is_open_ref, Value::Bool(value));
+                    }
+                    carry_popup_close(&mirror_close, value);
+                })
+            }
+            _ => {
+                let current_weak = std::rc::Rc::downgrade(&Pin::into_inner(current.clone()));
+                Box::new(move |value: bool| {
+                    if let Some(current) = current_weak.upgrade() {
+                        let _ = current;
+                        carry_popup_close(&mirror_close, value);
+                    }
+                })
+            }
         }
-        _ => Box::new(|_| {}),
     };
     let popup_dyn = vtable::VRc::into_dyn(popup_vrc.clone());
     let popup_id = i_slint_core::window::WindowInner::from_pub(adapter.window()).show_popup(
@@ -133,10 +215,128 @@ pub(crate) fn show_popup_window(ctx: &mut EvalContext, arguments: &[Expression])
     if let Some(slot) = owner.popup_ids.get(*popup_index as usize) {
         slot.set(Some(popup_id));
     }
+    // The show ran on the tree the application holds; the drawn copy needs the
+    // same construction to show anything. The mirror's owner is the
+    // sub-component at the same positions, the anchor is the item at the same
+    // stable id, and the popup registers with the mirror's own window, storing
+    // its id in the mirror's owner the way this one did here.
+    if carries_to_screen(&owner) {
+        let path = sub_path_from_root(&owner);
+        let anchor_id = parent_item_rc.stable_id();
+        let popup_index = *popup_index as usize;
+        let close_policy_captured = close_policy;
+        if let Some(root_inst) = owner.root.get().and_then(|w| w.upgrade())
+            && let Some(window_adapter) = root_inst.window_adapter_or_default()
+        {
+            let local_tree = vtable::VRc::into_dyn(vtable::VRc::clone(&root_inst));
+            window_adapter.window().post_on_screen_tree(
+                local_tree,
+                Box::new(move |tree: &i_slint_core::item_tree::ItemTreeRc| {
+                    let screen = vtable::VRef::downcast_pin::<crate::instance::Instance>(
+                        vtable::VRc::borrow_pin(tree),
+                    )
+                    .expect("the tree on screen is this interpreter component");
+                    let Some(mirror_owner) = sub_at_path(screen.get_ref(), &path) else {
+                        return;
+                    };
+                    let cu = mirror_owner.compilation_unit.clone();
+                    let sc = &cu.sub_components[mirror_owner.sub_component_idx];
+                    let Some(popup) = sc.popup_windows.get(popup_index) else { return };
+                    let mirror_popup = new_popup_for(&mirror_owner, &popup.item_tree);
+                    crate::instance::install_bindings_for_repeated_row(&mirror_popup);
+                    let Some(anchor) =
+                        i_slint_core::item_tree::find_item_by_stable_id(tree, anchor_id)
+                    else {
+                        return;
+                    };
+                    let Some(mirror_adapter) =
+                        i_slint_core::item_tree::ItemRc::new_root(tree.clone()).window_adapter()
+                    else {
+                        return;
+                    };
+                    let window_kind = || {
+                        if popup.is_tooltip {
+                            i_slint_core::window::WindowKind::ToolTip
+                        } else {
+                            i_slint_core::window::WindowKind::Popup
+                        }
+                    };
+                    // The position is evaluated against the drawn copy's popup,
+                    // whose bindings are its own.
+                    let access_position: Box<dyn Fn() -> i_slint_core::api::LogicalPosition> = {
+                        let pos_expr = popup.position.read().clone();
+                        let popup_root = mirror_popup.root_sub_component.clone();
+                        Box::new(move || {
+                            let mut popup_ctx = EvalContext::new(popup_root.clone());
+                            eval_expression(&mut popup_ctx, &pos_expr)
+                                .try_into()
+                                .unwrap_or_default()
+                        })
+                    };
+                    let popup_dyn = vtable::VRc::into_dyn(mirror_popup.clone());
+                    let popup_id =
+                        i_slint_core::window::WindowInner::from_pub(mirror_adapter.window())
+                            .show_popup(
+                                &popup_dyn,
+                                access_position,
+                                close_policy_captured,
+                                &anchor,
+                                window_kind(),
+                                Box::new(|_| {}),
+                            );
+                    if let Some(slot) = mirror_owner.popup_ids.get(popup_index) {
+                        slot.set(Some(popup_id));
+                    }
+                    crate::instance::finalize_instance(&mirror_popup);
+                }),
+            );
+        }
+    }
     // `init_code` runs now that the popup is registered, so `forward-focus`
     // calls can target items in the popup.
     crate::instance::finalize_instance(&popup_vrc);
     Value::Void
+}
+
+/// Close the drawn copy's popup, when one is carried. `mirror_close` holds
+/// the sub-component positions, the popup index and the window adapter the
+/// show captured; `value` is `false` on every close path.
+fn carry_popup_close(
+    mirror_close: &Option<(
+        Vec<usize>,
+        usize,
+        i_slint_core::window::WindowAdapterRc,
+        i_slint_core::item_tree::ItemTreeRc,
+    )>,
+    value: bool,
+) {
+    let Some((path, popup_index, window_adapter, local_tree)) = mirror_close else { return };
+    if value {
+        return;
+    }
+    // The drawn copy's owner is the sub-component at the same positions on the
+    // tree this window draws, and the popup it holds registered its id there.
+    let path = path.clone();
+    let popup_index = *popup_index;
+    let local_tree = local_tree.clone();
+    window_adapter.window().post_on_screen_tree(
+        local_tree,
+        Box::new(move |tree: &i_slint_core::item_tree::ItemTreeRc| {
+            let screen = vtable::VRef::downcast_pin::<crate::instance::Instance>(
+                vtable::VRc::borrow_pin(tree),
+            )
+            .expect("the tree on screen is this interpreter component");
+            let Some(mirror_owner) = sub_at_path(screen.get_ref(), &path) else { return };
+            let id = mirror_owner.popup_ids.get(popup_index).and_then(|slot| slot.take());
+            if let Some(id) = id
+                && let Some(mirror_adapter) =
+                    i_slint_core::item_tree::ItemRc::new_root(tree.clone()).window_adapter()
+            {
+                i_slint_core::window::WindowInner::from_pub(mirror_adapter.window())
+                    .close_popup(id);
+            }
+        }),
+    );
 }
 
 pub(crate) fn close_popup_window(ctx: &mut EvalContext, arguments: &[Expression]) -> Value {
