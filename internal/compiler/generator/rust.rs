@@ -2036,17 +2036,40 @@ fn public_api(
                     // the closure they travel in can cross to the thread the
                     // application runs on.
                     // The write-back's `handle` names the global's public
-                    // wrapper. Its type reaches the closure through the weak,
-                    // but the trait's associated `StaticSelf` does not always
-                    // let the inference name it; the annotation in
-                    // `upgrade_call` is what settles it.
+                    // wrapper. A global shared by several roots has one
+                    // `Global` impl per root, so the unqualified `as_weak`
+                    // cannot pick one; the call names the trait through the
+                    // first window root, whose `StaticSelf` -- the wrapper
+                    // with a `'static` lifetime -- is the same for all of
+                    // them. The same reason names the wrapper in
+                    // `upgrade_call`'s annotation.
                     let global_wrapper =
                         ctx.current_global().map(|g| format_ident!("{}", ident(&g.name)));
+                    let first_window_root =
+                        ctx.compilation_unit.public_components.iter().find(|c| {
+                            matches!(c.top_level_type, llr::TopLevelComponentType::Window)
+                        });
                     let (write_back_weak, write_back_self) = match call_target {
-                        CallTarget::GlobalTree { .. } => (
-                            quote!(let weak = slint::Global::as_weak(self);),
-                            quote!(let _self = handle.0.as_ref();),
-                        ),
+                        CallTarget::GlobalTree { .. } => {
+                            match (&global_wrapper, first_window_root) {
+                                (Some(wrapper), Some(component)) => {
+                                    let component = format_ident!("{}", ident(&component.name));
+                                    (
+                                        quote! {
+                                            let weak = <#wrapper as slint::Global<
+                                                '_,
+                                                #component,
+                                            >>::as_weak(self);
+                                        },
+                                        quote!(let _self = handle.0.as_ref();),
+                                    )
+                                }
+                                _ => (
+                                    quote!(let weak = slint::Global::as_weak(self);),
+                                    quote!(let _self = handle.0.as_ref();),
+                                ),
+                            }
+                        }
                         _ => (
                             quote!(let weak = slint::ComponentHandle::as_weak(self);),
                             quote!(let _self = sp::VRc::as_pin_ref(&handle.0);),
@@ -6050,6 +6073,9 @@ fn compile_builtin_function_call(
                     ctx.parent_sub_component_idx(*parent_level).unwrap(),
                     &local_reference.sub_component_path,
                 );
+                // The close carry walks the same access on the drawn tree, so
+                // the tokens are cloned before the show consumes them.
+                let component_access_for_close = component_access_tokens.clone();
                 ctx.with_reference_scope(
                     *parent_level,
                     &local_reference.sub_component_path,
@@ -6219,6 +6245,21 @@ fn compile_builtin_function_call(
                             ctx.parent_sub_component_idx(0).map(|idx| {
                                 inner_component_id(&ctx.compilation_unit.sub_components[idx])
                             });
+                        // The mirror's owner is reached the same way the show
+                        // reached this tree's owner: the access chain the show
+                        // used, re-based on the re-bound component. The chain's
+                        // shape decides how the `Option` is peeled.
+                        let owner_access = match &component_access_for_close {
+                            MemberAccess::Direct(t) => {
+                                let t = t.clone();
+                                quote! { #t #suffix . #popup_id_name . take() }
+                            }
+                            MemberAccess::Option(t) => {
+                                let t = t.clone();
+                                quote! { #t.and_then(|owner| owner #suffix . #popup_id_name . take()) }
+                            }
+                            MemberAccess::OptionFn(..) => quote! { ::core::option::Option::None },
+                        };
                         close_component.map(|close_component| {
                             quote! {
                                 if !value {
@@ -6261,13 +6302,15 @@ fn compile_builtin_function_call(
                                                             &#close_component,
                                                         >| {
                                                             // The re-bound component is the
-                                                            // one the popup id was stored
-                                                            // on; the show-scope's own
-                                                            // handle must not be captured
-                                                            // here, for it is not `Send`.
+                                                            // scope the show ran in; the
+                                                            // popup id lives on the owner the
+                                                            // show's own access names, walked
+                                                            // the same way from here. The
+                                                            // show-scope's handle must not be
+                                                            // captured, for it is not `Send`.
                                                             let _self = component;
                                                             if let Some(current_id) =
-                                                                _self.#popup_id_name.take()
+                                                                #owner_access
                                                             {
                                                                 if let Some(adapter) = sp::ItemRc::new_root(tree.clone()).window_adapter() {
                                                                     sp::WindowInner::from_pub(
