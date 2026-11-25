@@ -2433,6 +2433,8 @@ impl RenderCore {
                     &mut render_control_order,
                     &render_item_rcs,
                     &mut interaction,
+                    &render_component,
+                    &render_property_access,
                 );
                 last_iteration_work = frame_started.elapsed();
                 // The tree can move the focus on its own -- a routed
@@ -2511,6 +2513,8 @@ fn publish_mirror_controls(
     render_control_order: &mut Vec<u64>,
     render_item_rcs: &Rc<RefCell<HashMap<u64, ItemRc>>>,
     interaction: &mut ControlInteraction,
+    render_component: &RefCell<Option<Box<dyn std::any::Any>>>,
+    render_property_access: &RefCell<Option<ComponentPropertyAccess>>,
 ) -> bool {
     let Some(adapter) = render_window_adapter.as_ref() else {
         return false;
@@ -2534,6 +2538,37 @@ fn publish_mirror_controls(
     // running on this same thread; no separate publish step is needed.
     *render_item_rcs.borrow_mut() = table.item_refs.into_iter().collect();
     interaction.retain(&table.controls);
+    // A model swap resets the repeater's rows, and the interactive items the
+    // new rows instantiate start with their pointer state false while the
+    // interaction tracker still holds this thread's answer for the same ids.
+    // Re-assert what is held, writing only what a fresh item lacks, so a
+    // hover or press that survived the swap keeps drawing as held until the
+    // pointer itself moves on.
+    {
+        let items = render_item_rcs.borrow();
+        let component = render_component.borrow();
+        let access = render_property_access.borrow();
+        let hovered: Vec<u64> = interaction.hovered.iter().copied().collect();
+        let pressed: Vec<u64> = interaction.pressed.iter().copied().collect();
+        for (ids, property) in [(&hovered, "has-hover"), (&pressed, "pressed")] {
+            for id in ids {
+                let Some(item_rc) = items.get(id) else { continue };
+                let wants = ControlPropertyValue::Bool(true);
+                let missing =
+                    with_control_property(item_rc, property, |p| p.get().as_ref() != Some(&wants))
+                        .unwrap_or(false);
+                if missing {
+                    apply_control_property(
+                        component.as_deref(),
+                        access.as_ref(),
+                        item_rc,
+                        property,
+                        &wants,
+                    );
+                }
+            }
+        }
+    }
     if std::env::var_os("SLINT_LOG_REPEATER").is_some() {
         let size = adapter.size();
         std::eprintln!(
@@ -2607,6 +2642,8 @@ fn present_render_owned(
     render_control_order: &mut Vec<u64>,
     render_item_rcs: &Rc<RefCell<HashMap<u64, ItemRc>>>,
     interaction: &mut ControlInteraction,
+    render_component: &Rc<RefCell<Option<Box<dyn std::any::Any>>>>,
+    render_property_access: &Rc<RefCell<Option<ComponentPropertyAccess>>>,
 ) {
     let started = std::time::Instant::now();
     if !publish_mirror_controls(
@@ -2616,6 +2653,8 @@ fn present_render_owned(
         render_control_order,
         render_item_rcs,
         interaction,
+        &render_component,
+        &render_property_access,
     ) {
         return;
     }
