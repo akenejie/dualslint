@@ -946,6 +946,20 @@ impl WindowInner {
         self.component.borrow().upgrade()
     }
 
+    /// The input's semantics run on the application tree, so the repeater
+    /// rows the semantics may hit materialize here on demand -- including on
+    /// a tree whose drawing a backend took over, whose rows the drawn tree
+    /// instantiated for itself. The startup skip in
+    /// [`Self::ensure_tree_instantiated`] does not apply: the input is the
+    /// demand.
+    fn ensure_input_ready(&self) {
+        #[cfg(feature = "std")]
+        if let Some(component) = self.try_component() {
+            crate::item_tree::ensure_item_tree_instantiated(&component);
+        }
+        self.ensure_tree_instantiated();
+    }
+
     /// Walk the component tree and every active popup to materialize every
     /// Repeater, Conditional and ComponentContainer.  Runs change handlers
     /// and the instantiation pass in a loop because init callbacks may set
@@ -1011,7 +1025,7 @@ impl WindowInner {
         crate::animations::update_animations(crate::animations::Instant::now(self.context()));
 
         let item_tree = self.try_component()?;
-        self.ensure_tree_instantiated();
+        self.ensure_input_ready();
 
         // If the focused item became invisible (e.g. a TabWidget switched away from
         // the tab holding it), drop the focus so that input methods get torn down.
@@ -1182,7 +1196,7 @@ impl WindowInner {
             // The grab handler may have fired callbacks that modified models or
             // other state, so materialize any pending repeater/conditional
             // changes before hit-testing with the returned event.
-            self.ensure_tree_instantiated();
+            self.ensure_input_ready();
             let mut item_tree = self.component.borrow().upgrade();
             let mut offset = LogicalPoint::default();
             let mut menubar_item = None;
@@ -1320,7 +1334,7 @@ impl WindowInner {
             WindowInner::from_pub(parent_adapter.window()).close_popup(popup_id);
         }
 
-        self.ensure_tree_instantiated();
+        self.ensure_input_ready();
 
         Some(MouseDispatchResult { drag_action, accepted })
     }
@@ -1632,7 +1646,7 @@ impl WindowInner {
         &self,
         mut internal_key_event: InternalKeyEvent,
     ) -> crate::input::KeyEventResult {
-        self.ensure_tree_instantiated();
+        self.ensure_input_ready();
         // NFC-normalize the event text so that shortcut matching works consistently
         // regardless of the composed/decomposed form the backend provides
         // (e.g. é as U+00E9 vs e + U+0301).
@@ -1680,7 +1694,7 @@ impl WindowInner {
         // Slint widgets. Therefore we process the menubar shortcuts here first and abort event
         // propagation if a shortcut matches.
         if self.process_menubar_shortcuts(&internal_key_event) == KeyEventResult::EventAccepted {
-            self.ensure_tree_instantiated();
+            self.ensure_input_ready();
             return crate::input::KeyEventResult::EventAccepted;
         }
 
