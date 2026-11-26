@@ -114,6 +114,19 @@ UI スレッド                              Render スレッド
 ハンドラはアプリの tree で実行され、持ち運べる型の書き込みは mirror の対応するコピーへ carry されます
 （モデルや画像など参照の型は運べず、呼び出し側の tree が持つ値のままです）。
 
+### init の所有（アプリの意味論は一度だけ）
+
+`init => { ... }` は**アプリの意味論**なので、アプリの tree で一度だけ走ります。mirror（描画側のコピー）は
+走りません。mirror の行やポップアップは、アプリの tree が同じ `init` をすでに実行したことを知っているので、
+同じコードを 2 度実行することはありません。mirror が引き取るのは描画に必要な簿記だけ — 変更トラッカーと
+タイマです。行（`for` の中の要素）の `init` は、アプリの tree がその行を実体化したときに走ります。起動時に
+必要な実体化は描画側が mirror で行いますが、そこでは `init` は走らないので、**行の `init` が走るのはその行が
+入力や意味論で最初に必要になったとき**です。上流では起動時に走っていたコードが、このフォークでは
+初回の入力まで遅れうる、ということです。起動時に必ず走らせたい初期化は window の `init` に置いてください。
+
+アプリ側で書き分ける必要がある API（`slint::render_thread::` 配下のもの、`request_redraw` が描画を頼む
+先など）は「追加された API」の節にまとめてあります。`.slint` ファイルは上流と 1 字も変えません。
+
 ## 描画スレッドのプロトコル
 
 UI スレッド → 描画スレッドは **mpsc チャネル** です。送信側 `RenderHost`（`Clone` + `Send`）は任意スレッドから
@@ -193,7 +206,7 @@ publish される対象は `TouchArea` / `FocusScope` / `TextInput` です。hov
 | `internal/backends/scene/` | **新規クレート**。control プロトコル型（`PublishedControls` / `ControlPropertyValue` / C ABI）と geometry のみのコントロール走査（`encode_window_controls`） |
 | `internal/backends/android-activity/` | 同思想の render スレッド（`SkiaRenderer` を `ANativeWindow` に束縛、CPU ラスタ含む） |
 | `internal/core/` | `WindowInner::render_factory`（生成コードが factory を残す場所）、`WindowAdapter::run_on_screen_tree()` / `post_on_screen_tree()`、`render_handover`、`hosts_drawn_tree`（キー配送の可視性ゲート）、`ComponentPropertyAccess` の土台 |
-| `internal/compiler/` | 所有権分類（`passes/property_ownership.rs`）とその LLR への埋め込み、ハンドラ書き込みの carry コード生成、window-rooted な `invoke_*` の screen tree へのルーティング、複合 component の public プロパティが unused-remove されないよう保持、no_std でも通る render factory 登録 |
+| `internal/compiler/` | 所有権分類（`passes/property_ownership.rs`）とその LLR への埋め込み、ハンドラ書き込みの carry コード生成、window-rooted な `invoke_*` の screen tree へのルーティング、複合 component の public プロパティが unused-remove されないよう保持、no_std でも通る render factory 登録、`SharedGlobals` の `slint_drawn_copy` 印と init の semantics/visuals 分割（mirror と mirror の行・ポップアップは init の意味論を再実行しない） |
 | `internal/interpreter/` | `CompilationUnit` を `Send + Sync` 化（`RwLock` / `AtomicUsize`）して render スレッドでも instance を生成可能に。window-rooted 呼び出しの screen tree ルーティング |
 | `api/rs/slint` / `api/cpp` / `api/node` / `api/python` | `slint::render_thread`（`request_redraw`・control 借用・`attach_component*`）の公開とバインディング |
 

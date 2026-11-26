@@ -950,6 +950,41 @@ pub fn generate(
         }),
     ));
 
+    // Whether this tree is the drawn copy a render thread built: the mirror
+    // the window shows. Rows and popups instantiated inside it share these
+    // globals, inherit the mark, and their init runs the visual bookkeeping
+    // without the application's init code, which the application's own tree
+    // ran once.
+    globals_struct.members.push((
+        Access::Public,
+        Declaration::Var(Var {
+            ty: "bool".into(),
+            name: "slint_drawn_copy".into(),
+            init: Some("false".into()),
+            ..Default::default()
+        }),
+    ));
+
+    globals_struct.members.push((
+        Access::Public,
+        Declaration::Function(Function {
+            name: "slint_is_drawn_copy".into(),
+            signature: "() const -> bool".into(),
+            statements: Some(vec!["return slint_drawn_copy;".into()]),
+            ..Default::default()
+        }),
+    ));
+
+    globals_struct.members.push((
+        Access::Public,
+        Declaration::Function(Function {
+            name: "slint_mark_drawn_copy".into(),
+            signature: "() -> void".into(),
+            statements: Some(vec!["slint_drawn_copy = true;".into()]),
+            ..Default::default()
+        }),
+    ));
+
     let mut init_global = Vec::new();
     let mut clone_constructor_global_inits = Vec::new();
 
@@ -1031,7 +1066,14 @@ pub fn generate(
                     signature: format!(
                         "(const {SHARED_GLOBAL_CLASS}& source, const slint::private_api::WindowAdapterRc& adapter){init_list}"
                     ),
-                    statements: Some(vec!["m_window.emplace(adapter);".into()]),
+                    statements: Some(vec![
+                        "m_window.emplace(adapter);".to_string(),
+                        // A popup shows what the window that owns it draws, so
+                        // the popup and its owner are on the shelf together,
+                        // and a popup of the drawn copy is a drawn copy itself.
+                        "slint_shelved = source.slint_shelved;".to_string(),
+                        "slint_drawn_copy = source.slint_drawn_copy;".to_string(),
+                    ]),
                     ..Default::default()
                 }),
             ));
@@ -2272,9 +2314,12 @@ fn generate_item_tree(
             // application's tree ran it once, and the factory raises the
             // render-thread scope around this create. The visual bookkeeping
             // -- change trackers and timers -- is whichever drawing tree's
-            // own, so it runs either way.
+            // own, so it runs either way. The mark goes on before anything
+            // instantiates inside this tree: the rows and popups it builds
+            // from here on inherit it through the shared globals.
             create_code.push(
                 "if (slint::private_api::render_thread_tree_scope()) { \
+                 self->m_globals.slint_mark_drawn_copy(); \
                  self->user_init_visuals(); } else { self->user_init(); }"
                     .to_string(),
             );
@@ -2322,7 +2367,14 @@ fn generate_item_tree(
                 }
             }
         } else {
-            create_code.push("self->user_init();".to_string());
+            // A popup of the drawn copy is a drawn copy itself: the mark rides
+            // the shared globals, and its init runs the visual bookkeeping
+            // only. The application's own popups run the full init.
+            create_code.push(
+                "if (self->globals->slint_is_drawn_copy()) { \
+                 self->user_init_visuals(); } else { self->user_init(); }"
+                    .to_string(),
+            );
         }
     }
 
@@ -3528,7 +3580,14 @@ fn generate_repeated_component(
         Declaration::Function(Function {
             name: "init".into(),
             signature: "() -> void".into(),
-            statements: Some(vec!["user_init();".into()]),
+            // A row of the drawn copy takes the visual bookkeeping only: the
+            // application's init ran on the application's own row, and the
+            // mark rides the shared globals, which a row inherits from the
+            // tree that built it.
+            statements: Some(vec![
+                "if (globals->slint_is_drawn_copy()) { user_init_visuals(); } else { user_init(); }"
+                    .into(),
+            ]),
             ..Function::default()
         }),
     ));

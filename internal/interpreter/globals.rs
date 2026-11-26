@@ -124,6 +124,12 @@ pub struct GlobalStorage {
     >,
     /// Set through [`ComponentInstance::set_debug_hook_callback`]; see [`crate::debug_hook`].
     pub debug_hook_callback: std::cell::RefCell<Option<crate::debug_hook::DebugHookCallback>>,
+    /// Whether this tree is the drawn copy a render thread built: the mirror
+    /// the window shows. Rows and popups instantiated inside it share this
+    /// storage, inherit the mark, and their init runs the visual bookkeeping
+    /// without the application's init code, which the application's own tree
+    /// ran once.
+    pub drawn_copy: std::cell::Cell<bool>,
 }
 
 impl GlobalStorage {
@@ -180,6 +186,7 @@ impl GlobalStorage {
             globals,
             root: std::cell::OnceCell::new(),
             debug_hook_callback: std::cell::RefCell::new(None),
+            drawn_copy: std::cell::Cell::new(false),
         }
     }
 

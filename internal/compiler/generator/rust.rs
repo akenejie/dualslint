@@ -698,6 +698,10 @@ fn generate_public_component(
             fn new_without_init() -> ::core::result::Result<Self, slint::PlatformError> {
                 slint::private_unstable_api::ensure_backend()?;
                 let inner = #inner_component_id::new()?;
+                // The mark goes on before anything instantiates inside this
+                // tree: the rows and popups it builds from here on are a drawn
+                // copy's, and their init runs the visual bookkeeping only.
+                inner.globals.get().unwrap().slint_mark_drawn_copy();
                 #init_bundle_translations
                 #eager_create_window
                 #inner_component_id::user_init_visuals(sp::VRc::map(inner.clone(), |x| x));
@@ -842,6 +846,11 @@ fn generate_shared_globals(
             // draws. Every component of a tree shares the same `SharedGlobals`,
             // so one flag says it for all of them.
             slint_shelved : ::core::cell::Cell<bool>,
+            // Whether this tree is the drawn copy a render thread built: the
+            // mirror the window shows. Its rows and popups take the visual
+            // bookkeeping of an instance without re-running the application's
+            // init code, which the application's own tree ran once.
+            slint_drawn_copy : ::core::cell::Cell<bool>,
             #(#[allow(dead_code)]
             #library_shared_globals_names : sp::Rc<#library_shared_globals_types>,)*
         }
@@ -859,6 +868,19 @@ fn generate_shared_globals(
                 self.slint_shelved.set(true);
             }
 
+            /// Whether this tree is the drawn copy: the mirror whose bindings
+            /// decide the screen, built by a render thread from the factory.
+            fn slint_is_drawn_copy(&self) -> bool {
+                self.slint_drawn_copy.get()
+            }
+
+            /// Mark the tree as the drawn copy. Rows and popups instantiated
+            /// inside it inherit the mark through the shared globals, and their
+            /// init runs the visual bookkeeping only.
+            fn slint_mark_drawn_copy(&self) {
+                self.slint_drawn_copy.set(true);
+            }
+
             #pub_token fn new(root_item_tree_weak : sp::VWeak<sp::ItemTreeVTable>) -> sp::Rc<Self> {
                 #(let #library_shared_globals_names = #library_shared_globals_types::new(root_item_tree_weak.clone());)*
                 sp::Rc::new(Self {
@@ -867,6 +889,7 @@ fn generate_shared_globals(
                     window_adapter : ::core::default::Default::default(),
                     root_item_tree_weak,
                     slint_shelved : ::core::cell::Cell::new(false),
+                    slint_drawn_copy : ::core::cell::Cell::new(false),
                     #(#library_shared_globals_names,)*
                 })
             }
@@ -890,8 +913,10 @@ fn generate_shared_globals(
                     // `root_item_tree_weak` is only used to init the window_adapter. Since we have the window_adapter here already we don't need this variable
                     root_item_tree_weak: ::core::default::Default::default(),
                     // A popup shows what the window that owns it draws, so the
-                    // popup and its owner are on the shelf together.
+                    // popup and its owner are on the shelf together, and a
+                    // popup of the drawn copy is a drawn copy itself.
                     slint_shelved: ::core::cell::Cell::new(self.slint_shelved.get()),
+                    slint_drawn_copy: ::core::cell::Cell::new(self.slint_drawn_copy.get()),
                     #(#library_shared_globals_names: self.#library_shared_globals_names.clone(),)*
                 })
             }
@@ -4477,9 +4502,19 @@ fn generate_repeated_component(
             }
             fn init(&self) {
                 let self_rc = self.self_weak.get().unwrap().upgrade().unwrap();
-                #inner_component_id::user_init(
-                    sp::VRcMapped::map(self_rc, |x| x),
-                );
+                // A row of the drawn copy takes the visual bookkeeping only:
+                // the application's init ran on the application's own row, and
+                // the semantics are that tree's. The mark rides the shared
+                // globals, which a row shares with the tree that built it.
+                if self.globals.get().unwrap().slint_is_drawn_copy() {
+                    #inner_component_id::user_init_visuals(
+                        sp::VRcMapped::map(self_rc, |x| x),
+                    );
+                } else {
+                    #inner_component_id::user_init(
+                        sp::VRcMapped::map(self_rc, |x| x),
+                    );
+                }
             }
             #z_order_fn
             #extra_fn
@@ -6189,6 +6224,7 @@ fn compile_builtin_function_call(
                                             globals,
                                         )
                                         .unwrap();
+                                        let popup_drawn_copy = popup_instance.globals.get().unwrap().slint_is_drawn_copy();
                                         let popup_instance_vrc = sp::VRc::map(popup_instance.clone(), |x| x);
                                         if let Some(current_id) = #compo.#popup_id_name.take() {
                                             window.close_popup(current_id);
@@ -6207,7 +6243,11 @@ fn compile_builtin_function_call(
                                             sp::Box::new(|_| {}),
                                         );
                                         #compo.#popup_id_name.set(Some(popup_id));
-                                        #popup_window_id::user_init(popup_instance_vrc.clone());
+                                        if popup_drawn_copy {
+                                            #popup_window_id::user_init_visuals(popup_instance_vrc.clone());
+                                        } else {
+                                            #popup_window_id::user_init(popup_instance_vrc.clone());
+                                        }
                                     })
                                 })
                             },
@@ -6406,6 +6446,7 @@ fn compile_builtin_function_call(
                         let globals = #globals_init;
 
                         let popup_instance = #popup_window_id::new(#compo.self_weak.get().unwrap().clone(), globals).unwrap();
+                        let popup_drawn_copy = popup_instance.globals.get().unwrap().slint_is_drawn_copy();
                         let popup_instance_vrc = sp::VRc::map(popup_instance.clone(), |x| x);
                         if let Some(current_id) = #compo.#popup_id_name.take() {
                             window.close_popup(current_id);
@@ -6426,7 +6467,11 @@ fn compile_builtin_function_call(
                             #is_open_setter,
                         );
                         #compo.#popup_id_name.set(Some(popup_id));
-                        #popup_window_id::user_init(popup_instance_vrc.clone());
+                        if popup_drawn_copy {
+                                            #popup_window_id::user_init_visuals(popup_instance_vrc.clone());
+                                        } else {
+                                            #popup_window_id::user_init(popup_instance_vrc.clone());
+                                        }
                         #popup_show_carry
                     })
                     })
@@ -6539,12 +6584,17 @@ fn compile_builtin_function_call(
                         sp::Box::new(|_| {}),
                     );
                     #set_id;
+                    if popup_drawn_copy {
+                    #popup_id::user_init_visuals(popup_instance_vrc);
+                } else {
                     #popup_id::user_init(popup_instance_vrc);
+                }
                 };
 
                 let common_init = quote! {
                     let position = #position;
                     let popup_instance = #popup_id::new(_self.globals.get().unwrap().clone()).unwrap();
+                    let popup_drawn_copy = popup_instance.globals.get().unwrap().slint_is_drawn_copy();
                     let popup_instance_vrc = sp::VRc::map(popup_instance.clone(), |x| x);
                     let parent_weak = _self.self_weak.get().unwrap().clone();
                     let window_adapter = #window_adapter_tokens;

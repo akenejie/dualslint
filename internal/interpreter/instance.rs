@@ -768,6 +768,12 @@ impl Instance {
         if let Some(adapter) = window_adapter {
             let _ = vrc.window_adapter.set(adapter);
         }
+        // The mark goes on before anything instantiates inside this tree: the
+        // rows and popups it builds from here on share this storage, inherit
+        // the mark, and their init runs the visual bookkeeping only.
+        if !run_init {
+            vrc.globals.drawn_copy.set(true);
+        }
         // Set the outer-tree handle before finalizing so bindings that
         // read absolute coordinates during `install_bindings` /
         // `init_code` can resolve `parent_node` through the host.
@@ -1324,7 +1330,15 @@ impl i_slint_core::model::RepeatedItemTree for Instance {
         if let Some(weak) = self.self_weak.get()
             && let Some(vrc) = weak.upgrade()
         {
-            finalize_instance(&vrc);
+            // A row of the drawn copy takes the visual bookkeeping only: the
+            // application's init ran on the application's own row, and the
+            // mark rides the shared storage, which a row inherits from the
+            // tree that built it.
+            if vrc.globals.drawn_copy.get() {
+                finalize_instance_without_init(&vrc);
+            } else {
+                finalize_instance(&vrc);
+            }
         }
     }
 
