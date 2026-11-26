@@ -90,7 +90,8 @@ impl ComponentDefinitionInner {
         let compilation_unit = self.compilation_unit.clone();
         let public_index = self.public_index;
         WindowInner::from_pub(window_adapter.window()).set_render_factory(Arc::new(move || {
-            Box::new(Instance::new(compilation_unit.clone(), public_index)) as Box<dyn Any>
+            Box::new(Instance::new_without_init(compilation_unit.clone(), public_index))
+                as Box<dyn Any>
         }));
         // The tree the factory builds starts from the declaration, so it does
         // not have what the application set on this instance. Leave behind how
@@ -358,10 +359,11 @@ impl ComponentInstanceInner {
             let result = public_api::invoke(&self.0, name, args);
             let after = public_api::portable_public_state(&self.0);
             let changed: Vec<(String, Value)> = after
-                .into_iter()
+                .iter()
                 .filter(|(name, value)| {
                     before.iter().find(|(n, _)| n == name).is_some_and(|(_, old)| old != value)
                 })
+                .cloned()
                 .collect();
             if !changed.is_empty() {
                 Self::carry_portable_state(&self.0, &adapter, changed);

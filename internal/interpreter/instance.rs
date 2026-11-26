@@ -668,6 +668,28 @@ impl Instance {
         Self::new_with_window(compilation_unit, public_component_index, None, Default::default())
     }
 
+    /// Build an instance for a public component that never runs the
+    /// application's init code.
+    ///
+    /// The tree a render thread draws is the mirror of the one the
+    /// application instantiated, and the application's init ran there once
+    /// already: re-running it here would execute the application's own
+    /// semantics a second time, on a thread that owns no semantics. What the
+    /// application set reaches this tree through the handover carry instead.
+    pub fn new_without_init(
+        compilation_unit: Arc<CompilationUnit>,
+        public_component_index: usize,
+    ) -> VRc<ItemTreeVTable, Instance> {
+        Self::new_with_options_impl(
+            compilation_unit,
+            public_component_index,
+            None,
+            Default::default(),
+            None,
+            false,
+        )
+    }
+
     /// Build an instance for a public component and optionally reuse an
     /// existing [`WindowAdapterRc`]. Live preview passes in the window from
     /// the old instance so reloaded components keep the same window frame.
@@ -677,12 +699,13 @@ impl Instance {
         window_adapter: Option<i_slint_core::window::WindowAdapterRc>,
         type_loaders: crate::component::TypeLoaders,
     ) -> VRc<ItemTreeVTable, Instance> {
-        Self::new_with_options(
+        Self::new_with_options_impl(
             compilation_unit,
             public_component_index,
             window_adapter,
             type_loaders,
             None,
+            true,
         )
     }
 
@@ -713,6 +736,24 @@ impl Instance {
         type_loaders: crate::component::TypeLoaders,
         embedded_in: Option<(vtable::VWeak<ItemTreeVTable>, u32)>,
     ) -> VRc<ItemTreeVTable, Instance> {
+        Self::new_with_options_impl(
+            compilation_unit,
+            public_component_index,
+            window_adapter,
+            type_loaders,
+            embedded_in,
+            true,
+        )
+    }
+
+    fn new_with_options_impl(
+        compilation_unit: Arc<CompilationUnit>,
+        public_component_index: usize,
+        window_adapter: Option<i_slint_core::window::WindowAdapterRc>,
+        type_loaders: crate::component::TypeLoaders,
+        embedded_in: Option<(vtable::VWeak<ItemTreeVTable>, u32)>,
+        run_init: bool,
+    ) -> VRc<ItemTreeVTable, Instance> {
         let public = &compilation_unit.public_components[public_component_index];
         let globals = Rc::new(GlobalStorage::new(&compilation_unit));
         let item_tree = &public.item_tree;
@@ -733,7 +774,11 @@ impl Instance {
         if let Some((parent, idx)) = embedded_in {
             let _ = vrc.embedded_in.set((parent, idx));
         }
-        finalize_instance(&vrc);
+        if run_init {
+            finalize_instance(&vrc);
+        } else {
+            finalize_instance_without_init(&vrc);
+        }
         vrc
     }
 
@@ -832,10 +877,26 @@ fn build_instance(
 /// first measurement and defers `init_code` to the core's
 /// `init_instances` callback (`<Instance as RepeatedItemTree>::init`).
 pub(crate) fn finalize_instance(vrc: &VRc<ItemTreeVTable, Instance>) {
+    finalize_instance_with_init(vrc, true);
+}
+
+/// Finalize a mirror instance without running the application's init code.
+///
+/// The init ran once, on the application's own tree: the semantics are that
+/// tree's, and a mirror that re-ran them would execute the application's own
+/// code a second time on a thread that owns no semantics. What the
+/// application set reaches the mirror through the handover carry instead.
+pub(crate) fn finalize_instance_without_init(vrc: &VRc<ItemTreeVTable, Instance>) {
+    finalize_instance_with_init(vrc, false);
+}
+
+fn finalize_instance_with_init(vrc: &VRc<ItemTreeVTable, Instance>, run_init: bool) {
     install_bindings_for_repeated_row(vrc);
     if vrc.init_code_run.get().is_some() {
         return;
     }
+    // The cell marks the init step settled, whether the code ran or the
+    // instance is a mirror it must never run on.
     let _ = vrc.init_code_run.set(());
     // For top-level instances, attach the window to the item tree *before*
     // running init_code so `set_component` doesn't clear focus set by
@@ -858,7 +919,9 @@ pub(crate) fn finalize_instance(vrc: &VRc<ItemTreeVTable, Instance>) {
         let adapter = vrc.window_adapter_or_default();
         i_slint_core::item_tree::register_item_tree(&dyn_rc, adapter);
     }
-    crate::bindings::run_init_code_for_instance(vrc);
+    if run_init {
+        crate::bindings::run_init_code_for_instance(vrc);
+    }
 }
 
 /// Install bindings, two-way links and timers on `vrc` without running

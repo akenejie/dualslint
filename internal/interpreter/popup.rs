@@ -287,7 +287,11 @@ pub(crate) fn show_popup_window(ctx: &mut EvalContext, arguments: &[Expression])
                     if let Some(slot) = mirror_owner.popup_ids.get(popup_index) {
                         slot.set(Some(popup_id));
                     }
-                    crate::instance::finalize_instance(&mirror_popup);
+                    // The mirror popup is a visual copy: the application's
+                    // init ran on the popup the application tree holds, and
+                    // re-running it here would execute that semantics a
+                    // second time on a thread that owns no semantics.
+                    crate::instance::finalize_instance_without_init(&mirror_popup);
                 }),
             );
         }

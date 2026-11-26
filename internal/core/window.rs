@@ -953,9 +953,14 @@ impl WindowInner {
     /// [`Self::ensure_tree_instantiated`] does not apply: the input is the
     /// demand.
     fn ensure_input_ready(&self) {
+        // The direct walk is only for the tree that does not materialize its
+        // own rows: when this tree does, the loop below builds them and a
+        // walk here would repeat the same work every event.
         #[cfg(feature = "std")]
-        if let Some(component) = self.try_component() {
-            crate::item_tree::ensure_item_tree_instantiated(&component);
+        if self.handed_over.get() || !self.window_adapter().hosts_drawn_tree() {
+            if let Some(component) = self.try_component() {
+                crate::item_tree::ensure_item_tree_instantiated(&component);
+            }
         }
         self.ensure_tree_instantiated();
     }

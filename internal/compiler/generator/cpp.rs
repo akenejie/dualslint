@@ -2267,7 +2267,17 @@ fn generate_item_tree(
             // Ensure that the window exists before user_init, consistent with the
             // Rust codegen order.
             create_code.push(format!("auto &window = {global_access}->window();"));
-            create_code.push("self->user_init();".to_string());
+            // The tree a render thread builds from the factory skips the
+            // application's init code: the init is semantics, the
+            // application's tree ran it once, and the factory raises the
+            // render-thread scope around this create. The visual bookkeeping
+            // -- change trackers and timers -- is whichever drawing tree's
+            // own, so it runs either way.
+            create_code.push(
+                "if (slint::private_api::render_thread_tree_scope()) { \
+                 self->user_init_visuals(); } else { self->user_init(); }"
+                    .to_string(),
+            );
             create_code.push("self->m_globals.window();".to_string());
             create_code.push(
                 "slint::cbindgen_private::slint_windowrc_ensure_tree_instantiated(\
@@ -2520,6 +2530,7 @@ fn generate_sub_component(
     }
 
     let mut user_init = vec!["[[maybe_unused]] auto self = this;".into()];
+    let mut user_init_semantics = vec!["[[maybe_unused]] auto self = this;".into()];
 
     let mut children_visitor_cases = Vec::new();
     let mut subtrees_ranges_cases = Vec::new();
@@ -2555,7 +2566,8 @@ fn generate_sub_component(
         init.push(format!(
             "this->{sub_field}.init(globals, self_weak.into_dyn(), {global_index}, {global_children});"
         ));
-        user_init.push(format!("this->{sub_field}.user_init();"));
+        user_init.push(format!("this->{sub_field}.user_init_visuals();"));
+        user_init_semantics.push(format!("this->{sub_field}.user_init_semantics();"));
 
         let sub_component_repeater_count = sub_sc.repeater_count(root);
         if sub_component_repeater_count > 0 {
@@ -2743,7 +2755,7 @@ fn generate_sub_component(
 
     init.extend(properties_init_code);
 
-    user_init.extend(component.init_code.iter().map(|e| {
+    user_init_semantics.extend(component.init_code.iter().map(|e| {
         let mut expr_str = compile_expression(&e.read(), &ctx);
         expr_str.push(';');
         expr_str
@@ -2808,6 +2820,31 @@ fn generate_sub_component(
         field_access,
         Declaration::Function(Function {
             name: "user_init".into(),
+            signature: "() -> void".into(),
+            statements: Some(vec!["user_init_semantics();".into(), "user_init_visuals();".into()]),
+            ..Default::default()
+        }),
+    ));
+
+    // The application's own init code. Only the tree the application holds
+    // runs it: the mirror a render thread draws takes the visual bookkeeping
+    // without re-running the application's semantics.
+    target_struct.members.push((
+        field_access,
+        Declaration::Function(Function {
+            name: "user_init_semantics".into(),
+            signature: "() -> void".into(),
+            statements: Some(user_init_semantics),
+            ..Default::default()
+        }),
+    ));
+
+    // The visual bookkeeping the drawing tree owes itself either way: the
+    // change trackers and the timers.
+    target_struct.members.push((
+        field_access,
+        Declaration::Function(Function {
+            name: "user_init_visuals".into(),
             signature: "() -> void".into(),
             statements: Some(user_init),
             ..Default::default()

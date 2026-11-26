@@ -6,11 +6,13 @@
 //!
 //! A backend that took the window over builds a second tree from the factory
 //! the component left behind, and from then on the instance the application
-//! holds is not the one on screen. `invoke_*` has to land on the tree that is
-//! drawn, carrying plain arguments there and their answer back, and a property
-//! that can travel is read from there too, because that tree's bindings decide
-//! what is seen. A call that carries something a thread cannot hold stays with
-//! the caller.
+//! holds is not the one on screen. A call is semantics, so it runs on the tree
+//! the caller holds -- the same rule the generated accessors follow -- and
+//! what the call changed among the portable public values carries to the tree
+//! that is drawn, as values. A property that can travel is read from there
+//! too, because that tree's bindings decide what is seen. A call whose
+//! argument cannot travel stays with the caller all the same; only its
+//! portable writes carry.
 //!
 //! The adapter below is the seam the winit render thread implements: it says
 //! which tree the window shows. It is the only way to have two trees of one
@@ -94,6 +96,13 @@ struct ShowingTree {
 impl WindowAdapter for ShowingTree {
     fn window(&self) -> &Window {
         &self.window
+    }
+
+    fn hosts_drawn_tree(&self) -> bool {
+        // Until a tree of its own is shown, the tree this adapter holds is
+        // the one on screen; the handover below replaces it, and from then on
+        // the tree here is the husk the application holds.
+        self.shown.borrow().is_none()
     }
 
     fn run_on_screen_tree(
@@ -212,15 +221,15 @@ fn count_and_note(instance: &ComponentInstance) -> (Option<Value>, Option<Value>
 }
 
 #[test]
-fn a_call_reaches_the_tree_the_window_shows() {
+fn a_call_runs_where_the_caller_holds_and_carries_what_changed() {
     let platform = PlatformShowingTree::install();
     let app = create_instance();
     let adapter = platform.adapter_of_last_window();
 
-    // Nothing has taken the window over, so the call lands on the caller's own
-    // tree -- which is also what says the call goes through the hook at all.
+    // Nothing has taken the window over, so the call runs on the caller's own
+    // tree and nothing asks the adapter for a road.
     app.invoke("add", &[Value::from(2), Value::from(SharedString::from("first"))]).unwrap();
-    assert_eq!(adapter.calls.get(), 1, "the call went through the hook");
+    assert_eq!(adapter.calls.get(), 0, "with no tree of its own, the call is local");
     assert_eq!(
         count_and_note(&app),
         (Some(Value::from(3)), Some(Value::from(SharedString::from("first")))),
@@ -234,8 +243,13 @@ fn a_call_reaches_the_tree_the_window_shows() {
     app.invoke("add", &[Value::from(4), Value::from(SharedString::from("after"))]).unwrap();
     assert_eq!(
         count_and_note(&mirror),
-        (Some(Value::from(5)), Some(Value::from(SharedString::from("after")))),
-        "the call landed on the tree that is drawn"
+        (Some(Value::from(7)), Some(Value::from(SharedString::from("after")))),
+        "the values the call moved carry to the tree that is drawn"
+    );
+    assert_eq!(
+        count_and_note(&app),
+        (Some(Value::from(7)), Some(Value::from(SharedString::from("after")))),
+        "the call itself ran on the tree the caller holds"
     );
 }
 
@@ -253,7 +267,7 @@ fn a_read_comes_from_the_tree_the_window_shows() {
     assert_eq!(
         count_and_note(&mirror),
         (Some(Value::from(5)), Some(Value::from(SharedString::from("after")))),
-        "the call landed on the tree that is drawn"
+        "the values the call moved carry to the tree that is drawn"
     );
     assert_eq!(
         count_and_note(&app),
@@ -262,9 +276,10 @@ fn a_read_comes_from_the_tree_the_window_shows() {
     );
 }
 
-/// The number a function returns comes from the tree the window shows.
+/// A function's answer is the tree the caller holds; reads come from the tree
+/// the window draws.
 #[test]
-fn a_functions_answer_comes_from_the_tree_the_window_shows() {
+fn a_functions_answer_is_the_callers_tree_its_reads_the_drawn_one() {
     let platform = PlatformShowingTree::install();
     let app = create_instance();
     let adapter = platform.adapter_of_last_window();
@@ -277,13 +292,13 @@ fn a_functions_answer_comes_from_the_tree_the_window_shows() {
 
     assert_eq!(
         app.invoke("total", &[]),
-        Ok(Value::from(11)),
-        "the answer comes from the tree that is drawn"
+        Ok(Value::from(2)),
+        "a function is semantics: it runs on the tree the caller holds"
     );
     assert_eq!(
         app.get_property("count"),
         Ok(Value::from(10)),
-        "and that is what the application reads"
+        "and a read is answered from the tree that is drawn"
     );
 }
 
@@ -309,22 +324,24 @@ fn a_call_that_cannot_cross_stays_with_the_caller() {
     let mirror = create_instance();
     *adapter.shown.borrow_mut() = Some(tree_of(&mirror));
 
-    // A struct cannot travel after the handover either: the call stays with the
-    // caller, and the tree that is drawn is left as it was. What the application
-    // reads afterwards is the tree the window draws, which the call never
-    // reached.
+    // A struct cannot travel after the handover either: the call stays with
+    // the caller. What the call moved among the portable public values still
+    // carries, as values -- the struct argument itself never crosses.
     let mut point = slint_interpreter::Struct::default();
     point.set_field("x".into(), Value::from(9));
     app.invoke("set-struct", &[Value::Struct(point)]).unwrap();
+    // The note write happened before the handover, and the fake handover here
+    // carries no state (the real one does -- see the handover test below), so
+    // only what this call moved -- the count -- reaches the drawn tree.
     assert_eq!(
         count_and_note(&mirror),
-        (Some(Value::from(1)), Some(Value::from(SharedString::from("")))),
-        "the tree that is drawn is left as it was"
+        (Some(Value::from(9)), Some(Value::from(SharedString::from("")))),
+        "the portable writes the call made carry, the struct argument does not"
     );
     assert_eq!(
         count_and_note(&app),
-        (Some(Value::from(1)), Some(Value::from(SharedString::from("")))),
-        "what the application reads is the tree the window draws, not the one the call wrote"
+        (Some(Value::from(9)), Some(Value::from(SharedString::from("")))),
+        "and what the application reads is the tree the window draws"
     );
 }
 

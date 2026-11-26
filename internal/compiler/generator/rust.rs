@@ -526,9 +526,13 @@ fn generate_public_component(
                     .set_ime_affects_rendering(#ime_affects_rendering);
                 // Only this code knows how to build another instance of this
                 // component, so leave that behind for a backend that needs one.
+                // The mirror the render thread builds starts without the
+                // application's init code: the init is semantics, the
+                // application's tree ran it once, and the drawn copy is not
+                // the tree to run it again on.
                 slint::private_unstable_api::register_render_factory(
                     window.window(),
-                    || #public_component_id::new().expect(
+                    || #public_component_id::new_without_init().expect(
                         "the render thread could not create another instance of the component"
                     ),
                 );
@@ -681,6 +685,22 @@ fn generate_public_component(
                 #init_with_context
 
                 #inner_component_id::user_init(sp::VRc::map(inner.clone(), |x| x));
+                #ensure_tree_instantiated
+                ::core::result::Result::Ok(Self(inner))
+            }
+
+            // The instance a render thread draws: the same tree without the
+            // application's init code. The init ran once, on the application's
+            // own tree; the semantics are that tree's, and what the
+            // application set reaches the drawn copy through the handover
+            // carry. The visual bookkeeping -- change trackers and timers --
+            // belongs to whichever tree draws and runs here.
+            fn new_without_init() -> ::core::result::Result<Self, slint::PlatformError> {
+                slint::private_unstable_api::ensure_backend()?;
+                let inner = #inner_component_id::new()?;
+                #init_bundle_translations
+                #eager_create_window
+                #inner_component_id::user_init_visuals(sp::VRc::map(inner.clone(), |x| x));
                 #ensure_tree_instantiated
                 ::core::result::Result::Ok(Self(inner))
             }
@@ -2814,7 +2834,8 @@ fn generate_sub_component(
         quote!(sp::VWeakMapped::<sp::ItemTreeVTable, #parent_component_id>)
     });
 
-    user_init_code.extend(component.init_code.iter().map(|e| {
+    let mut user_init_semantics_code: Vec<TokenStream> = Vec::new();
+    user_init_semantics_code.extend(component.init_code.iter().map(|e| {
         let code = compile_expression(&e.read(), &ctx);
         quote!(#code;)
     }));
@@ -2959,8 +2980,17 @@ fn generate_sub_component(
         &mut chunk_fns,
     );
     let user_init_code = emit_in_chunks(
-        "user_init",
+        "user_init_visuals",
         user_init_code,
+        &quote!(self_rc: sp::VRcMapped<sp::ItemTreeVTable, Self>),
+        &quote!(self_rc.clone()),
+        &quote!(let _self = self_rc.as_pin_ref();),
+        false,
+        &mut chunk_fns,
+    );
+    let user_init_semantics_code = emit_in_chunks(
+        "user_init_semantics",
+        user_init_semantics_code,
         &quote!(self_rc: sp::VRcMapped<sp::ItemTreeVTable, Self>),
         &quote!(self_rc.clone()),
         &quote!(let _self = self_rc.as_pin_ref();),
@@ -3021,7 +3051,23 @@ fn generate_sub_component(
                 ::core::result::Result::Ok(())
             }
 
+            // The application's own initialization: the init code the user
+            // wrote, then the visual bookkeeping the tree owes itself either
+            // way -- the change trackers and the timers. The two are separate
+            // so the mirror a render thread draws can take the bookkeeping
+            // without re-running the application's semantics.
             fn user_init(self_rc: sp::VRcMapped<sp::ItemTreeVTable, Self>) {
+                Self::user_init_semantics(self_rc.clone());
+                Self::user_init_visuals(self_rc);
+            }
+
+            fn user_init_semantics(self_rc: sp::VRcMapped<sp::ItemTreeVTable, Self>) {
+                #![allow(unused)]
+                let _self = self_rc.as_pin_ref();
+                #(#user_init_semantics_code)*
+            }
+
+            fn user_init_visuals(self_rc: sp::VRcMapped<sp::ItemTreeVTable, Self>) {
                 #![allow(unused)]
                 let _self = self_rc.as_pin_ref();
                 #(#user_init_code)*
